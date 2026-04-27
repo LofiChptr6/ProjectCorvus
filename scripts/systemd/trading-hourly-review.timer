@@ -1,0 +1,13 @@
+[Unit]
+Description=Trading hourly review timer — every hour, quiet-window gated inside the command
+
+[Timer]
+# Local time = America/Phoenix (MST, no DST). The command itself enforces the
+# 22:00–05:00 AZ quiet window, so it's safe to fire every hour around the clock.
+OnCalendar=*-*-* *:00:00
+Persistent=true
+AccuracySec=30s
+Unit=trading-hourly-review.service
+
+[Install]
+WantedBy=timers.target

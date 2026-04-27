@@ -1,0 +1,14 @@
+[Unit]
+Description=Cassidy's 11:00 PM MST evening risk review — invokes Claude Code /cassidy-evening
+Documentation=file:///home/tianyizhang/opus%20trading/.claude/commands/cassidy-evening.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/tianyizhang/opus trading
+Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/tianyizhang/.local/bin/claude -p "/cassidy-evening" --dangerously-skip-permissions
+TimeoutStartSec=1200
+StandardOutput=append:/home/tianyizhang/opus trading/logs/cassidy-evening.log
+StandardError=append:/home/tianyizhang/opus trading/logs/cassidy-evening.log

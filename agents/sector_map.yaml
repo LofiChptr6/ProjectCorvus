@@ -1,0 +1,361 @@
+# Sector shard — defines which agent owns which symbols.
+#
+# Rules:
+# - Each symbol is owned by exactly one agent. No overlaps.
+# - 30 symbols per active sector agent.
+# - bearish_via:
+#     - 'inverse_etf:XXX' = a verified inverse ETF; allocator can resolve any
+#       legacy short-direction submission to this vehicle.
+#     - 'skip' = no direct short or vetted inverse from this map. Agents
+#       express bearish views by going long an inverse vehicle from
+#       agents/inverse_etf_map.yaml (which the allocator nets at portfolio
+#       level via meta_agent.allocator.net_inverse_pairs).
+
+version: 2
+last_reviewed: 2026-04-27
+
+agents:
+
+  atlas:
+    description: Macro — US indices, rates, FX, gold, dollar, international macro, vol, credit
+    universe:
+      SPY:  {bearish_via: 'inverse_etf:SH'}
+      QQQ:  {bearish_via: 'inverse_etf:SQQQ'}
+      IWM:  {bearish_via: 'inverse_etf:RWM'}
+      DIA:  {bearish_via: 'inverse_etf:DOG'}
+      VOO:  {bearish_via: 'inverse_etf:SH'}
+      RSP:  {bearish_via: skip}
+      VIX:  {bearish_via: skip}
+      TLT:  {bearish_via: 'inverse_etf:TBT'}
+      IEF:  {bearish_via: skip}
+      SHY:  {bearish_via: skip}
+      LQD:  {bearish_via: skip}
+      HYG:  {bearish_via: skip}
+      TIP:  {bearish_via: skip}
+      BND:  {bearish_via: skip}
+      GLD:  {bearish_via: 'inverse_etf:GLL'}
+      SLV:  {bearish_via: skip}
+      UUP:  {bearish_via: skip}
+      DBC:  {bearish_via: skip}
+      EFA:  {bearish_via: skip}
+      EEM:  {bearish_via: 'inverse_etf:EUM'}
+      FXI:  {bearish_via: 'inverse_etf:YXI'}
+      EWJ:  {bearish_via: skip}
+      EWZ:  {bearish_via: skip}
+      INDA: {bearish_via: skip}
+      EWG:  {bearish_via: skip}
+      EWU:  {bearish_via: skip}
+      EWY:  {bearish_via: skip}
+      EWT:  {bearish_via: skip}
+      ACWI: {bearish_via: skip}
+      VWO:  {bearish_via: skip}
+
+  fab:
+    description: Semiconductor manufacturing — foundries, equipment, memory, AI infra (capex-cycle driven)
+    universe:
+      TSM:   {bearish_via: skip}
+      UMC:   {bearish_via: skip}
+      GFS:   {bearish_via: skip}
+      INTC:  {bearish_via: skip}
+      MU:    {bearish_via: skip}
+      WDC:   {bearish_via: skip}
+      STX:   {bearish_via: skip}
+      ASML:  {bearish_via: skip}
+      AMAT:  {bearish_via: skip}
+      LRCX:  {bearish_via: skip}
+      KLAC:  {bearish_via: skip}
+      TER:   {bearish_via: skip}
+      ENTG:  {bearish_via: skip}
+      MKSI:  {bearish_via: skip}
+      ONTO:  {bearish_via: skip}
+      AEHR:  {bearish_via: skip}
+      ICHR:  {bearish_via: skip}
+      COHU:  {bearish_via: skip}
+      ACMR:  {bearish_via: skip}
+      PLAB:  {bearish_via: skip}
+      ASMI:  {bearish_via: skip}
+      SMCI:  {bearish_via: skip}
+      FN:    {bearish_via: skip}
+      AMKR:  {bearish_via: skip}
+      BESI:  {bearish_via: skip}
+      MTSI:  {bearish_via: skip}
+      COHR:  {bearish_via: skip}
+      INFN:  {bearish_via: skip}
+      AOSL:  {bearish_via: skip}
+      CGNX:  {bearish_via: skip}
+
+  fabless:
+    description: Semiconductor designers + sector ETFs (design-win + product-cycle driven)
+    universe:
+      NVDA:  {bearish_via: skip}
+      AMD:   {bearish_via: skip}
+      AVGO:  {bearish_via: skip}
+      QCOM:  {bearish_via: skip}
+      MRVL:  {bearish_via: skip}
+      ARM:   {bearish_via: skip}
+      SMH:   {bearish_via: 'inverse_etf:SOXS'}
+      SOXX:  {bearish_via: 'inverse_etf:SOXS'}
+      SOXL:  {bearish_via: 'inverse_etf:SOXS'}
+      TXN:   {bearish_via: skip}
+      ADI:   {bearish_via: skip}
+      MCHP:  {bearish_via: skip}
+      "ON":  {bearish_via: skip}   # quoted: ON Semiconductor — YAML 1.1 coerces unquoted ON → bool
+      NXPI:  {bearish_via: skip}
+      MBLY:  {bearish_via: skip}
+      ALAB:  {bearish_via: skip}
+      SNPS:  {bearish_via: skip}
+      CDNS:  {bearish_via: skip}
+      LSCC:  {bearish_via: skip}
+      SLAB:  {bearish_via: skip}
+      SWKS:  {bearish_via: skip}
+      QRVO:  {bearish_via: skip}
+      CRUS:  {bearish_via: skip}
+      AMBA:  {bearish_via: skip}
+      WOLF:  {bearish_via: skip}
+      RMBS:  {bearish_via: skip}
+      POWI:  {bearish_via: skip}
+      DIOD:  {bearish_via: skip}
+      ANET:  {bearish_via: skip}
+      CRDO:  {bearish_via: skip}
+
+  rex:
+    description: Mega-cap tech ex-semi — cloud, ads, software, internet, payments, sharing
+    universe:
+      AAPL:  {bearish_via: skip}
+      MSFT:  {bearish_via: skip}
+      GOOGL: {bearish_via: skip}
+      META:  {bearish_via: skip}
+      AMZN:  {bearish_via: skip}
+      NFLX:  {bearish_via: skip}
+      TSLA:  {bearish_via: skip}
+      CRM:   {bearish_via: skip}
+      ORCL:  {bearish_via: skip}
+      ADBE:  {bearish_via: skip}
+      XLK:   {bearish_via: skip}
+      NOW:   {bearish_via: skip}
+      INTU:  {bearish_via: skip}
+      ADSK:  {bearish_via: skip}
+      WDAY:  {bearish_via: skip}
+      SNOW:  {bearish_via: skip}
+      DDOG:  {bearish_via: skip}
+      MDB:   {bearish_via: skip}
+      NET:   {bearish_via: skip}
+      OKTA:  {bearish_via: skip}
+      ZS:    {bearish_via: skip}
+      CRWD:  {bearish_via: skip}
+      PANW:  {bearish_via: skip}
+      FTNT:  {bearish_via: skip}
+      SHOP:  {bearish_via: skip}
+      SPOT:  {bearish_via: skip}
+      ROKU:  {bearish_via: skip}
+      UBER:  {bearish_via: skip}
+      PYPL:  {bearish_via: skip}
+      IBM:   {bearish_via: skip}
+
+  maya:
+    description: Financials — money-center banks, i-banks, brokers, cards, insurers, exchanges, ratings
+    universe:
+      JPM:   {bearish_via: skip}
+      BAC:   {bearish_via: skip}
+      WFC:   {bearish_via: skip}
+      C:     {bearish_via: skip}
+      USB:   {bearish_via: skip}
+      GS:    {bearish_via: skip}
+      MS:    {bearish_via: skip}
+      SCHW:  {bearish_via: skip}
+      BLK:   {bearish_via: skip}
+      KKR:   {bearish_via: skip}
+      BX:    {bearish_via: skip}
+      V:     {bearish_via: skip}
+      MA:    {bearish_via: skip}
+      AXP:   {bearish_via: skip}
+      COF:   {bearish_via: skip}
+      DFS:   {bearish_via: skip}
+      ICE:   {bearish_via: skip}
+      CME:   {bearish_via: skip}
+      NDAQ:  {bearish_via: skip}
+      SPGI:  {bearish_via: skip}
+      MCO:   {bearish_via: skip}
+      MSCI:  {bearish_via: skip}
+      AIG:   {bearish_via: skip}
+      MET:   {bearish_via: skip}
+      PRU:   {bearish_via: skip}
+      AFL:   {bearish_via: skip}
+      TRV:   {bearish_via: skip}
+      XLF:   {bearish_via: 'inverse_etf:SEF'}
+      KRE:   {bearish_via: skip}
+      IAI:   {bearish_via: skip}
+
+  titan:
+    description: Energy + materials + commodities — integrated, refining, services, midstream, metals, chemicals
+    universe:
+      XOM:   {bearish_via: skip}
+      CVX:   {bearish_via: skip}
+      COP:   {bearish_via: skip}
+      OXY:   {bearish_via: skip}
+      EOG:   {bearish_via: skip}
+      PXD:   {bearish_via: skip}
+      DVN:   {bearish_via: skip}
+      HES:   {bearish_via: skip}
+      PSX:   {bearish_via: skip}
+      MPC:   {bearish_via: skip}
+      VLO:   {bearish_via: skip}
+      SLB:   {bearish_via: skip}
+      HAL:   {bearish_via: skip}
+      BKR:   {bearish_via: skip}
+      ET:    {bearish_via: skip}
+      EPD:   {bearish_via: skip}
+      OKE:   {bearish_via: skip}
+      LIN:   {bearish_via: skip}
+      APD:   {bearish_via: skip}
+      SHW:   {bearish_via: skip}
+      FCX:   {bearish_via: skip}
+      NEM:   {bearish_via: skip}
+      GOLD:  {bearish_via: skip}
+      AEM:   {bearish_via: skip}
+      FNV:   {bearish_via: skip}
+      SCCO:  {bearish_via: skip}
+      TECK:  {bearish_via: skip}
+      RIO:   {bearish_via: skip}
+      BHP:   {bearish_via: skip}
+      XLE:   {bearish_via: 'inverse_etf:DUG'}
+      USO:   {bearish_via: 'inverse_etf:SCO'}
+
+  vera:
+    description: Healthcare — pharma, biotech, med devices, tools, insurers, hospitals
+    universe:
+      LLY:   {bearish_via: skip}
+      JNJ:   {bearish_via: skip}
+      PFE:   {bearish_via: skip}
+      MRK:   {bearish_via: skip}
+      ABBV:  {bearish_via: skip}
+      BMY:   {bearish_via: skip}
+      AMGN:  {bearish_via: skip}
+      GILD:  {bearish_via: skip}
+      REGN:  {bearish_via: skip}
+      VRTX:  {bearish_via: skip}
+      MDT:   {bearish_via: skip}
+      BSX:   {bearish_via: skip}
+      SYK:   {bearish_via: skip}
+      EW:    {bearish_via: skip}
+      DHR:   {bearish_via: skip}
+      TMO:   {bearish_via: skip}
+      IDXX:  {bearish_via: skip}
+      ZTS:   {bearish_via: skip}
+      UNH:   {bearish_via: skip}
+      ELV:   {bearish_via: skip}
+      CI:    {bearish_via: skip}
+      HUM:   {bearish_via: skip}
+      CVS:   {bearish_via: skip}
+      HCA:   {bearish_via: skip}
+      MCK:   {bearish_via: skip}
+      BIIB:  {bearish_via: skip}
+      MRNA:  {bearish_via: skip}
+      NVS:   {bearish_via: skip}
+      XLV:   {bearish_via: skip}
+      IBB:   {bearish_via: skip}
+
+  trump:
+    description: Consumer staples + discretionary — food/bev/tobacco, restaurants, apparel, big-box, beauty, autos, leisure
+    universe:
+      WMT:   {bearish_via: skip}
+      COST:  {bearish_via: skip}
+      PG:    {bearish_via: skip}
+      KO:    {bearish_via: skip}
+      PEP:   {bearish_via: skip}
+      MO:    {bearish_via: skip}
+      PM:    {bearish_via: skip}
+      KMB:   {bearish_via: skip}
+      CL:    {bearish_via: skip}
+      GIS:   {bearish_via: skip}
+      MDLZ:  {bearish_via: skip}
+      KR:    {bearish_via: skip}
+      MCD:   {bearish_via: skip}
+      SBUX:  {bearish_via: skip}
+      CMG:   {bearish_via: skip}
+      NKE:   {bearish_via: skip}
+      LULU:  {bearish_via: skip}
+      HD:    {bearish_via: skip}
+      TGT:   {bearish_via: skip}
+      LOW:   {bearish_via: skip}
+      EL:    {bearish_via: skip}
+      ULTA:  {bearish_via: skip}
+      BKNG:  {bearish_via: skip}
+      MAR:   {bearish_via: skip}
+      HLT:   {bearish_via: skip}
+      F:     {bearish_via: skip}
+      GM:    {bearish_via: skip}
+      ROST:  {bearish_via: skip}
+      XLP:   {bearish_via: skip}
+      XLY:   {bearish_via: skip}
+
+  iron:
+    description: Industrials + transports + defense — aerospace/defense, capex, machinery, transports, airlines
+    universe:
+      CAT:   {bearish_via: skip}
+      DE:    {bearish_via: skip}
+      BA:    {bearish_via: skip}
+      LMT:   {bearish_via: skip}
+      RTX:   {bearish_via: skip}
+      NOC:   {bearish_via: skip}
+      GD:    {bearish_via: skip}
+      GE:    {bearish_via: skip}
+      HON:   {bearish_via: skip}
+      EMR:   {bearish_via: skip}
+      ETN:   {bearish_via: skip}
+      ITW:   {bearish_via: skip}
+      ROK:   {bearish_via: skip}
+      PH:    {bearish_via: skip}
+      DOV:   {bearish_via: skip}
+      FTV:   {bearish_via: skip}
+      MMM:   {bearish_via: skip}
+      JCI:   {bearish_via: skip}
+      XYL:   {bearish_via: skip}
+      UNP:   {bearish_via: skip}
+      NSC:   {bearish_via: skip}
+      CSX:   {bearish_via: skip}
+      UPS:   {bearish_via: skip}
+      FDX:   {bearish_via: skip}
+      ODFL:  {bearish_via: skip}
+      DAL:   {bearish_via: skip}
+      UAL:   {bearish_via: skip}
+      LUV:   {bearish_via: skip}
+      XLI:   {bearish_via: skip}
+      IYT:   {bearish_via: skip}
+
+  volt:
+    description: Utilities + REITs + infrastructure — regulated utes, datacenter REITs, residential/industrial/healthcare REITs, mREITs
+    universe:
+      NEE:   {bearish_via: skip}
+      SO:    {bearish_via: skip}
+      DUK:   {bearish_via: skip}
+      D:     {bearish_via: skip}
+      AEP:   {bearish_via: skip}
+      EXC:   {bearish_via: skip}
+      XEL:   {bearish_via: skip}
+      EIX:   {bearish_via: skip}
+      SRE:   {bearish_via: skip}
+      PCG:   {bearish_via: skip}
+      PLD:   {bearish_via: skip}
+      AMT:   {bearish_via: skip}
+      EQIX:  {bearish_via: skip}
+      DLR:   {bearish_via: skip}
+      CCI:   {bearish_via: skip}
+      IRM:   {bearish_via: skip}
+      SPG:   {bearish_via: skip}
+      AVB:   {bearish_via: skip}
+      EQR:   {bearish_via: skip}
+      ESS:   {bearish_via: skip}
+      MAA:   {bearish_via: skip}
+      O:     {bearish_via: skip}
+      NNN:   {bearish_via: skip}
+      WPC:   {bearish_via: skip}
+      NLY:   {bearish_via: skip}
+      AGNC:  {bearish_via: skip}
+      PSA:   {bearish_via: skip}
+      EXR:   {bearish_via: skip}
+      XLU:   {bearish_via: skip}
+      XLRE:  {bearish_via: 'inverse_etf:REK'}
+
+# Defaults for symbols not in any agent's universe:
+# - Only mike may submit views on uncovered symbols (e.g. for tactical hedges).

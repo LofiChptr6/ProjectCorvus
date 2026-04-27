@@ -1,0 +1,235 @@
+# Inverse ETF lookup table — single source of truth for the desk.
+#
+# Used by:
+#   - agent/prompt_builder.py — filters verified=true entries, formats as a
+#     catalog, injects into every sector agent's system prompt so agents pick
+#     vehicles from a vetted list.
+#   - meta_agent/allocator.py:net_inverse_pairs — collapses (long underlying +
+#     long its inverse) positions into a single net position before order
+#     generation, avoiding paying both legs of an offsetting trade.
+#
+# Each entry:
+#   underlying : the ETF/index/stock the inverse moves opposite to
+#   leverage   : signed daily-reset leverage factor (e.g., -2.0 for a 2x bear)
+#   description: vendor + product name
+#   verified   : true = manually audited via vendor websites + at least one
+#                external quote source (Yahoo / Morningstar / Bloomberg)
+#
+# AUDIT POLICY: only entries with verified=true are exposed to agent prompts.
+
+version: 2
+last_audited: 2026-04-27
+last_audited_by: claude_via_websearch
+audit_sources:
+  - direxion.com (Direxion Single-Stock Bull/Bear product pages)
+  - rexshares.com (T-REX 2X Inverse single-stock lineup)
+  - tradretfs.com (Tradr 2X/1.5X Short single-stock lineup)
+  - graniteshares.com (GraniteShares 2x Short single-stock lineup)
+  - defianceetfs.com (Defiance 2X Short single-stock)
+  - stockanalysis.com (Direxion 121-ETF roster cross-check)
+
+inverses:
+
+  # ════════════════════════════════════════════════════════════════
+  # BROAD US INDICES
+  # ════════════════════════════════════════════════════════════════
+  SH:    { underlying: SPY, leverage: -1.0, description: "ProShares Short S&P 500", verified: true }
+  SDS:   { underlying: SPY, leverage: -2.0, description: "ProShares UltraShort S&P 500", verified: true }
+  SPXU:  { underlying: SPY, leverage: -3.0, description: "ProShares UltraPro Short S&P 500", verified: true }
+  SPXS:  { underlying: SPY, leverage: -3.0, description: "Direxion Daily S&P 500 Bear 3x", verified: true }
+
+  PSQ:   { underlying: QQQ, leverage: -1.0, description: "ProShares Short QQQ", verified: true }
+  QID:   { underlying: QQQ, leverage: -2.0, description: "ProShares UltraShort QQQ", verified: true }
+  SQQQ:  { underlying: QQQ, leverage: -3.0, description: "ProShares UltraPro Short QQQ", verified: true }
+
+  DOG:   { underlying: DIA, leverage: -1.0, description: "ProShares Short Dow30", verified: true }
+  DXD:   { underlying: DIA, leverage: -2.0, description: "ProShares UltraShort Dow30", verified: true }
+  SDOW:  { underlying: DIA, leverage: -3.0, description: "ProShares UltraPro Short Dow30", verified: true }
+
+  RWM:   { underlying: IWM, leverage: -1.0, description: "ProShares Short Russell 2000", verified: true }
+  TWM:   { underlying: IWM, leverage: -2.0, description: "ProShares UltraShort Russell 2000", verified: true }
+  TZA:   { underlying: IWM, leverage: -3.0, description: "Direxion Daily Small Cap Bear 3x", verified: true }
+
+  # ════════════════════════════════════════════════════════════════
+  # RATES / TREASURIES
+  # ════════════════════════════════════════════════════════════════
+  TBF:   { underlying: TLT, leverage: -1.0, description: "ProShares Short 20+ Year Treasury", verified: true }
+  TBT:   { underlying: TLT, leverage: -2.0, description: "ProShares UltraShort 20+ Year Treasury", verified: true }
+  TMV:   { underlying: TLT, leverage: -3.0, description: "Direxion Daily 20+ Year Treasury Bear 3x", verified: true }
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTOR INVERSES
+  # ════════════════════════════════════════════════════════════════
+  SEF:   { underlying: XLF, leverage: -1.0, description: "ProShares Short Financials", verified: true }
+  SKF:   { underlying: XLF, leverage: -2.0, description: "ProShares UltraShort Financials", verified: true }
+  FAZ:   { underlying: XLF, leverage: -3.0, description: "Direxion Daily Financial Bear 3x", verified: true }
+
+  DUG:   { underlying: XLE, leverage: -2.0, description: "ProShares UltraShort Oil & Gas", verified: true }
+  ERY:   { underlying: XLE, leverage: -2.0, description: "Direxion Daily Energy Bear 2x", verified: true }
+
+  REK:   { underlying: XLRE, leverage: -1.0, description: "ProShares Short Real Estate", verified: true }
+  SRS:   { underlying: XLRE, leverage: -2.0, description: "ProShares UltraShort Real Estate", verified: true }
+  DRV:   { underlying: XLRE, leverage: -3.0, description: "Direxion Daily Real Estate Bear 3x", verified: true }
+
+  SOXS:  { underlying: SMH, leverage: -3.0, description: "Direxion Daily Semiconductor Bear 3x (tracks SOX index, ~SOXX/SMH)", verified: true }
+
+  # Commodities
+  SCO:   { underlying: USO, leverage: -2.0, description: "ProShares UltraShort Bloomberg Crude Oil", verified: true }
+  GLL:   { underlying: GLD, leverage: -2.0, description: "ProShares UltraShort Gold", verified: true }
+
+  # International
+  EUM:   { underlying: EEM, leverage: -1.0, description: "ProShares Short MSCI Emerging Markets", verified: true }
+  EDZ:   { underlying: EEM, leverage: -3.0, description: "Direxion Daily MSCI EM Bear 3x", verified: true }
+  YXI:   { underlying: FXI, leverage: -1.0, description: "ProShares Short FTSE China 50", verified: true }
+  YANG:  { underlying: FXI, leverage: -3.0, description: "Direxion Daily FTSE China Bear 3x", verified: true }
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK BEAR ETFs — Direxion Bear 1X family
+  # ════════════════════════════════════════════════════════════════
+  AAPD:  { underlying: AAPL,  leverage: -1.0, description: "Direxion Daily AAPL Bear 1X", verified: true }
+  AMDD:  { underlying: AMD,   leverage: -1.0, description: "Direxion Daily AMD Bear 1X", verified: true }
+  AMZD:  { underlying: AMZN,  leverage: -1.0, description: "Direxion Daily AMZN Bear 1X", verified: true }
+  AVS:   { underlying: AVGO,  leverage: -1.0, description: "Direxion Daily AVGO Bear 1X", verified: true }
+  CSCS:  { underlying: CSCO,  leverage: -1.0, description: "Direxion Daily CSCO Bear 1X", verified: true }
+  GGLS:  { underlying: GOOGL, leverage: -1.0, description: "Direxion Daily GOOGL Bear 1X", verified: true }
+  METD:  { underlying: META,  leverage: -1.0, description: "Direxion Daily META Bear 1X", verified: true }
+  MSFD:  { underlying: MSFT,  leverage: -1.0, description: "Direxion Daily MSFT Bear 1X", verified: true }
+  MUD:   { underlying: MU,    leverage: -1.0, description: "Direxion Daily MU Bear 1X", verified: true }
+  NFXS:  { underlying: NFLX,  leverage: -1.0, description: "Direxion Daily NFLX Bear 1X", verified: true }
+  NVDD:  { underlying: NVDA,  leverage: -1.0, description: "Direxion Daily NVDA Bear 1X", verified: true }
+  ORCS:  { underlying: ORCL,  leverage: -1.0, description: "Direxion Daily ORCL Bear 1X", verified: true }
+  PALD:  { underlying: PANW,  leverage: -1.0, description: "Direxion Daily PANW Bear 1X", verified: true }
+  PLTD:  { underlying: PLTR,  leverage: -1.0, description: "Direxion Daily PLTR Bear 1X", verified: true }
+  QCMD:  { underlying: QCOM,  leverage: -1.0, description: "Direxion Daily QCOM Bear 1X", verified: true }
+  TSLS:  { underlying: TSLA,  leverage: -1.0, description: "Direxion Daily TSLA Bear 1X", verified: true }
+  TSMZ:  { underlying: TSM,   leverage: -1.0, description: "Direxion Daily TSM Bear 1X", verified: true }
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK BEAR ETFs — T-REX 2X Inverse (REX Shares)
+  # ════════════════════════════════════════════════════════════════
+  NVDQ:  { underlying: NVDA, leverage: -2.0, description: "T-REX 2X Inverse NVDA Daily", verified: true }
+  TSLZ:  { underlying: TSLA, leverage: -2.0, description: "T-REX 2X Inverse TSLA Daily", verified: true }
+  MSTZ:  { underlying: MSTR, leverage: -2.0, description: "T-REX 2X Inverse MSTR Daily", verified: true }
+  CRCD:  { underlying: CRCL, leverage: -2.0, description: "T-REX 2X Inverse Circle Daily", verified: true }
+  CORD:  { underlying: CRWV, leverage: -2.0, description: "T-REX 2X Inverse CoreWeave Daily", verified: true }
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK BEAR ETFs — Tradr Short
+  # ════════════════════════════════════════════════════════════════
+  AMZO:  { underlying: AMZN, leverage: -2.0, description: "Tradr 2X Short AMZN Daily", verified: true }
+  APLZ:  { underlying: APLD, leverage: -2.0, description: "Tradr 2X Short APLD Daily (Applied Digital)", verified: true }
+  BEZ:   { underlying: BE,   leverage: -2.0, description: "Tradr 2X Short BE Daily (Bloom Energy)", verified: true }
+  CLSZ:  { underlying: CLSK, leverage: -2.0, description: "Tradr 2X Short CLSK Daily (Cleanspark)", verified: true }
+  IREZ:  { underlying: IREN, leverage: -2.0, description: "Tradr 2X Short IREN Daily", verified: true }
+  LITZ:  { underlying: LITE, leverage: -2.0, description: "Tradr 2X Short LITE Daily (Lumentum)", verified: true }
+  NBIZ:  { underlying: NBIS, leverage: -2.0, description: "Tradr 2X Short NBIS Daily (Nebius)", verified: true }
+  NVDS:  { underlying: NVDA, leverage: -1.5, description: "Tradr 1.5X Short NVDA Daily", verified: true }
+  SNDQ:  { underlying: SNDK, leverage: -2.0, description: "Tradr 2X Short SNDK Daily (SanDisk)", verified: true }
+  SMZ:   { underlying: SMR,  leverage: -2.0, description: "Tradr 2X Short SMR Daily (NuScale Power)", verified: true }
+  TSLQ:  { underlying: TSLA, leverage: -2.0, description: "Tradr 2X Short TSLA Daily", verified: true }
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK BEAR ETFs — GraniteShares 2X Short (US-listed)
+  # ════════════════════════════════════════════════════════════════
+  CONI:  { underlying: COIN, leverage: -2.0, description: "GraniteShares 2x Short COIN Daily", verified: true }
+  MSDD:  { underlying: MSTR, leverage: -2.0, description: "GraniteShares 2x Short MSTR Daily", verified: true }
+  NVD:   { underlying: NVDA, leverage: -2.0, description: "GraniteShares 2x Short NVDA Daily", verified: true }
+  TSDD:  { underlying: TSLA, leverage: -2.0, description: "GraniteShares 2x Short TSLA Daily", verified: true }
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK BEAR ETFs — Defiance 2X Short
+  # ════════════════════════════════════════════════════════════════
+  SMST:  { underlying: MSTR, leverage: -2.0, description: "Defiance Daily Target 2X Short MSTR", verified: true }
+
+
+# Underlyings that still have NO verified inverse expression on this desk.
+# Agents should publish 'flat' for bearish theses on these names.
+no_verified_inverse:
+  # Defense / industrials — no clean single-stock or sub-sector inverse exists
+  - LMT
+  - RTX
+  - GE
+  - HON
+  - UNP
+  - UPS
+  - FDX
+  - CAT
+  - DE
+  - BA
+  # Financials individual names (use SEF/SKF/FAZ for sector-broad bearish)
+  - JPM
+  - BAC
+  - WFC
+  - GS
+  - MS
+  - C
+  - SCHW
+  - BLK
+  - KRE
+  # Consumer individual names (no clean XLY/XLP sub-sector inverses)
+  - WMT
+  - COST
+  - PG
+  - KO
+  - PEP
+  - MCD
+  - NKE
+  - SBUX
+  - HD
+  - TGT
+  - LULU
+  - XLP
+  - XLY
+  # Healthcare — no single-stock inverses widely available
+  - LLY
+  - JNJ
+  - UNH
+  - PFE
+  - MRK
+  - ABBV
+  - TMO
+  - ABT
+  - MRNA
+  # Semis without single-stock bears (use SOXS for sector-broad)
+  - ASML
+  - AMAT
+  - LRCX
+  - KLAC
+  - INTC
+  - ARM
+  - MRVL
+  # Tech without single-stock bears (use PSQ/SQQQ for sector-broad)
+  - CRM
+  - ADBE
+  # Energy / materials individual names (use DUG/ERY/SCO for sector-broad)
+  - XOM
+  - CVX
+  - COP
+  - OXY
+  - SLB
+  - XLB
+  - FCX
+  - NEM
+  - LIN
+  # REITs / utilities (use REK/SRS/DRV for sector-broad)
+  - PLD
+  - AMT
+  - EQIX
+  - O
+  - NEE
+  - SO
+  - DUK
+  - D
+  - AEP
+  - XLU
+  - XLI
+  # Other
+  - SLV
+  - VIX
+  - IEF
+  - HYG
+  - UUP
+  - EFA
+  - EWJ
+  - EWZ
+  - INDA

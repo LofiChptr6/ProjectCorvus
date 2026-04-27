@@ -1,0 +1,14 @@
+[Unit]
+Description=Mike midday review timer — fires at 11:00 ET, weekdays
+
+[Timer]
+# DST-aware (see trading-mike-morning.timer for the full DST note):
+#   EDT (Mar–Nov):   08:00 Phoenix = 11:00 ET   <-- this line
+#   EST (Nov–Mar):   09:00 Phoenix = 11:00 ET   (swap when DST flips)
+OnCalendar=Mon..Fri *-*-* 08:00:00
+Persistent=true
+AccuracySec=30s
+Unit=trading-mike-midday.service
+
+[Install]
+WantedBy=timers.target

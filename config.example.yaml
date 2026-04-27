@@ -1,0 +1,102 @@
+# Trading system configuration — copy to config.yaml and fill in real values.
+# NEVER commit config.yaml (contains the postgres password + IBKR account #).
+# .gitignore already excludes it.
+
+trading:
+  mode: paper                         # "paper" or "live" — must match IBKR connection
+
+ibkr:
+  host: 127.0.0.1
+  port: 4002                          # 4002=IB Gateway paper, 4001=live, 7497=TWS paper
+  client_id: 2                        # Per-skill assignments live in scripts/run_scheduled_skill.sh
+  account: ""                         # Your IBKR account number (e.g. "U12345678"). Leave blank to auto-detect.
+
+# Market data is served by massive.com (REST, polygon-compatible). API key
+# in .env as MASSIVE_API_KEY. IBKR is used only for orders + account state.
+data:
+  provider: massive
+  base_url: https://api.massive.com
+
+postgres:
+  host: localhost
+  port: 5432
+  database: trading
+  user: trading
+  password: "CHANGE_ME"               # plaintext for local-dev only; override via env var PG_PASSWORD in prod
+  min_pool: 2
+  max_pool: 20                        # raised from default 5 to support concurrent sector reviews + allocator
+  command_timeout: 30                 # seconds per query before async cancellation
+
+risk:
+  max_order_value: 10000              # Max single order notional ($)
+  max_order_shares: 1000
+  max_position_pct: 0.20              # Max position as fraction of NAV
+  max_daily_loss: 500                 # Circuit breaker: halt if daily loss > $500
+  max_run_notional: 25000             # Allocator: cap total notional placed in one rebalance run
+  max_daily_notional: 75000           # Allocator: cap total notional placed in a calendar day (UTC)
+  allow_extended_hours: false
+
+approval:
+  enabled: true
+  threshold_usd: 9000                 # Orders >= this require Telegram approval
+  timeout_s: 120
+
+# Scheduling is driven by systemd timers under scripts/systemd/. The cron
+# strings below are informational. Times are interpreted in the scheduler's
+# local timezone (America/Phoenix MST — no DST). Mike's market-anchored
+# routines must be rewritten twice a year to follow ET DST.
+schedule_hints:
+  scheduler_timezone: America/Phoenix
+  current_season: EDT                 # update when DST toggles (Mar / Nov)
+  director_routines:
+    mike_morning_edt: "6 6 * * 1-5"   # 6:06 MST = 9:06 EDT — deep market analysis
+    mike_morning_est: "6 7 * * 1-5"   # 7:06 MST = 9:06 EST — swap to this in Nov
+    mike_midday_edt:  "0 8 * * 1-5"   # 8:00 MST = 11:00 EDT — position reassessment
+    mike_midday_est:  "0 9 * * 1-5"   # 9:00 MST = 11:00 EST — swap to this in Nov
+    cassidy_evening:  "0 23 * * 1-5"  # 11:00 PM MST — AZ-anchored, no DST shift
+    hourly_review:    "0 * * * *"     # every hour, quiet-window gate inside the command
+  agent_routines:
+    morning_scan:     "30 9 * * 1-5"
+    monitor_fills:    "*/15 9-16 * * 1-5"
+    daily_summary:    "0 17 * * 1-5"
+    close_positions:  "45 15 * * 1-5"
+
+# Quiet window: no hourly-review activity 10pm–5am Arizona (MST, UTC-7).
+# Cassidy's scheduled report is EXEMPT — it runs at 11pm MST inside this window.
+quiet_window:
+  description: "No autonomous activity 10pm–5am Arizona (MST, UTC-7, no DST)"
+  az_start: "22:00"
+  az_end: "05:00"
+  utc_start: "05:00"
+  utc_end: "12:00"
+
+reporting:
+  output_dir: data/reports
+  log_dir: logs
+  csv_export: true
+
+news:
+  enabled: false
+  symbols: []
+
+# Concierge — long-running Sonnet-backed Telegram chat-ops service.
+# See concierge/README.md. Start with: bash scripts/start_concierge.sh
+concierge:
+  enabled: true
+  model: claude-sonnet-4-5-20250929   # override via env CONCIERGE_MODEL
+  max_tool_iterations: 5
+  history_turns: 40
+  daily_usd_cap: 5.00                 # halts Sonnet calls when reached (UTC-midnight reset)
+  nudge_interval_s: 60                # stale-proposal re-ping cadence
+  allowed_tools:
+    - get_positions
+    - get_balances
+    - get_pnl_summary
+    - get_open_orders
+    - get_quote
+    - get_agent_list
+    - get_mike_analysis
+    - list_pending_proposals
+    - resolve_proposal
+    - propose_strategic_change
+    - send_telegram_followup

@@ -1,0 +1,15 @@
+[Unit]
+Description=Mike morning analysis timer — fires at 9:06 ET, weekdays
+
+[Timer]
+# Phoenix is MST (UTC-7, no DST). NY observes DST.
+#   EDT (Mar–Nov):   06:06 Phoenix = 09:06 ET   <-- this line
+#   EST (Nov–Mar):   07:06 Phoenix = 09:06 ET   (swap when DST flips)
+# To switch seasons, edit the hour below and `systemctl --user daemon-reload && systemctl --user restart trading-mike-morning.timer`.
+OnCalendar=Mon..Fri *-*-* 06:06:00
+Persistent=true
+AccuracySec=30s
+Unit=trading-mike-morning.service
+
+[Install]
+WantedBy=timers.target

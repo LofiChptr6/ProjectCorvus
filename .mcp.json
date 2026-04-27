@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ibkr-trading": {
+      "type": "stdio",
+      "command": "/home/tianyizhang/opus trading/.venv/bin/python",
+      "args": ["/home/tianyizhang/opus trading/mcp_server.py"],
+      "cwd": "/home/tianyizhang/opus trading"
+    }
+  }
+}

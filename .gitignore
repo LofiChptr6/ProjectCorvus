@@ -1,0 +1,58 @@
+# ── Secrets & runtime config ─────────────────────────────────────────────────
+# .env holds Telegram / Anthropic / Massive API keys + chat ids.
+# config.yaml holds the postgres password and live IBKR account number.
+# NEVER commit either. Templates live at .env.example and config.example.yaml.
+.env
+.env.*
+!.env.example
+config.yaml
+*.env.local
+
+# ── Runtime data ──────────────────────────────────────────────────────────────
+# Trading state, agent journals, telegram caches, sqlite backups, mike's
+# daily analyses — all runtime, all sensitive in different ways. The few
+# Python source files that historically live under data/ are whitelisted.
+data/*
+!data/__init__.py
+!data/massive_client.py
+!data/.gitkeep
+logs/
+*.sqlite
+*.sqlite_backup
+*.db
+concierge.lock
+*.lock
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.coverage
+htmlcov/
+
+# ── Virtualenvs ───────────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Editor / OS ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# ── Claude Code local overrides ──────────────────────────────────────────────
+# .claude/settings.json is per-project (commit it). .local.json is per-user.
+.claude/settings.local.json
+.claude/.session/
+
+# ── Misc local artifacts ──────────────────────────────────────────────────────
+notes_local.md
+TODO.local.md

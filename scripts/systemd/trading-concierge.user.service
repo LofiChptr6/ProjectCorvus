@@ -1,0 +1,20 @@
+[Unit]
+Description=Trading Concierge (Sonnet-backed Telegram bot, user mode)
+Documentation=file:///home/tianyizhang/opus%20trading/concierge/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tianyizhang/opus trading
+EnvironmentFile=/home/tianyizhang/opus trading/.env
+ExecStart=/home/tianyizhang/opus trading/.venv/bin/python -m concierge.service
+KillSignal=SIGTERM
+TimeoutStopSec=15
+Restart=on-failure
+RestartSec=10
+
+[Install]
+# Mode C analog: runs while the user has an active session. To survive
+# logout/reboot without re-login, run:  loginctl enable-linger tianyizhang
+WantedBy=default.target

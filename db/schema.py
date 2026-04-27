@@ -1,0 +1,379 @@
+"""PostgreSQL schema + connection pool. Called once at startup to create tables."""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
+import asyncpg
+import yaml
+
+log = logging.getLogger(__name__)
+
+# Legacy export kept so existing imports that reference DB_PATH don't break.
+# The sqlite path is only used by the one-shot migration script.
+DB_PATH = "data/trading.db"
+
+_pool: Optional[asyncpg.Pool] = None
+_pool_cfg: dict = {}
+
+
+SCHEMA_STATEMENTS = [
+    """CREATE TABLE IF NOT EXISTS audit_log (
+        id                BIGSERIAL PRIMARY KEY,
+        session_id        TEXT NOT NULL,
+        created_at        TEXT NOT NULL,
+        agent_name        TEXT NOT NULL,
+        routine           TEXT NOT NULL,
+        trigger_source    TEXT NOT NULL,
+        system_prompt     TEXT,
+        messages          TEXT NOT NULL,
+        tool_rounds       INTEGER DEFAULT 0,
+        final_response    TEXT,
+        finish_reason     TEXT,
+        duration_ms       INTEGER,
+        prompt_tokens     INTEGER,
+        completion_tokens INTEGER,
+        error             TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS tool_calls (
+        id           BIGSERIAL PRIMARY KEY,
+        session_id   TEXT NOT NULL,
+        created_at   TEXT NOT NULL,
+        tool_round   INTEGER NOT NULL,
+        tool_name    TEXT NOT NULL,
+        tool_input   TEXT NOT NULL,
+        tool_output  TEXT,
+        duration_ms  INTEGER,
+        error        TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS orders (
+        id               BIGSERIAL PRIMARY KEY,
+        session_id       TEXT,
+        agent_name       TEXT NOT NULL,
+        created_at       TEXT NOT NULL,
+        ibkr_order_id    INTEGER,
+        symbol           TEXT NOT NULL,
+        action           TEXT NOT NULL,
+        order_type       TEXT NOT NULL,
+        quantity         DOUBLE PRECISION NOT NULL,
+        limit_price      DOUBLE PRECISION,
+        stop_price       DOUBLE PRECISION,
+        status           TEXT NOT NULL,
+        risk_approved    INTEGER NOT NULL DEFAULT 0,
+        human_approved   INTEGER,
+        rejection_reason TEXT,
+        reasoning        TEXT,
+        mode             TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS fills (
+        id            BIGSERIAL PRIMARY KEY,
+        ibkr_exec_id  TEXT NOT NULL UNIQUE,
+        order_id      INTEGER,
+        agent_name    TEXT,
+        filled_at     TEXT NOT NULL,
+        symbol        TEXT NOT NULL,
+        action        TEXT NOT NULL,
+        quantity      DOUBLE PRECISION NOT NULL,
+        fill_price    DOUBLE PRECISION NOT NULL,
+        commission    DOUBLE PRECISION,
+        exchange      TEXT,
+        mode          TEXT NOT NULL
+    )""",
+    """CREATE TABLE IF NOT EXISTS positions_snapshot (
+        id             BIGSERIAL PRIMARY KEY,
+        snapshot_at    TEXT NOT NULL,
+        session_id     TEXT,
+        agent_name     TEXT,
+        symbol         TEXT NOT NULL,
+        quantity       DOUBLE PRECISION NOT NULL,
+        avg_cost       DOUBLE PRECISION NOT NULL,
+        market_price   DOUBLE PRECISION,
+        market_value   DOUBLE PRECISION,
+        unrealized_pnl DOUBLE PRECISION,
+        realized_pnl   DOUBLE PRECISION
+    )""",
+    """CREATE TABLE IF NOT EXISTS pnl_daily (
+        id             BIGSERIAL PRIMARY KEY,
+        trade_date     TEXT NOT NULL,
+        agent_name     TEXT NOT NULL,
+        realized_pnl   DOUBLE PRECISION NOT NULL DEFAULT 0,
+        unrealized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
+        total_pnl      DOUBLE PRECISION NOT NULL DEFAULT 0,
+        nav_start      DOUBLE PRECISION,
+        nav_end        DOUBLE PRECISION,
+        num_trades     INTEGER DEFAULT 0,
+        num_fills      INTEGER DEFAULT 0,
+        updated_at     TEXT NOT NULL,
+        UNIQUE(trade_date, agent_name)
+    )""",
+    """CREATE TABLE IF NOT EXISTS agent_allocations (
+        id              BIGSERIAL PRIMARY KEY,
+        agent_name      TEXT NOT NULL UNIQUE,
+        allocation_pct  DOUBLE PRECISION NOT NULL,
+        updated_at      TEXT NOT NULL,
+        updated_by      TEXT NOT NULL DEFAULT 'cli'
+    )""",
+    # One-time migration from $-based to %-based. Idempotent — checks col existence.
+    """DO $$ BEGIN
+        IF EXISTS (
+            SELECT 1 FROM information_schema.columns
+            WHERE table_name='agent_allocations' AND column_name='allocated_usd'
+        ) THEN
+            ALTER TABLE agent_allocations ADD COLUMN IF NOT EXISTS allocation_pct DOUBLE PRECISION;
+            -- Migrate using the most recent NAV from pnl_daily; fallback to safe default.
+            UPDATE agent_allocations
+            SET allocation_pct = COALESCE(allocation_pct, allocated_usd / NULLIF(43932.51, 0))
+            WHERE allocation_pct IS NULL;
+            ALTER TABLE agent_allocations ALTER COLUMN allocation_pct SET NOT NULL;
+            ALTER TABLE agent_allocations DROP COLUMN allocated_usd;
+        END IF;
+    END $$;""",
+    """CREATE TABLE IF NOT EXISTS kill_switch (
+        id             BIGSERIAL PRIMARY KEY,
+        agent_name     TEXT,
+        is_active      INTEGER NOT NULL DEFAULT 0,
+        activated_at   TEXT,
+        activated_by   TEXT,
+        reason         TEXT,
+        deactivated_at TEXT
+    )""",
+    """CREATE TABLE IF NOT EXISTS news_items (
+        id         BIGSERIAL PRIMARY KEY,
+        fetched_at TEXT NOT NULL,
+        symbol     TEXT,
+        headline   TEXT NOT NULL,
+        article_id TEXT,
+        provider   TEXT
+    )""",
+    # Per-agent thesis/memory journal (append-only). Status updates on existing
+    # rows; new ideas append new rows. parent_id chains supersedes/refinements.
+    """CREATE TABLE IF NOT EXISTS agent_thesis (
+        id               BIGSERIAL PRIMARY KEY,
+        agent_name       TEXT NOT NULL,
+        created_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        kind             TEXT NOT NULL,
+        title            TEXT NOT NULL,
+        body             TEXT NOT NULL,
+        status           TEXT NOT NULL DEFAULT 'open',
+        verify_by        DATE,
+        parent_id        BIGINT REFERENCES agent_thesis(id),
+        market_snapshot  JSONB,
+        resolution_note  TEXT,
+        resolved_at      TIMESTAMPTZ
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_thesis_agent_status ON agent_thesis (agent_name, status, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_thesis_verify_open ON agent_thesis (agent_name, verify_by) WHERE status = 'open'",
+    # Tool-gap requests routed through Mike (Mike consolidates in his morning analysis).
+    """CREATE TABLE IF NOT EXISTS agent_tool_gaps (
+        id           BIGSERIAL PRIMARY KEY,
+        agent_name   TEXT NOT NULL,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        tool_name    TEXT NOT NULL,
+        description  TEXT NOT NULL,
+        use_case     TEXT NOT NULL,
+        priority     TEXT NOT NULL DEFAULT 'normal',
+        status       TEXT NOT NULL DEFAULT 'open',
+        mike_note    TEXT,
+        resolved_at  TIMESTAMPTZ
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_tool_gaps_status ON agent_tool_gaps (status, created_at DESC)",
+    # One row per agent per trading day for the evening summary.
+    """CREATE TABLE IF NOT EXISTS agent_evening_digests (
+        id                BIGSERIAL PRIMARY KEY,
+        agent_name        TEXT NOT NULL,
+        trading_date      DATE NOT NULL,
+        created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        thesis_summary    TEXT,
+        open_questions    TEXT,
+        tomorrow_focus    TEXT,
+        pnl_today         NUMERIC,
+        pnl_week          NUMERIC,
+        positions_json    JSONB,
+        chart_path        TEXT,
+        telegram_sent_at  TIMESTAMPTZ,
+        UNIQUE(agent_name, trading_date)
+    )""",
+    # Conviction views — sector agents publish (symbol, direction, conviction)
+    # rows that feed mike-allocator. Upserted on every review; conviction auto-
+    # expires via expires_at so stale views never pollute the allocator.
+    """CREATE TABLE IF NOT EXISTS agent_conviction (
+        id                    BIGSERIAL PRIMARY KEY,
+        agent_name            TEXT NOT NULL,
+        symbol                TEXT NOT NULL,
+        direction             TEXT NOT NULL,
+        conviction            NUMERIC NOT NULL,
+        expected_return_pct   NUMERIC,
+        time_to_target_days   INTEGER,
+        rationale             TEXT,
+        model_inputs          JSONB,
+        submitted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at            TIMESTAMPTZ NOT NULL,
+        UNIQUE(agent_name, symbol)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_conv_active ON agent_conviction (expires_at) WHERE conviction > 0",
+    "CREATE INDEX IF NOT EXISTS idx_conv_symbol ON agent_conviction (symbol, expires_at)",
+    # Mike's allocator decisions — one row per rebalance run.
+    """CREATE TABLE IF NOT EXISTS allocation_decision (
+        id                       BIGSERIAL PRIMARY KEY,
+        decided_at               TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        nav_at_decision          NUMERIC NOT NULL,
+        target_weights_json      JSONB NOT NULL,
+        contributing_views_json  JSONB NOT NULL,
+        orders_placed_json       JSONB,
+        notes                    TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_alloc_decided ON allocation_decision (decided_at DESC)",
+    # P&L attribution — each fill is divided across contributing agents
+    # proportionally to their share of the conviction that drove the trade.
+    """CREATE TABLE IF NOT EXISTS agent_pnl_attribution (
+        id                  BIGSERIAL PRIMARY KEY,
+        fill_id             BIGINT,
+        decision_id         BIGINT REFERENCES allocation_decision(id),
+        agent_name          TEXT NOT NULL,
+        symbol              TEXT NOT NULL,
+        attribution_share   NUMERIC NOT NULL,
+        attributed_pnl      NUMERIC,
+        decided_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_pnl_attr_agent ON agent_pnl_attribution (agent_name, decided_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_pnl_attr_fill ON agent_pnl_attribution (fill_id)",
+    # Per-agent narrative archive. Written by sector-archivist weekly. Each row
+    # is one chapter covering [period_start, period_end] for one agent —
+    # condensing closed theses, conviction history, and attributed P&L into a
+    # short prose summary so old rows can be pruned without losing the story.
+    """CREATE TABLE IF NOT EXISTS sector_story (
+        id              BIGSERIAL PRIMARY KEY,
+        agent_name      TEXT NOT NULL,
+        period_start    DATE NOT NULL,
+        period_end      DATE NOT NULL,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        narrative       TEXT NOT NULL,
+        stats_json      JSONB,
+        rows_archived   JSONB,
+        UNIQUE(agent_name, period_end)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_story_agent ON sector_story (agent_name, period_end DESC)",
+    # Desk-wide threads board. Multi-author public bulletin: user announcements,
+    # Mike's morning analysis, agent reports, external news feeds. Read by every
+    # agent on every review (active desk-announcements posts are auto-injected
+    # into agent system prompts).
+    """CREATE TABLE IF NOT EXISTS thread (
+        id            BIGSERIAL PRIMARY KEY,
+        slug          TEXT NOT NULL UNIQUE,
+        title         TEXT NOT NULL,
+        description   TEXT,
+        tags          TEXT[] NOT NULL DEFAULT ARRAY[]::TEXT[],
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        archived_at   TIMESTAMPTZ
+    )""",
+    """CREATE TABLE IF NOT EXISTS post (
+        id              BIGSERIAL PRIMARY KEY,
+        thread_id       BIGINT NOT NULL REFERENCES thread(id) ON DELETE CASCADE,
+        author          TEXT NOT NULL,
+        author_kind     TEXT NOT NULL,
+        posted_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        title           TEXT,
+        body            TEXT NOT NULL,
+        meta            JSONB NOT NULL DEFAULT '{}'::jsonb,
+        parent_post_id  BIGINT REFERENCES post(id) ON DELETE SET NULL,
+        expires_at      TIMESTAMPTZ
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_post_thread_posted ON post (thread_id, posted_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_post_author_posted ON post (author, posted_at DESC)",
+    # Seed canonical threads (idempotent — INSERT ON CONFLICT DO NOTHING).
+    """INSERT INTO thread (slug, title, description, tags) VALUES
+        ('desk-announcements',
+         'Desk announcements',
+         'Operational constraints + system-wide notices. Every agent reads active posts on every review.',
+         ARRAY['announcements','ops']),
+        ('mikes-morning',
+         'Mike''s morning analysis',
+         'Director-level daily market read. Mike posts ~9:06 ET pre-open.',
+         ARRAY['analysis','daily']),
+        ('user-announcements',
+         'User announcements',
+         'Posts directly from the desk owner.',
+         ARRAY['user']),
+        ('news-headlines',
+         'External news feed',
+         'Auto-posted headlines from connected news sources.',
+         ARRAY['news','external'])
+       ON CONFLICT (slug) DO NOTHING""",
+    # Hot-path indexes (audit_log/tool_calls/orders/fills): without these the query
+    # planner falls back to seq-scans once these tables grow past ~100k rows.
+    "CREATE INDEX IF NOT EXISTS idx_audit_log_session ON audit_log (session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_audit_log_agent_created ON audit_log (agent_name, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls (session_id)",
+    "CREATE INDEX IF NOT EXISTS idx_orders_agent_status ON orders (agent_name, status)",
+    "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_fills_agent_filled ON fills (agent_name, filled_at DESC)",
+]
+
+
+def _load_pg_cfg() -> dict:
+    """Load pg creds from config.yaml (override via PG_* env vars)."""
+    global _pool_cfg
+    if _pool_cfg:
+        return _pool_cfg
+    cfg_path = Path("config.yaml")
+    pg: dict = {}
+    if cfg_path.exists():
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            pg = (yaml.safe_load(f) or {}).get("postgres", {})
+    _pool_cfg = {
+        "host": os.getenv("PG_HOST") or pg.get("host", "localhost"),
+        "port": int(os.getenv("PG_PORT") or pg.get("port", 5432)),
+        "database": os.getenv("PG_DATABASE") or pg.get("database", "trading"),
+        "user": os.getenv("PG_USER") or pg.get("user", "postgres"),
+        "password": os.getenv("PG_PASSWORD") or str(pg.get("password", "")),
+        "min_size": int(pg.get("min_pool", 1)),
+        "max_size": int(pg.get("max_pool", 5)),
+        "command_timeout": float(pg.get("command_timeout", 15)),
+    }
+    return _pool_cfg
+
+
+async def get_pool() -> asyncpg.Pool:
+    """Return the shared asyncpg pool, creating it on first call."""
+    global _pool
+    if _pool is not None:
+        return _pool
+    cfg = _load_pg_cfg()
+    _pool = await asyncpg.create_pool(
+        host=cfg["host"],
+        port=cfg["port"],
+        database=cfg["database"],
+        user=cfg["user"],
+        password=cfg["password"],
+        min_size=cfg["min_size"],
+        max_size=cfg["max_size"],
+        timeout=10,
+        command_timeout=cfg["command_timeout"],
+    )
+    return _pool
+
+
+async def init_db(db_path: str = DB_PATH) -> None:
+    """Create all tables and seed initial kill_switch row if empty.
+    `db_path` is ignored (kept for backward compat with callers)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        for stmt in SCHEMA_STATEMENTS:
+            await conn.execute(stmt)
+        # Seed one global-kill row if table is empty (was 'INSERT OR IGNORE' in sqlite).
+        row = await conn.fetchrow("SELECT COUNT(*) AS n FROM kill_switch")
+        if row and row["n"] == 0:
+            await conn.execute(
+                "INSERT INTO kill_switch (agent_name, is_active) VALUES (NULL, 0)"
+            )
+    log.info("Postgres schema ready (host=%s db=%s)", _pool_cfg.get("host"), _pool_cfg.get("database"))
+
+
+async def close_pool() -> None:
+    global _pool
+    if _pool is not None:
+        await _pool.close()
+        _pool = None

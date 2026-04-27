@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"/home/tianyizhang/opus trading/scripts/stop_hook_telegram.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

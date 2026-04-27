@@ -1,0 +1,13 @@
+[Unit]
+Description=Cassidy evening risk review timer — fires at 23:00 Phoenix, weekdays
+
+[Timer]
+# Anchored to AZ wall-clock (no DST shift). The cassidy-evening command is the
+# one routine that legitimately runs *inside* the 22:00–05:00 quiet window.
+OnCalendar=Mon..Fri *-*-* 23:00:00
+Persistent=true
+AccuracySec=30s
+Unit=trading-cassidy-evening.service
+
+[Install]
+WantedBy=timers.target
