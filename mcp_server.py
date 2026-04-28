@@ -86,6 +86,7 @@ _RATE_LIMITS: dict[str, tuple[int, float]] = {
     "post_to_thread":         (60,  60.0),    # mostly external feeds; user posts are rare
     "get_thread_posts":      (300,  60.0),    # every agent reads on every review
     "search_posts":           (60,  60.0),
+    "get_trading_briefing":   (60,  60.0),    # ProjectParrot/Mocha UI panel
 }
 _rate_calls: dict[str, list[float]] = {}
 
@@ -278,11 +279,17 @@ async def get_positions() -> str:
 @mcp.tool()
 async def get_balances() -> str:
     """
-    Get account balances: NAV, cash, buying power, today's realized P&L.
+    Get account balances: NAV, cash, buying power, today's realized + unrealized
+    P&L, and combined total. Combined = realized + unrealized — what the desk
+    is actually up/down right now (open positions included).
     """
     await _ensure_init()
     from ibkr.account import get_account_summary
-    return json.dumps(await get_account_summary())
+    summary = await get_account_summary()
+    realized = float(summary.get("realized_pnl_today") or 0.0)
+    unrealized = float(summary.get("unrealized_pnl") or 0.0)
+    summary["combined_pnl_today"] = realized + unrealized
+    return json.dumps(summary)
 
 
 @mcp.tool()
@@ -370,10 +377,22 @@ async def place_order(
     from risk.models import AccountState, OrderRequest
     from risk.guardrails import check as risk_check
 
+    # Fetch a quote for market orders so the min-quantity gate can compare
+    # against the live price. Limit/stop orders carry their own price already;
+    # only call out for MKT to avoid the round-trip.
+    current_mark: Optional[float] = None
+    if order_type == "MKT":
+        try:
+            from data.massive_client import get_quote as _get_quote
+            q = await _get_quote(symbol)
+            current_mark = float(q.get("last") or q.get("close") or 0.0) or None
+        except Exception:
+            current_mark = None
+
     order = OrderRequest(
         symbol=symbol, action=action, quantity=quantity, order_type=order_type,
         limit_price=limit_price, stop_price=stop_price, reasoning=reasoning,
-        agent_name=agent_name,
+        agent_name=agent_name, current_mark=current_mark,
     )
     summary = await get_account_summary()
     positions = await get_positions()
@@ -387,10 +406,25 @@ async def place_order(
 
     risk_result = await risk_check(order, account, _cfg)
     if not risk_result.allowed:
-        return json.dumps({"status": "blocked", "reason": risk_result.reason, "check": risk_result.check_name})
+        # Sub-10-share gate: when the only blocker is min-quantity on an
+        # expensive ticker, fall through to the synchronous Telegram override
+        # rather than rejecting outright.
+        if risk_result.needs_telegram_approval:
+            from approval.workflow import request_approval
+            est_notional = quantity * (order.effective_price or 0.0)
+            override = await request_approval(order, est_notional, None, _cfg)
+            if not override.approved:
+                return json.dumps({
+                    "status": "approval_rejected",
+                    "reason": f"sub-{int(_cfg.get('risk', {}).get('min_shares_per_order', 10))}-share override declined: {override.reason}",
+                    "check": "min_quantity",
+                })
+            # Fall through to standard large-notional approval gate below.
+        else:
+            return json.dumps({"status": "blocked", "reason": risk_result.reason, "check": risk_result.check_name})
 
     # Human approval for large orders
-    price = limit_price or stop_price or 0
+    price = limit_price or stop_price or current_mark or 0
     notional = quantity * price
     approval_cfg = _cfg.get("approval", {})
     if approval_cfg.get("enabled", True) and notional >= approval_cfg.get("threshold_usd", 5000):
@@ -466,22 +500,79 @@ async def compute_technicals(symbol: str, indicators: list[str]) -> str:
 @mcp.tool()
 async def get_pnl_summary(period: str = "today", agent_name: Optional[str] = None) -> str:
     """
-    Get P&L summary by period.
+    Get P&L by agent. For period='today' (default), returns COMBINED P&L
+    (realized + unrealized) — open-position mark-to-market is split across
+    agents by their current conviction weight on each held symbol. For
+    'week'/'month'/'all', returns realized-only (unrealized is right-now,
+    not historical).
 
     Args:
         period: 'today', 'week', 'month', or 'all'
         agent_name: Filter by agent (omit for all agents)
     """
     await _ensure_init_light()
+    if period == "today":
+        from reporting.combined_pnl import get_pnl_combined
+        combined = await get_pnl_combined(agent_name=agent_name)
+        totals = {
+            "total_pnl": combined["desk"]["combined_total"],
+            "realized_pnl": combined["desk"]["realized_total"],
+            "unrealized_pnl": combined["desk"]["unrealized_total"],
+            "num_fills": sum(r["num_fills"] for r in combined["rows"]),
+            "commission_gap": combined["desk"]["commission_gap"],
+            "orphan_unrealized": combined["desk"]["orphan_unrealized"],
+        }
+        return json.dumps({"period": period, "by_agent": combined["rows"], "totals": totals})
     import db.store as store
     rows = await store.get_pnl_summary(agent_name=agent_name, period=period)
-    totals = {"realized_pnl": 0.0, "unrealized_pnl": 0.0, "total_pnl": 0.0, "num_fills": 0}
+    totals = {"total_pnl": 0.0, "num_fills": 0}
     for r in rows:
-        totals["realized_pnl"] += r.get("realized_pnl", 0) or 0
-        totals["unrealized_pnl"] += r.get("unrealized_pnl", 0) or 0
         totals["total_pnl"] += r.get("total_pnl", 0) or 0
         totals["num_fills"] += r.get("num_fills", 0) or 0
     return json.dumps({"period": period, "by_agent": rows, "totals": totals})
+
+
+@mcp.tool()
+async def get_my_pnl(agent_name: str) -> str:
+    """
+    Combined (realized + unrealized) P&L for your agent — the correct number to report.
+
+    Unrealized P&L is split using the stored attribution_shares from open fills, so
+    this works correctly at end-of-day after conviction views have expired.
+
+    Always use this instead of get_pnl_summary for your own P&L in evening reviews.
+
+    Returns: {realized_pnl, unrealized_pnl, total_pnl, num_fills, desk_total}
+    """
+    await _ensure_init_light()
+    from reporting.combined_pnl import get_pnl_combined
+    combined = await get_pnl_combined(agent_name=agent_name)
+    agent_row = next((r for r in combined["rows"] if r["agent_name"] == agent_name), {
+        "agent_name": agent_name, "realized_pnl": 0.0,
+        "unrealized_pnl": 0.0, "total_pnl": 0.0, "num_fills": 0,
+    })
+    return json.dumps({
+        "agent_name": agent_name,
+        "realized_pnl": agent_row.get("realized_pnl", 0.0),
+        "unrealized_pnl": agent_row.get("unrealized_pnl", 0.0),
+        "total_pnl": agent_row.get("total_pnl", 0.0),
+        "num_fills": agent_row.get("num_fills", 0),
+        "desk_total_pnl": combined["desk"]["combined_total"],
+        "note": "unrealized attributed via open fill shares, not live convictions",
+    })
+
+
+@mcp.tool()
+async def get_desk_policy() -> str:
+    """
+    Return the canonical desk-wide operating rules all agents must follow.
+    Call this at the start of any review session to internalize current policy.
+    """
+    policy_path = Path(__file__).parent / "DESK_POLICY.md"
+    try:
+        return json.dumps({"policy": policy_path.read_text()})
+    except FileNotFoundError:
+        return json.dumps({"policy": "(DESK_POLICY.md not found)"})
 
 
 @mcp.tool()
@@ -688,6 +779,24 @@ def _market_date() -> str:
 
 def _resolve_date(date: str) -> str:
     return _market_date() if date == "today" else date
+
+
+def _parse_window(window: str) -> tuple[str, str | None]:
+    """'today'/'week'/'month', Nd shorthand (e.g. '5d','30d'), or 'YYYY-MM-DD/YYYY-MM-DD' → (since_iso, until_iso). until=None means up to now."""
+    from datetime import date, timedelta
+    today = date.today()
+    if window == "today":
+        return today.isoformat() + "T00:00:00+00:00", None
+    if window == "week":
+        return (today - timedelta(days=7)).isoformat() + "T00:00:00+00:00", None
+    if window == "month":
+        return (today - timedelta(days=30)).isoformat() + "T00:00:00+00:00", None
+    if window.endswith("d") and window[:-1].isdigit():
+        return (today - timedelta(days=int(window[:-1]))).isoformat() + "T00:00:00+00:00", None
+    if "/" in window:
+        a, b = window.split("/", 1)
+        return a + "T00:00:00+00:00", b + "T23:59:59+00:00"
+    return window + "T00:00:00+00:00", window + "T23:59:59+00:00"
 
 
 # Per-date async lock so morning + midday writes cannot interleave.
@@ -1140,6 +1249,40 @@ async def send_telegram_chart(image_path: str, caption: Optional[str] = None) ->
     from approval.telegram import send_photo
     result = await send_photo(image_path, caption)
     return json.dumps({"sent": result is not None})
+
+
+@mcp.tool()
+async def generate_agent_chart(agent_name: str, date: Optional[str] = None) -> str:
+    """
+    Generate a 30-day performance chart PNG for one agent and return its file path.
+
+    Runs reporting/agent_chart.py as a subprocess (matplotlib, asyncpg). The chart
+    shows cumulative attributed P&L (top panel) and daily net P&L bars (bottom panel)
+    over the last 30 calendar days, plus overall prediction hit rate in the title.
+
+    Args:
+        agent_name: Sector agent name (e.g. "rex", "atlas").
+        date: Chart date YYYY-MM-DD (default: today).
+
+    Returns:
+        {"chart_path": "data/charts/{agent}_{date}.png"}
+        {"error": "..."} on failure.
+    """
+    import asyncio as _asyncio
+    from datetime import date as _date
+
+    d = date or _date.today().isoformat()
+    proc = await _asyncio.create_subprocess_exec(
+        sys.executable, "-m", "reporting.agent_chart",
+        "--agent", agent_name, "--date", d,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+        cwd=str(Path(__file__).parent),
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return json.dumps({"error": stderr.decode().strip()})
+    return json.dumps({"chart_path": stdout.decode().strip()})
 
 
 # ── Custom indicator dispatch ─────────────────────────────────────────────────
@@ -1632,6 +1775,33 @@ async def rebalance_desk(
             kept.append(o)
         proposed = kept
 
+    # Sub-10-share gate. The allocator runs unattended hourly and must NOT
+    # block on Telegram mid-run, so handle expensive sub-min orders by skipping
+    # them here and surfacing under `pending_user_review` for the operator to
+    # approve manually via place_order. Cheap sub-min orders are dropped flat.
+    from risk.checks.order_size import evaluate_min_quantity
+    pending_user_review: list[dict] = []
+    min_qty_dropped: list[dict] = []
+    filtered: list = []
+    for o in proposed:
+        last_px = quotes.get(o.symbol) or quotes.get(o.symbol.lower()) or 0.0
+        status, reason = evaluate_min_quantity(float(o.qty), last_px or None, _cfg)
+        if status == "ok":
+            filtered.append(o)
+        elif status == "needs_telegram_approval":
+            pending_user_review.append({
+                "symbol": o.symbol, "side": o.side, "qty": o.qty,
+                "last_price": last_px, "delta_value": o.delta_value,
+                "rationale": o.rationale, "reason": reason,
+            })
+        else:  # reject
+            min_qty_dropped.append({
+                "symbol": o.symbol, "side": o.side, "qty": o.qty,
+                "last_price": last_px, "delta_value": o.delta_value,
+                "reason": reason,
+            })
+    proposed = filtered
+
     contributing_views_json = {
         sym: [{"agent": a, "weight": w} for (a, w) in tw.contributors.get(sym, [])]
         for sym in tw.weights
@@ -1664,6 +1834,18 @@ async def rebalance_desk(
     ]
 
     if dry_run:
+        try:
+            from meta_agent.holdings_snapshot import snapshot_after_decision
+            kanban = await snapshot_after_decision(
+                decision_id=decision_id, nav=nav,
+                target_weights=tw.weights,
+                contributing_views=contributing_views_json,
+                cash_weight=cash_weight,
+                cash_contributors=cash_contributors_json,
+            )
+        except Exception as exc:
+            log.warning("holding_kanban snapshot failed (dry_run): %s", exc)
+            kanban = {"error": f"{type(exc).__name__}: {exc}"}
         return json.dumps({
             "dry_run": True, "decision_id": decision_id,
             "nav": nav, "target_weights": tw.weights,
@@ -1673,7 +1855,10 @@ async def rebalance_desk(
             "proposed_orders": proposed_dump,
             "skipped_views": skipped_views,
             "cap_dropped": cap_dropped,
+            "min_qty_dropped": min_qty_dropped,
+            "pending_user_review": pending_user_review,
             "netted_pairs": netted_pairs_dump,
+            "holding_kanban": kanban,
         })
 
     # Live mode: place orders, then record attribution. Route through the
@@ -1722,6 +1907,23 @@ async def rebalance_desk(
             placed.append({"symbol": o.symbol, "error": f"{type(e).__name__}: {e}"})
 
     await store.update_allocation_orders(decision_id, placed)
+
+    # Holding Kanban snapshot — persistent per-agent×symbol row capturing
+    # who owns what right after Mike acts. Best-effort: failures are logged
+    # but don't fail the rebalance.
+    try:
+        from meta_agent.holdings_snapshot import snapshot_after_decision
+        kanban = await snapshot_after_decision(
+            decision_id=decision_id, nav=nav,
+            target_weights=tw.weights,
+            contributing_views=contributing_views_json,
+            cash_weight=cash_weight,
+            cash_contributors=cash_contributors_json,
+        )
+    except Exception as exc:
+        log.warning("holding_kanban snapshot failed (live): %s", exc)
+        kanban = {"error": f"{type(exc).__name__}: {exc}"}
+
     return json.dumps({
         "dry_run": False, "decision_id": decision_id,
         "nav": nav, "target_weights": tw.weights,
@@ -1731,7 +1933,10 @@ async def rebalance_desk(
         "orders_placed": placed,
         "skipped_views": skipped_views,
         "cap_dropped": cap_dropped,
+        "min_qty_dropped": min_qty_dropped,
+        "pending_user_review": pending_user_review,
         "netted_pairs": netted_pairs_dump,
+        "holding_kanban": kanban,
     }, default=str)
 
 
@@ -1752,6 +1957,97 @@ async def get_agent_pnl_attribution(
     from db import store
     rows = await store.get_agent_pnl_attribution(agent_name, since=since)
     return json.dumps({"attribution": rows}, default=str)
+
+
+@mcp.tool()
+async def get_my_standing(agent_name: str, lookback_hours: int = 24) -> str:
+    """
+    Holding Kanban: this agent's per-symbol holdings, conviction, and equity
+    over the last N hours, one row per (symbol, snapshot tick). Use this in
+    your evening review to see your trajectory — which symbols you held,
+    how attribution shifted, and how your agent_equity moved tick-by-tick.
+
+    Args:
+        agent_name: whose standing to read.
+        lookback_hours: window length (default 24h ≈ one trading day).
+
+    Returns:
+        {
+          "snapshots": [<row>, ...],          # newest first
+          "latest": {                         # convenience: agent's most recent tick
+            "snapshot_at": ..., "agent_equity": float, "holdings":
+              [{symbol, holding_qty, market_value, conviction, direction}, ...]
+          },
+        }
+    """
+    await _ensure_init_light()
+    from db import store
+    rows = await store.get_agent_holdings_snapshots(agent_name, lookback_hours=lookback_hours)
+    latest = None
+    if rows:
+        most_recent_ts = rows[0]["snapshot_at"]
+        latest_rows = [r for r in rows if r["snapshot_at"] == most_recent_ts]
+        latest = {
+            "snapshot_at": most_recent_ts,
+            "agent_equity": float(latest_rows[0].get("agent_equity") or 0.0) if latest_rows else 0.0,
+            "desk_nav": float(latest_rows[0].get("desk_nav") or 0.0) if latest_rows else 0.0,
+            "holdings": [
+                {
+                    "symbol": r["symbol"],
+                    "holding_qty": float(r["holding_qty"] or 0),
+                    "market_value": float(r["market_value"] or 0),
+                    "conviction": float(r["conviction"]) if r.get("conviction") is not None else None,
+                    "direction": r.get("direction"),
+                    "attribution_share": float(r["attribution_share"]) if r.get("attribution_share") is not None else None,
+                }
+                for r in latest_rows
+            ],
+        }
+    return json.dumps({"snapshots": rows, "latest": latest}, default=str)
+
+
+@mcp.tool()
+async def get_kanban_snapshot(at: Optional[str] = None) -> str:
+    """
+    Cross-section of the Holding Kanban: every (agent, symbol) row at the
+    snapshot tick nearest to (and ≤) `at` (default: most recent tick).
+    Use for desk-wide visualisation — who holds what at a given moment.
+
+    Args:
+        at: ISO timestamp; omitted returns the latest tick.
+    """
+    await _ensure_init_light()
+    from db import store
+    rows = await store.get_kanban_at(at=at)
+    snapshot_at = rows[0]["snapshot_at"] if rows else None
+    return json.dumps({"snapshot_at": snapshot_at, "rows": rows}, default=str)
+
+
+@mcp.tool()
+async def generate_kanban_chart(date: Optional[str] = None) -> str:
+    """
+    Render a stacked-bar visualization of the latest holding_kanban tick
+    (or the most recent tick on `date`). Each bar = symbol; segments
+    coloured by agent; height = market_value. Saves PNG under data/charts/
+    and returns its path.
+
+    Args:
+        date: YYYY-MM-DD; omitted = today.
+    """
+    await _ensure_init_light()
+    import asyncio as _asyncio
+    from datetime import date as _date
+    d = date or _date.today().isoformat()
+    proc = await _asyncio.create_subprocess_exec(
+        sys.executable, "-m", "reporting.kanban_chart",
+        "--date", d,
+        stdout=_asyncio.subprocess.PIPE,
+        stderr=_asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        return json.dumps({"error": (stderr or b"").decode().strip()})
+    return json.dumps({"chart_path": (stdout or b"").decode().strip()})
 
 
 @mcp.tool()
@@ -2059,6 +2355,675 @@ async def search_posts(
         query=query, thread_slug=thread_slug, author=author, limit=limit,
     )
     return json.dumps({"query": query, "matches": rows}, default=str)
+
+
+# ── ProjectParrot / Mocha briefing ────────────────────────────────────────────
+
+@mcp.tool()
+async def get_trading_briefing() -> str:
+    """
+    Live trading desk briefing: P&L, top positions, active conviction views, and
+    per-agent attribution. Call when the user asks for a portfolio update, morning
+    briefing, desk summary, or how the trading desk is performing.
+    """
+    await _ensure_init()
+    ok, reason = _rate_check("get_trading_briefing")
+    if not ok:
+        return json.dumps({"error": reason})
+
+    from datetime import datetime
+    from ibkr.account import get_account_summary, get_positions as _get_positions
+    from db import store
+
+    # ET market day, not OS clock — see _market_date() above.
+    report_date = _market_date()
+    display_date = datetime.strptime(report_date, "%Y-%m-%d").strftime("%b %-d, %Y")
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+
+    def _money(v: float) -> str:
+        return f"{'+' if v >= 0 else '-'}${abs(v):,.2f}"
+
+    # Independent reads — fetch in parallel.
+    # store.get_consolidated_view() is called directly (not via the mike-only
+    # MCP wrapper) because we use it for read-only display, not allocation.
+    # combined_pnl pulls IBKR account + positions + attribution + active
+    # convictions; it's the single source of truth for "right-now" desk P&L.
+    from reporting.combined_pnl import get_pnl_combined as _get_combined
+    acct, positions, combined, conv_view = await asyncio.gather(
+        get_account_summary(),
+        _get_positions(),
+        _get_combined(),
+        store.get_consolidated_view(),
+    )
+
+    pnl_rows = combined["rows"]
+    desk = combined["desk"]
+    total_pnl = float(desk["combined_total"])
+    realized_total = float(desk["realized_total"])
+    unrealized_total = float(desk["unrealized_total"])
+    commission_gap = float(desk["commission_gap"])
+    nav = float(acct.get("nav") or 0.0)
+    pnl_pct = (total_pnl / nav * 100) if nav else 0.0
+
+    best = max(pnl_rows, key=lambda r: float(r.get("total_pnl") or 0), default=None)
+    worst = min(pnl_rows, key=lambda r: float(r.get("total_pnl") or 0), default=None)
+
+    sorted_pos = sorted(
+        positions,
+        key=lambda p: abs(float(p.get("quantity") or 0) * float(p.get("avg_cost") or 1)),
+        reverse=True,
+    )[:4]
+    chart_symbols = [{"symbol": p["symbol"]} for p in sorted_pos if p.get("symbol")]
+
+    conv_items = sorted(
+        [(sym, data) for sym, data in conv_view.items() if float(data.get("net") or 0) != 0],
+        key=lambda x: abs(float(x[1].get("net") or 0)),
+        reverse=True,
+    )[:5]
+    conviction_bullets = []
+    for sym, data in conv_items:
+        net = float(data.get("net") or 0)
+        direction = "LONG" if net > 0 else "SHORT"
+        conviction_bullets.append(f"{sym}: desk net {direction} (score {net:.2f})")
+
+    sorted_agents = sorted(pnl_rows, key=lambda r: float(r.get("total_pnl") or 0), reverse=True)
+    attr_lines = ["| Agent | P&L | Fills |", "|---|---|---|"]
+    for r in sorted_agents:
+        pnl_val = float(r.get("total_pnl") or 0)
+        attr_lines.append(f"| {r['agent_name']} | {_money(pnl_val)} | {r.get('num_fills', 0)} |")
+    attr_md = "\n".join(attr_lines) if len(attr_lines) > 2 else "_No attribution data yet._"
+
+    direction_word = "up" if total_pnl >= 0 else "down"
+    pnl_narration = (
+        f"The desk is {direction_word} ${abs(total_pnl):,.0f} today, "
+        f"a move of {pnl_pct:+.2f}% on NAV."
+    )
+    if best and float(best.get("total_pnl") or 0) > 0:
+        pnl_narration += f" {best['agent_name'].capitalize()} leads with ${float(best['total_pnl']):,.0f}."
+
+    pos_narration = (
+        f"Here are the top {len(chart_symbols)} positions by notional size. "
+        "Chart shows intraday price action."
+    ) if chart_symbols else "No open positions on the desk right now."
+
+    conv_narration = (
+        f"The desk holds active conviction on {len(conv_items)} symbol{'s' if len(conv_items) != 1 else ''}. "
+        "Scores represent aggregated sector-agent net conviction."
+    ) if conv_items else "No active conviction views are posted right now."
+
+    attr_narration = "Here is the P&L breakdown by sector agent for today."
+    if worst and float(worst.get("total_pnl") or 0) < 0:
+        attr_narration += f" {worst['agent_name'].capitalize()} is the drag at {_money(float(worst['total_pnl']))}."
+    elif pnl_rows:
+        attr_narration += " No agents in the red today."
+
+    # Best/worst suppression: when every agent rounds to $0 (nothing closed AND
+    # no unrealized exposure attributed), the "best agent atlas +$0 / worst
+    # agent atlas +$0" footgun returns. Hide the cards in that case.
+    nontrivial_rows = [r for r in pnl_rows if abs(float(r.get("total_pnl") or 0)) >= 1.0]
+    show_best_worst = bool(nontrivial_rows)
+
+    slides: list[dict] = [
+        {
+            "type": "stat_row",
+            "narration": pnl_narration,
+            "title": "Today's P&L (realized + unrealized)",
+            "stats": [
+                {"label": "Total P&L", "value": _money(total_pnl), "delta": f"{pnl_pct:+.2f}%"},
+                {"label": "NAV", "value": f"${nav:,.0f}"},
+                {"label": "Best agent",
+                 "value": (f"{best['agent_name']} {_money(float(best['total_pnl']))}"
+                           if (show_best_worst and best) else "—")},
+                {"label": "Worst agent",
+                 "value": (f"{worst['agent_name']} {_money(float(worst['total_pnl']))}"
+                           if (show_best_worst and worst) else "—")},
+            ],
+        },
+    ]
+
+    # Reconciliation sub-row so the user can spot commission drag and orphan
+    # exposure (open positions with no current conviction backing them).
+    orphan = float(desk.get("orphan_unrealized") or 0.0)
+    if abs(commission_gap) >= 1.0 or abs(orphan) >= 1.0:
+        slides.append({
+            "type": "stat_row",
+            "narration": (
+                f"Reconciliation: realized {_money(realized_total)}, "
+                f"unrealized {_money(unrealized_total)}. "
+                + (f"Commission/fees drag {_money(commission_gap)}. " if abs(commission_gap) >= 1.0 else "")
+                + (f"{_money(orphan)} of unrealized has no active conviction backing it." if abs(orphan) >= 1.0 else "")
+            ),
+            "title": "P&L Reconciliation",
+            "stats": [
+                {"label": "Realized", "value": _money(realized_total)},
+                {"label": "Unrealized", "value": _money(unrealized_total)},
+                {"label": "Commission gap", "value": _money(commission_gap)},
+                {"label": "Orphan unrealized", "value": _money(orphan)},
+            ],
+        })
+
+    if chart_symbols:
+        slides.append({
+            "type": "multi_chart",
+            "narration": pos_narration,
+            "title": "Top Positions",
+            "symbols": chart_symbols,
+            "default_period": "1d",
+        })
+
+    if conviction_bullets:
+        slides.append({
+            "type": "bullets",
+            "narration": conv_narration,
+            "title": "Active Desk Conviction",
+            "items": conviction_bullets,
+        })
+
+    slides.append({
+        "type": "markdown",
+        "narration": attr_narration,
+        "title": "Agent Attribution",
+        "content": attr_md,
+    })
+
+    payload = {
+        "__panel__": "create_presentation",
+        "__payload__": {
+            "id": f"pres_trading_briefing_{ts}",
+            "title": f"Trading Desk — {display_date}",
+            "slides": slides,
+        },
+    }
+    return json.dumps(payload)
+
+
+# ── Parrot / Nori insight tools ───────────────────────────────────────────────
+
+@mcp.tool()
+async def get_position_dossier(symbol: str) -> str:
+    """
+    Deep view of one position the user holds: which agent put it on, the agent's
+    thesis, recent fills, and net P&L on the symbol. Call when the user asks about
+    ONE specific position — "tell me about LMT", "who long'ed X", "what's the
+    thesis on X", "is the X thesis still good", "why did we close X".
+
+    Args:
+        symbol: Ticker to inspect, e.g. 'NVDA', 'LMT'
+    """
+    await _ensure_init_light()
+    ok, reason = _validate_symbol(symbol)
+    if not ok:
+        return json.dumps({"error": reason})
+    import db.store as store
+    from reporting.combined_pnl import get_symbol_unrealized
+    sym = symbol.upper()
+    convictions, fills, pnl, unrealized = await asyncio.gather(
+        store.get_convictions_for_symbol(sym),
+        store.get_symbol_fills(sym, lookback_days=30),
+        store.get_symbol_pnl_summary(sym),
+        get_symbol_unrealized(sym),
+    )
+    realized = sum(float(r.get("attributed_pnl") or 0) for r in pnl)
+    combined = realized + float(unrealized or 0.0)
+    if not convictions and not fills:
+        note = f"No desk exposure to {sym} — no active conviction and no fills in the last 30 days."
+    else:
+        long_agents  = [c["agent_name"] for c in convictions if c["direction"] == "long"]
+        short_agents = [c["agent_name"] for c in convictions if c["direction"] == "short"]
+        conflict = (f" NOTE: conflicting views — {long_agents} long vs {short_agents} short."
+                    if long_agents and short_agents else "")
+        note = (f"Desk holds {len(convictions)} active conviction(s) on {sym} "
+                f"({len(long_agents)} long, {len(short_agents)} short), "
+                f"{len(fills)} fill(s) in 30d, total P&L {combined:+,.2f} "
+                f"(real {realized:+,.2f}, unreal {float(unrealized):+,.2f}).{conflict}")
+    return json.dumps({
+        "symbol": sym,
+        "active_convictions": convictions,
+        "recent_fills_30d": fills,
+        "pnl_by_agent": pnl,
+        "realized_pnl": realized,
+        "unrealized_pnl": float(unrealized or 0.0),
+        "total_pnl": combined,
+        "analyst_note": note,
+    }, default=str)
+
+
+@mcp.tool()
+async def get_agent_overview(agent_id: str) -> str:
+    """
+    Full snapshot of one sector agent — active convictions, P&L, allocation, recent
+    sector view. Call when the user asks about ONE specific agent — "how is the
+    atlas agent doing", "what's maya running", "show me agent X's book".
+
+    Args:
+        agent_id: Agent name, e.g. 'rex', 'atlas', 'maya'
+    """
+    await _ensure_init_light()
+    import db.store as store
+    from reporting.combined_pnl import get_pnl_combined
+    (convictions, open_theses, resolutions, combined_today, pnl_week,
+     allocations, digest, stories) = await asyncio.gather(
+        store.get_agent_active_convictions(agent_id),
+        store.get_open_theses(agent_id, limit=10),
+        store.get_recent_resolutions(agent_id, limit=5),
+        get_pnl_combined(agent_name=agent_id),
+        store.get_pnl_summary(agent_name=agent_id, period="week"),
+        store.get_allocations(),
+        store.get_agent_evening_digest(agent_id),
+        store.get_sector_stories(agent_id, limit=2),
+    )
+    alloc = next((a["allocation_pct"] for a in allocations if a["agent_name"] == agent_id), None)
+    today_row = next(iter(combined_today["rows"]), None)
+    t_pnl = float(today_row["total_pnl"]) if today_row else 0.0
+    t_real = float(today_row["realized_pnl"]) if today_row else 0.0
+    t_unreal = float(today_row["unrealized_pnl"]) if today_row else 0.0
+    w_pnl = sum(r["total_pnl"] for r in pnl_week)
+    note = (f"{agent_id.capitalize()} allocated {(alloc or 0)*100:.1f}% of NAV, "
+            f"{len(convictions)} active conviction(s). "
+            f"P&L today {t_pnl:+,.2f} (real {t_real:+,.2f}, unreal {t_unreal:+,.2f}), "
+            f"week {w_pnl:+,.2f} (realized). "
+            f"{len(open_theses)} open thesis(es).")
+    return json.dumps({
+        "agent_id": agent_id,
+        "allocation_pct": alloc,
+        "pnl_today": t_pnl,
+        "pnl_today_realized": t_real,
+        "pnl_today_unrealized": t_unreal,
+        "pnl_week": w_pnl,
+        "active_convictions": convictions,
+        "open_theses_count": len(open_theses),
+        "open_theses": open_theses,
+        "recent_resolutions": resolutions,
+        "last_evening_digest": digest,
+        "sector_stories_recent": stories,
+        "analyst_note": note,
+    }, default=str)
+
+
+@mcp.tool()
+async def get_pnl_attribution(window: str = "today") -> str:
+    """
+    Symbol-level and agent-level P&L attribution. Call when the user asks WHY money
+    moved — "why did I make money today", "what drove the loss", "where did the
+    alpha come from", "who lost me money".
+
+    Args:
+        window: 'today', 'week', 'month', or 'YYYY-MM-DD/YYYY-MM-DD'
+    """
+    await _ensure_init_light()
+    import db.store as store
+    since, until = _parse_window(window)
+    by_symbol, by_agent = await asyncio.gather(
+        store.get_pnl_attribution_by_symbol(since, until),
+        store.get_pnl_attribution_by_agent(since, until),
+    )
+
+    # For "today", overlay the live combined per-agent rows so the
+    # by_agent table includes mark-to-market unrealized. by_symbol stays
+    # historical-attribution only (unrealized has no per-symbol attribution
+    # entry yet — surfaced via get_position_dossier instead).
+    desk_realized = sum(r["total_pnl"] for r in by_agent)
+    desk_unrealized = 0.0
+    desk_combined = desk_realized
+    commission_gap = 0.0
+    orphan_unrealized = 0.0
+    if window == "today":
+        from reporting.combined_pnl import get_pnl_combined
+        combined = await get_pnl_combined()
+        by_agent = combined["rows"]
+        desk_realized = combined["desk"]["realized_total"]
+        desk_unrealized = combined["desk"]["unrealized_total"]
+        desk_combined = combined["desk"]["combined_total"]
+        commission_gap = combined["desk"]["commission_gap"]
+        orphan_unrealized = combined["desk"]["orphan_unrealized"]
+
+    if not by_symbol and not by_agent:
+        note = f"No P&L recorded for {window}."
+    else:
+        top_sym   = by_symbol[0] if by_symbol else None
+        top_agent = max(by_agent, key=lambda r: float(r.get("total_pnl") or 0), default=None)
+        bits = [f"Desk total {desk_combined:+,.2f} over {window}"]
+        if window == "today":
+            bits.append(f"(real {desk_realized:+,.2f}, unreal {desk_unrealized:+,.2f})")
+        if top_sym:
+            bits.append(f"best symbol: {top_sym['symbol']} ({top_sym['total_pnl']:+,.2f})")
+        if top_agent:
+            bits.append(f"{top_agent['agent_name'].capitalize()} leads agents "
+                        f"with {float(top_agent['total_pnl']):+,.2f}")
+        note = ". ".join(bits) + "."
+    return json.dumps({
+        "window": window,
+        "since": since,
+        "desk_total_pnl": desk_combined,
+        "desk_realized_pnl": desk_realized,
+        "desk_unrealized_pnl": desk_unrealized,
+        "commission_gap": commission_gap,
+        "orphan_unrealized": orphan_unrealized,
+        "by_symbol": by_symbol,
+        "by_agent": by_agent,
+        "analyst_note": note,
+    }, default=str)
+
+
+@mcp.tool()
+async def get_trade_activity(window: str = "today") -> str:
+    """
+    All fills and orders in a time window, grouped by agent and symbol with
+    aggregate statistics. Use to audit trading behavior or investigate
+    a period of unusual activity.
+
+    Args:
+        window: 'today', 'week', 'month', or 'YYYY-MM-DD/YYYY-MM-DD'
+    """
+    await _ensure_init_light()
+    import db.store as store
+    since, until = _parse_window(window)
+    fills, orders, stats = await asyncio.gather(
+        store.get_fills_window(since, until),
+        store.get_orders_window(since),
+        store.get_fill_stats_by_agent_symbol(since, until),
+    )
+    total_pnl  = sum(float(f.get("realized_pnl") or 0) for f in fills)
+    active_ags = len({f["agent_name"] for f in fills if f["agent_name"]})
+    rejected   = [o for o in orders if o["status"] in (
+        "blocked", "risk_rejected", "approval_rejected", "kill_switch_blocked")]
+    note = (f"Desk executed {len(fills)} fill(s) across {active_ags} agent(s) "
+            f"over {window}, realizing {total_pnl:+,.2f}."
+            + (f" {len(rejected)} order(s) blocked or rejected." if rejected else ""))
+    return json.dumps({
+        "window": window,
+        "summary": {
+            "total_fills": len(fills), "total_orders": len(orders),
+            "total_realized_pnl": total_pnl, "active_agents": active_ags,
+            "rejected_orders": len(rejected),
+        },
+        "stats_by_agent_symbol": stats,
+        "fills": fills,
+        "orders": orders,
+        "analyst_note": note,
+    }, default=str)
+
+
+@mcp.tool()
+async def get_risk_overview(focus: str = "") -> str:
+    """
+    Desk-wide risk snapshot: concentration, kill-switch states, allocation,
+    conflicting positions. Call when the user asks about RISK or EXPOSURE —
+    "biggest risk", "how concentrated", "net beta", "factor exposure",
+    "what if market drops 5%".
+
+    Args:
+        focus: Optional — 'kill_switch', 'concentration', 'conflicts',
+               'allocations'. Omit for full overview.
+    """
+    await _ensure_init_light()
+    import db.store as store
+    kill_states, convictions, allocations, recent_decisions = await asyncio.gather(
+        store.get_kill_switch_all_states(),
+        store.get_active_convictions(),
+        store.get_allocations(),
+        store.get_recent_allocation_decisions(limit=3),
+    )
+    sym_weight: dict[str, float] = {}
+    for c in convictions:
+        sym_weight[c["symbol"]] = sym_weight.get(c["symbol"], 0) + abs(float(c["conviction"]))
+    top_conc = sorted(sym_weight.items(), key=lambda x: x[1], reverse=True)[:8]
+    sym_dirs: dict[str, set] = {}
+    for c in convictions:
+        sym_dirs.setdefault(c["symbol"], set()).add(c["direction"])
+    conflicts = [
+        {"symbol": sym, "views": [c for c in convictions if c["symbol"] == sym]}
+        for sym, dirs in sym_dirs.items() if "long" in dirs and "short" in dirs
+    ]
+    global_killed = any(r["agent_name"] is None and r["is_active"] for r in kill_states)
+    killed_agents = [r["agent_name"] for r in kill_states if r["agent_name"] and r["is_active"]]
+    total_alloc   = sum(a["allocation_pct"] for a in allocations)
+    note_prefix   = "KILL SWITCH ACTIVE — TRADING HALTED. " if global_killed else ""
+    note = (f"{note_prefix}Kill switch: {'active' if global_killed else 'inactive'}. "
+            f"Active conviction on {len(sym_weight)} symbol(s). "
+            f"Total agent allocation {total_alloc*100:.0f}% of NAV."
+            + (f" WARNING: {len(conflicts)} conflicting long/short pair(s): "
+               f"{', '.join(c['symbol'] for c in conflicts)}." if conflicts else ""))
+    return json.dumps({
+        "kill_switch": {
+            "global_active": global_killed,
+            "killed_agents": killed_agents,
+            "states": kill_states,
+        },
+        "conviction_concentration": [{"symbol": s, "total_conviction_weight": w}
+                                      for s, w in top_conc],
+        "conflicting_views": conflicts,
+        "allocations": allocations,
+        "total_allocation_pct": total_alloc,
+        "recent_decisions": recent_decisions,
+        "analyst_note": note,
+    }, default=str)
+
+
+@mcp.tool()
+async def get_agent_disagreement() -> str:
+    """
+    Symbols where two agents hold opposite positions, with their competing
+    rationales. Call when the user asks about INTERNAL CONFLICT — "are agents
+    fighting", "what's controversial in the book", "where do strategies disagree".
+    """
+    await _ensure_init_light()
+    import db.store as store
+    view = await store.get_consolidated_view()
+    disagreements = []
+    for sym, data in view.items():
+        if float(data.get("long_sum") or 0) > 0 and float(data.get("short_sum") or 0) > 0:
+            long_contr  = [c for c in data["contributors"] if c["direction"] == "long"]
+            short_contr = [c for c in data["contributors"] if c["direction"] == "short"]
+            spread = abs(float(data["long_sum"]) - float(data["short_sum"]))
+            disagreements.append({
+                "symbol": sym,
+                "long_sum": data["long_sum"],
+                "short_sum": data["short_sum"],
+                "net": data["net"],
+                "spread": round(spread, 4),
+                "long_agents": [c["agent"] for c in long_contr],
+                "short_agents": [c["agent"] for c in short_contr],
+                "all_views": data["contributors"],
+            })
+    disagreements.sort(key=lambda x: x["spread"], reverse=True)
+    if not disagreements:
+        note = "No agent disagreements — all active conviction views are directionally consistent."
+    else:
+        top = disagreements[0]
+        note = (f"Desk has {len(disagreements)} disagreement(s). "
+                f"Highest tension on {top['symbol']} — spread {top['spread']:.2f} "
+                f"({top['long_agents']} long vs {top['short_agents']} short).")
+    return json.dumps({
+        "disagreement_count": len(disagreements),
+        "disagreements": disagreements,
+        "analyst_note": note,
+    }, default=str)
+
+
+@mcp.tool()
+async def get_position_history(symbol: str, lookback_days: int = 30) -> str:
+    """
+    Historical fills + conviction arc for a symbol. Call when the user asks about
+    TRACK RECORD — "has X been traded before", "what's our history with TLT",
+    "how often does this setup work".
+
+    Args:
+        symbol: Ticker to inspect
+        lookback_days: Calendar days back to search (default 30, capped at 90)
+    """
+    await _ensure_init_light()
+    ok, reason = _validate_symbol(symbol)
+    if not ok:
+        return json.dumps({"error": reason})
+    import db.store as store
+    from reporting.combined_pnl import get_symbol_unrealized
+    sym = symbol.upper()
+    lookback_days = min(max(1, lookback_days), 90)
+    fills, pnl_by_agent, conv_arc, current, unrealized = await asyncio.gather(
+        store.get_symbol_fills(sym, lookback_days=lookback_days),
+        store.get_symbol_pnl_summary(sym),
+        store.get_conviction_history_for_symbol(sym, lookback_days=lookback_days),
+        store.get_convictions_for_symbol(sym),
+        get_symbol_unrealized(sym),
+    )
+    cum = 0.0
+    timeline = []
+    for f in reversed(fills):
+        cum += float(f.get("realized_pnl") or 0)
+        timeline.append({
+            "date": str(f["filled_at"])[:10],
+            "action": f["action"],
+            "quantity": f["quantity"],
+            "fill_price": f["fill_price"],
+            "realized_pnl": f.get("realized_pnl"),
+            "cumulative_pnl": round(cum, 2),
+        })
+    long_n  = sum(1 for c in current if c["direction"] == "long")
+    short_n = sum(1 for c in current if c["direction"] == "short")
+    bias = ("long" if long_n > short_n
+            else "short" if short_n > long_n
+            else "flat" if current else "no conviction")
+    realized_pnl = sum(r["attributed_pnl"] for r in pnl_by_agent if r["attributed_pnl"])
+    unreal = float(unrealized or 0.0)
+    total_pnl = realized_pnl + unreal
+    note = (f"{sym}: {len(fills)} fill(s) over {lookback_days}d, "
+            f"total P&L {total_pnl:+,.2f} (real {realized_pnl:+,.2f}, unreal {unreal:+,.2f}). "
+            f"Current desk bias: {bias}.")
+    return json.dumps({
+        "symbol": sym,
+        "lookback_days": lookback_days,
+        "fill_timeline": timeline,
+        "pnl_by_agent": pnl_by_agent,
+        "realized_pnl": realized_pnl,
+        "current_unrealized_pnl": unreal,
+        "total_pnl": total_pnl,
+        "conviction_arc": conv_arc,
+        "current_convictions": current,
+        "analyst_note": note,
+    }, default=str)
+
+
+@mcp.tool()
+async def get_changes_since(since: str = "last_day") -> str:
+    """
+    What changed since a checkpoint — new fills, new convictions, new theses, new
+    allocations. Call when the user wants to CATCH UP — "what's new since I checked",
+    "anything change overnight", "catch me up", "what did I miss".
+
+    Args:
+        since: ISO timestamp e.g. '2026-04-27T14:00:00+00:00', or shorthand:
+               'last_hour', 'last_4h', 'last_day' (default)
+    """
+    await _ensure_init_light()
+    from datetime import datetime, timedelta, timezone
+    _DELTA = {"last_hour": timedelta(hours=1),
+              "last_4h":   timedelta(hours=4),
+              "last_day":  timedelta(days=1)}
+    since_iso = ((datetime.now(timezone.utc) - _DELTA[since]).isoformat()
+                 if since in _DELTA else since)
+    import db.store as store
+    fills, orders, convictions, theses, decisions = await asyncio.gather(
+        store.get_fills_window(since_iso),
+        store.get_orders_window(since_iso),
+        store.get_new_convictions_since(since_iso),
+        store.get_new_theses_since(since_iso),
+        store.get_recent_allocation_decisions(limit=10),
+    )
+    decisions = [d for d in decisions if str(d.get("decided_at") or "") >= since_iso[:19]]
+    n = len(fills) + len(convictions) + len(theses) + len(decisions)
+    note = (f"No changes recorded since {since}." if n == 0 else
+            f"{n} event(s) since {since}: {len(fills)} fill(s), "
+            f"{len(convictions)} conviction update(s), "
+            f"{len(theses)} new thesis entry(s), "
+            f"{len(decisions)} allocation decision(s).")
+    return json.dumps({
+        "since": since_iso,
+        "event_counts": {"fills": len(fills), "orders": len(orders),
+                         "convictions": len(convictions), "theses": len(theses),
+                         "decisions": len(decisions)},
+        "fills": fills,
+        "orders": orders,
+        "new_convictions": convictions,
+        "new_theses": theses,
+        "allocation_decisions": decisions,
+        "analyst_note": note,
+    }, default=str)
+
+
+@mcp.tool()
+async def get_upcoming_catalysts(window: str = "today") -> str:
+    """
+    Forward-looking calendar — upcoming theses due, conviction expirations, fresh
+    news. Call when the user asks WHAT'S COMING — "anything coming up", "what's on
+    the docket", "next catalyst", "upcoming earnings".
+
+    Args:
+        window: 'today' (default), 'tomorrow', or 'YYYY-MM-DD'
+    """
+    await _ensure_init_light()
+    from datetime import date, timedelta
+    today = date.today()
+    if window == "today":
+        due = today.isoformat()
+    elif window == "tomorrow":
+        due = (today + timedelta(days=1)).isoformat()
+    else:
+        due = window
+    import db.store as store
+    theses_due, expiring, news = await asyncio.gather(
+        store.get_theses_due_all_agents(due),
+        store.get_convictions_expiring_soon(within_hours=8),
+        store.get_recent_news(symbol=None, limit=15),
+    )
+    note = (f"No upcoming catalysts in the {window} window."
+            if not theses_due and not expiring else
+            f"{len(theses_due)} prediction(s) due by {due}. "
+            f"{len(expiring)} conviction view(s) expiring within 8 hours. "
+            f"{len(news)} news item(s) in feed.")
+    return json.dumps({
+        "window": window,
+        "due_date": due,
+        "predictions_due": theses_due,
+        "convictions_expiring_8h": expiring,
+        "recent_news": news,
+        "analyst_note": note,
+    }, default=str)
+
+
+@mcp.tool()
+async def get_manual_overrides(window: str = "today") -> str:
+    """
+    Trades placed outside the conviction allocator (manual overrides). Call when
+    the user asks if they DID SOMETHING DUMB — "did I override anything",
+    "manual trades", "where did discretion help or hurt".
+
+    Args:
+        window: 'today', 'week', 'month', or 'YYYY-MM-DD/YYYY-MM-DD'
+    """
+    await _ensure_init_light()
+    import db.store as store
+    since, until = _parse_window(window)
+    fills = await store.get_unattributed_fills(since, until)
+    by_agent: dict[str, list] = {}
+    for f in fills:
+        by_agent.setdefault(f["agent_name"] or "unknown", []).append(f)
+    notional = sum(abs((f["quantity"] or 0) * (f["fill_price"] or 0)) for f in fills)
+    realized = sum(float(f.get("realized_pnl") or 0) for f in fills)
+    note = (f"No manual overrides in {window} — all fills have conviction attribution."
+            if not fills else
+            f"{len(fills)} unattributed fill(s) in {window}, "
+            f"notional {notional:,.0f}, P&L impact {realized:+,.2f}. "
+            "These were not conviction-driven.")
+    return json.dumps({
+        "window": window,
+        "unattributed_fill_count": len(fills),
+        "total_notional": notional,
+        "realized_pnl": realized,
+        "by_agent": by_agent,
+        "fills": fills,
+        "analyst_note": note,
+    }, default=str)
 
 
 if __name__ == "__main__":

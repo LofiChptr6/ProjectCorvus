@@ -17,10 +17,11 @@ class OrderRequest:
     reasoning: Optional[str] = None
     agent_name: str = ""
     session_id: Optional[str] = None
+    current_mark: Optional[float] = None  # live quote, set by callers that have one
 
     @property
     def effective_price(self) -> Optional[float]:
-        return self.limit_price or self.stop_price
+        return self.limit_price or self.stop_price or self.current_mark
 
 
 @dataclass
@@ -37,6 +38,10 @@ class RiskResult:
     allowed: bool
     reason: str = ""
     check_name: str = ""
+    # When True alongside allowed=False, the order is blocked by default but
+    # the caller MAY ask the user via Telegram to override (used by the sub-10
+    # share gate on expensive tickers).
+    needs_telegram_approval: bool = False
 
 
 ALLOWED = RiskResult(allowed=True, reason="", check_name="")

@@ -166,6 +166,7 @@ async def write_fill(
     commission: Optional[float],
     exchange: Optional[str],
     mode: str,
+    realized_pnl: Optional[float] = None,
     db_path: str = DB_PATH,
 ) -> None:
     pool = await get_pool()
@@ -173,11 +174,12 @@ async def write_fill(
         await conn.execute(
             """INSERT INTO fills
                (ibkr_exec_id, order_id, agent_name, filled_at, symbol, action,
-                quantity, fill_price, commission, exchange, mode)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+                quantity, fill_price, commission, exchange, mode, realized_pnl)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
                ON CONFLICT (ibkr_exec_id) DO NOTHING""",
             ibkr_exec_id, order_id, agent_name, filled_at,
             symbol, action, quantity, fill_price, commission, exchange, mode,
+            realized_pnl,
         )
 
 
@@ -354,8 +356,6 @@ async def get_pnl_summary(
         SELECT agent_name,
                (decided_at::date)::text AS trade_date,
                COALESCE(SUM(attributed_pnl), 0)::float8 AS total_pnl,
-               0.0::float8 AS realized_pnl,
-               0.0::float8 AS unrealized_pnl,
                COUNT(*)::int AS num_fills
         FROM agent_pnl_attribution
         WHERE {date_clause} {agent_clause}
@@ -1005,6 +1005,134 @@ async def record_pnl_attribution(
         return int(row["id"])
 
 
+async def get_decision_id_for_order(order_id: int) -> Optional[int]:
+    """Reverse-lookup the allocation_decision that produced a given order_id,
+    by scanning orders_placed_json. Returns None if the order wasn't placed
+    by the allocator (e.g. manual orders predating the sector-shard era)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id FROM allocation_decision
+               WHERE orders_placed_json @> $1::jsonb
+               ORDER BY id DESC LIMIT 1""",
+            json.dumps([{"result": {"order_id": order_id}}]),
+        )
+        return int(row["id"]) if row else None
+
+
+async def add_attributed_pnl(decision_id: int, symbol: str, realized_pnl: float) -> int:
+    """Distribute a closing fill's realized P&L across the agent_pnl_attribution
+    rows for (decision_id, symbol), proportional to attribution_share. Shares
+    sum to 1.0 by construction (split_attribution), so each row gets
+    realized_pnl × share. Idempotent in shape but not value — call once per fill.
+    Returns the number of rows updated."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE agent_pnl_attribution
+               SET attributed_pnl = COALESCE(attributed_pnl, 0)
+                                  + (attribution_share * $3)
+               WHERE decision_id = $1 AND symbol = $2""",
+            decision_id, symbol, realized_pnl,
+        )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
+
+async def record_holdings_snapshot(
+    decision_id: int,
+    desk_nav: float,
+    rows: list[dict],
+) -> int:
+    """Batched insert of one (agent, symbol) row per dict in `rows`. Each
+    dict must contain: agent_name, symbol, holding_qty, attribution_share
+    (or None), conviction (or None), direction (or None), price_per_share,
+    market_value, agent_equity. Returns rows inserted."""
+    if not rows:
+        return 0
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.executemany(
+                """INSERT INTO holding_kanban
+                     (decision_id, agent_name, symbol, holding_qty,
+                      attribution_share, conviction, direction,
+                      price_per_share, market_value, agent_equity, desk_nav)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+                [
+                    (
+                        decision_id,
+                        r["agent_name"],
+                        r["symbol"],
+                        float(r["holding_qty"]),
+                        float(r["attribution_share"]) if r.get("attribution_share") is not None else None,
+                        float(r["conviction"]) if r.get("conviction") is not None else None,
+                        r.get("direction"),
+                        float(r["price_per_share"]),
+                        float(r["market_value"]),
+                        float(r["agent_equity"]),
+                        float(desk_nav),
+                    )
+                    for r in rows
+                ],
+            )
+    return len(rows)
+
+
+async def get_agent_holdings_snapshots(
+    agent_name: str,
+    lookback_hours: int = 24,
+) -> list[dict]:
+    """Return holding_kanban rows for one agent over the lookback window,
+    ordered newest-first."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, snapshot_at, decision_id, agent_name, symbol,
+                      holding_qty, attribution_share, conviction, direction,
+                      price_per_share, market_value, agent_equity, desk_nav
+               FROM holding_kanban
+               WHERE agent_name=$1
+                 AND snapshot_at >= NOW() - ($2 || ' hours')::interval
+               ORDER BY snapshot_at DESC, symbol""",
+            agent_name, str(lookback_hours),
+        )
+    return [dict(r) for r in rows]
+
+
+async def get_kanban_at(at: Optional[str] = None) -> list[dict]:
+    """Cross-section: every (agent, symbol) row at the snapshot tick nearest
+    to `at` (default: most recent tick). Returns rows from the single
+    timestamp closest to (and ≤) the requested time."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if at:
+            at_dt = datetime.fromisoformat(at)
+            if at_dt.tzinfo is None:
+                at_dt = at_dt.replace(tzinfo=timezone.utc)
+            tick = await conn.fetchval(
+                """SELECT MAX(snapshot_at) FROM holding_kanban
+                   WHERE snapshot_at <= $1""",
+                at_dt,
+            )
+        else:
+            tick = await conn.fetchval("SELECT MAX(snapshot_at) FROM holding_kanban")
+        if tick is None:
+            return []
+        rows = await conn.fetch(
+            """SELECT id, snapshot_at, decision_id, agent_name, symbol,
+                      holding_qty, attribution_share, conviction, direction,
+                      price_per_share, market_value, agent_equity, desk_nav
+               FROM holding_kanban
+               WHERE snapshot_at = $1
+               ORDER BY agent_name, symbol""",
+            tick,
+        )
+    return [dict(r) for r in rows]
+
+
 async def get_agent_pnl_attribution(
     agent_name: str,
     since: Optional[str] = None,
@@ -1225,3 +1353,345 @@ async def prune_global_noise(news_days: int = 14, audit_days: int = 30) -> dict:
             "audit_deleted": _n(a),
             "tool_calls_deleted": _n(tc),
         }
+
+
+# ── Parrot / Nori insight tools ───────────────────────────────────────────────
+
+def _as_dt(s: str):
+    """Convert ISO timestamp string → timezone-aware datetime for asyncpg."""
+    from datetime import datetime, timezone
+    dt = datetime.fromisoformat(s)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _as_date(s: str):
+    """Convert ISO date string → datetime.date for asyncpg DATE columns."""
+    from datetime import date
+    return date.fromisoformat(s[:10])
+
+
+async def get_convictions_for_symbol(symbol: str) -> list[dict]:
+    """Active conviction rows for a symbol across all agents (tools 1, 7)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT agent_name, direction, conviction::float8, expected_return_pct::float8,
+                      time_to_target_days, rationale, submitted_at, expires_at
+               FROM agent_conviction
+               WHERE symbol = $1 AND expires_at > NOW() AND conviction > 0
+               ORDER BY conviction DESC""",
+            symbol.upper())
+        return [dict(r) for r in rows]
+
+
+async def get_symbol_fills(symbol: str, lookback_days: int = 30) -> list[dict]:
+    """All fills for a symbol in the last N days, newest first (tools 1, 7)."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT ibkr_exec_id, order_id, agent_name, filled_at,
+                      action, quantity::float8, fill_price::float8,
+                      commission::float8, realized_pnl::float8
+               FROM fills
+               WHERE symbol = $1 AND filled_at::timestamptz >= $2
+               ORDER BY filled_at DESC LIMIT 200""",
+            symbol.upper(), cutoff)
+        return [dict(r) for r in rows]
+
+
+async def get_symbol_pnl_summary(symbol: str, since: str | None = None) -> list[dict]:
+    """Per-agent attributed P&L for one symbol (tools 1, 3, 7)."""
+    params: list = [symbol.upper()]
+    clause = ""
+    if since:
+        clause = "AND decided_at >= $2"
+        params.append(_as_dt(since))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT agent_name,
+                       COUNT(*)::int                              AS total_fills,
+                       SUM(attribution_share)::float8            AS attribution_share_sum,
+                       COALESCE(SUM(attributed_pnl), 0)::float8  AS attributed_pnl
+                FROM agent_pnl_attribution
+                WHERE symbol = $1 {clause}
+                GROUP BY agent_name
+                ORDER BY attributed_pnl DESC NULLS LAST""",
+            *params)
+        return [dict(r) for r in rows]
+
+
+async def get_fills_window(
+    since: str,
+    until: str | None = None,
+    agent_name: str | None = None,
+) -> list[dict]:
+    """Fills in a time range, optionally filtered by agent (tools 4, 8, 10)."""
+    params: list = [_as_dt(since)]
+    clauses = ["filled_at::timestamptz >= $1"]
+    i = 2
+    if until:
+        clauses.append(f"filled_at::timestamptz <= ${i}")
+        params.append(_as_dt(until))
+        i += 1
+    if agent_name:
+        clauses.append(f"agent_name = ${i}")
+        params.append(agent_name)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT id, ibkr_exec_id, order_id, agent_name, filled_at,
+                       symbol, action, quantity::float8, fill_price::float8,
+                       commission::float8, realized_pnl::float8, mode
+                FROM fills WHERE {' AND '.join(clauses)}
+                ORDER BY filled_at DESC LIMIT 1000""",
+            *params)
+        return [dict(r) for r in rows]
+
+
+async def get_orders_window(
+    since: str,
+    agent_name: str | None = None,
+) -> list[dict]:
+    """Orders created since a timestamp, optionally filtered by agent (tools 4, 8)."""
+    params: list = [_as_dt(since)]
+    clause = ""
+    if agent_name:
+        clause = "AND agent_name = $2"
+        params.append(agent_name)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT id, agent_name, created_at, symbol, action, order_type,
+                       quantity::float8, limit_price::float8, status,
+                       risk_approved, human_approved, rejection_reason, reasoning, mode
+                FROM orders WHERE created_at::timestamptz >= $1 {clause}
+                ORDER BY created_at DESC LIMIT 500""",
+            *params)
+        return [dict(r) for r in rows]
+
+
+async def get_new_convictions_since(since: str) -> list[dict]:
+    """Conviction rows submitted after a timestamp across all agents (tools 8, 9)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, agent_name, symbol, direction, conviction::float8,
+                      expected_return_pct::float8, time_to_target_days,
+                      rationale, submitted_at, expires_at
+               FROM agent_conviction WHERE submitted_at >= $1
+               ORDER BY submitted_at DESC""",
+            _as_dt(since))
+        return [dict(r) for r in rows]
+
+
+async def get_new_theses_since(since: str) -> list[dict]:
+    """Thesis rows created after a timestamp across all agents (tools 8, 9)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, agent_name, created_at, kind, title, body,
+                      verify_by, status, parent_id
+               FROM agent_thesis WHERE created_at >= $1
+               ORDER BY created_at DESC LIMIT 200""",
+            _as_dt(since))
+        return [dict(r) for r in rows]
+
+
+async def get_agent_evening_digest(
+    agent_name: str,
+    trading_date: str | None = None,
+) -> dict | None:
+    """Latest (or specific date) evening digest for one agent (tool 2)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if trading_date:
+            row = await conn.fetchrow(
+                "SELECT * FROM agent_evening_digests WHERE agent_name=$1 AND trading_date=$2::date",
+                agent_name, trading_date)
+        else:
+            row = await conn.fetchrow(
+                """SELECT * FROM agent_evening_digests WHERE agent_name=$1
+                   ORDER BY trading_date DESC LIMIT 1""",
+                agent_name)
+        return dict(row) if row else None
+
+
+async def get_pnl_attribution_by_symbol(
+    since: str,
+    until: str | None = None,
+) -> list[dict]:
+    """Symbol-level P&L rollup across all agents in a window (tool 3)."""
+    params: list = [_as_dt(since)]
+    clause = ""
+    if until:
+        clause = "AND decided_at <= $2"
+        params.append(_as_dt(until))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT symbol,
+                       COALESCE(SUM(attributed_pnl), 0)::float8   AS total_pnl,
+                       COUNT(DISTINCT fill_id)::int                AS fill_count,
+                       array_agg(DISTINCT agent_name)              AS agents
+                FROM agent_pnl_attribution
+                WHERE decided_at >= $1 {clause}
+                  AND attributed_pnl IS NOT NULL
+                GROUP BY symbol ORDER BY total_pnl DESC NULLS LAST""",
+            *params)
+        return [dict(r) for r in rows]
+
+
+async def get_pnl_attribution_by_agent(
+    since: str,
+    until: str | None = None,
+) -> list[dict]:
+    """Agent-level P&L rollup in a window (tool 3)."""
+    params: list = [_as_dt(since)]
+    clause = ""
+    if until:
+        clause = "AND decided_at <= $2"
+        params.append(_as_dt(until))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT agent_name,
+                       COALESCE(SUM(attributed_pnl), 0)::float8 AS total_pnl,
+                       COUNT(DISTINCT fill_id)::int              AS fill_count
+                FROM agent_pnl_attribution
+                WHERE decided_at >= $1 {clause}
+                  AND attributed_pnl IS NOT NULL
+                GROUP BY agent_name ORDER BY total_pnl DESC NULLS LAST""",
+            *params)
+        return [dict(r) for r in rows]
+
+
+async def get_fill_stats_by_agent_symbol(
+    since: str,
+    until: str | None = None,
+) -> list[dict]:
+    """Aggregate fills grouped by (agent_name, symbol) in a window (tool 4)."""
+    params: list = [_as_dt(since)]
+    clause = ""
+    if until:
+        clause = "AND filled_at::timestamptz <= $2"
+        params.append(_as_dt(until))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT agent_name, symbol,
+                       COUNT(*)::int                                                AS fill_count,
+                       SUM(quantity)::float8                                        AS total_qty,
+                       AVG(fill_price)::float8                                      AS avg_price,
+                       COALESCE(SUM(realized_pnl), 0)::float8                      AS realized_pnl,
+                       SUM(CASE WHEN action='BUY'  THEN quantity ELSE 0 END)::float8 AS bought_qty,
+                       SUM(CASE WHEN action='SELL' THEN quantity ELSE 0 END)::float8 AS sold_qty
+                FROM fills WHERE filled_at::timestamptz >= $1 {clause}
+                GROUP BY agent_name, symbol
+                ORDER BY agent_name, realized_pnl DESC NULLS LAST""",
+            *params)
+        return [dict(r) for r in rows]
+
+
+async def get_kill_switch_all_states() -> list[dict]:
+    """All kill_switch rows — global + latest per-agent state (tool 5)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT DISTINCT ON (COALESCE(agent_name, ''))
+                      id, agent_name, is_active, activated_at, activated_by, reason
+               FROM kill_switch
+               ORDER BY COALESCE(agent_name, ''), id DESC""")
+        return [dict(r) for r in rows]
+
+
+async def get_recent_allocation_decisions(limit: int = 10) -> list[dict]:
+    """Most recent allocation_decision rows, metadata only (tools 5, 8)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, decided_at, nav_at_decision::float8, notes
+               FROM allocation_decision ORDER BY decided_at DESC LIMIT $1""",
+            limit)
+        return [dict(r) for r in rows]
+
+
+async def get_conviction_history_for_symbol(
+    symbol: str,
+    lookback_days: int = 60,
+) -> list[dict]:
+    """Attribution rows for a symbol as a proxy for conviction-backed trade history (tool 7)."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT agent_name, decided_at, attribution_share::float8,
+                      attributed_pnl::float8, decision_id
+               FROM agent_pnl_attribution
+               WHERE symbol = $1 AND decided_at >= $2
+               ORDER BY decided_at DESC LIMIT 300""",
+            symbol.upper(), cutoff)
+        return [dict(r) for r in rows]
+
+
+async def get_theses_due_all_agents(on_or_before: str) -> list[dict]:
+    """All open prediction theses due for verification across all agents (tool 9)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, agent_name, created_at, kind, title, body, verify_by
+               FROM agent_thesis
+               WHERE status = 'open' AND verify_by IS NOT NULL
+                 AND verify_by <= $1
+               ORDER BY verify_by ASC, agent_name""",
+            _as_date(on_or_before))
+        return [dict(r) for r in rows]
+
+
+async def get_convictions_expiring_soon(within_hours: int = 8) -> list[dict]:
+    """Active convictions expiring within N hours (tool 9)."""
+    from datetime import datetime, timedelta, timezone
+    cutoff = datetime.now(timezone.utc) + timedelta(hours=within_hours)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT agent_name, symbol, direction, conviction::float8,
+                      rationale, submitted_at, expires_at
+               FROM agent_conviction
+               WHERE expires_at > NOW()
+                 AND expires_at <= $1
+                 AND conviction > 0
+               ORDER BY expires_at ASC""",
+            cutoff)
+        return [dict(r) for r in rows]
+
+
+async def get_unattributed_fills(
+    since: str,
+    until: str | None = None,
+) -> list[dict]:
+    """Fills with no agent_pnl_attribution record — traded outside the allocator (tool 10)."""
+    params: list = [_as_dt(since)]
+    clause = ""
+    if until:
+        clause = "AND f.filled_at::timestamptz <= $2"
+        params.append(_as_dt(until))
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT f.id, f.ibkr_exec_id, f.order_id, f.agent_name,
+                       f.filled_at, f.symbol, f.action, f.quantity::float8,
+                       f.fill_price::float8, f.commission::float8,
+                       f.realized_pnl::float8, f.mode
+                FROM fills f
+                LEFT JOIN agent_pnl_attribution p ON p.fill_id = f.id
+                WHERE f.filled_at::timestamptz >= $1 {clause}
+                  AND p.id IS NULL
+                ORDER BY f.filled_at DESC LIMIT 200""",
+            *params)
+        return [dict(r) for r in rows]

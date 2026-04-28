@@ -252,6 +252,7 @@ agents:
       BIIB:  {bearish_via: skip}
       MRNA:  {bearish_via: skip}
       NVS:   {bearish_via: skip}
+      ABT:   {bearish_via: skip}
       XLV:   {bearish_via: skip}
       IBB:   {bearish_via: skip}
 

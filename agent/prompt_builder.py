@@ -151,6 +151,9 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
     except Exception:
         pnl_today = {}
 
+    realized_today = float(summary.get("realized_pnl_today", 0) or 0)
+    unrealized_today = float(summary.get("unrealized_pnl", 0) or 0)
+    combined_today = realized_today + unrealized_today
     lines = [
         f"=== {routine_name.upper()} | Agent: {agent_name} | {now} ===",
         "",
@@ -161,8 +164,8 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
         f"NAV:           ${summary.get('nav', 0):>12,.2f}",
         f"Cash:          ${summary.get('cash', 0):>12,.2f}",
         f"Buying Power:  ${summary.get('buying_power', 0):>12,.2f}",
-        f"Realized P&L today: ${summary.get('realized_pnl_today', 0):>+10,.2f}",
-        f"Unrealized P&L:     ${summary.get('unrealized_pnl', 0):>+10,.2f}",
+        f"Total P&L today:    ${combined_today:>+10,.2f}  "
+        f"(realized ${realized_today:+,.2f}, unrealized ${unrealized_today:+,.2f})",
         "",
     ]
 

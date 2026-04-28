@@ -103,20 +103,49 @@ async def _on_fill(
     order_id: int, agent_name: str, mode: str, fill, report
 ) -> None:
     try:
+        # IBKR's commissionReport carries realizedPNL when the fill closes (or
+        # partially closes) a position. The unset sentinel is sys.float_info.max;
+        # treat anything implausibly large as missing.
+        realized_pnl: Optional[float] = None
+        if report is not None:
+            rp = getattr(report, "realizedPNL", None)
+            if rp is not None and abs(float(rp)) < 1e100:
+                realized_pnl = float(rp)
+
+        symbol = fill.contract.symbol
         await store.write_fill(
             ibkr_exec_id=fill.execution.execId,
             order_id=order_id,
             agent_name=agent_name,
             filled_at=datetime.now(timezone.utc).isoformat(),
-            symbol=fill.contract.symbol,
+            symbol=symbol,
             action=fill.execution.side,
             quantity=fill.execution.shares,
             fill_price=fill.execution.price,
             commission=report.commission if report else None,
             exchange=fill.execution.exchange,
             mode=mode,
+            realized_pnl=realized_pnl,
         )
         await store.update_order_status(order_id, "filled")
+
+        # Settle attribution. Closing fills carry realizedPNL but the
+        # closing decision has no attribution rows for the symbol (the
+        # SELL trim is not driven by a contributing_view). Realized P&L
+        # belongs on the OPENING decision's rows. Re-walk the symbol's
+        # fills via FIFO; this is idempotent and self-heals across
+        # partial fills, missing realizedPNL, and out-of-order callbacks.
+        try:
+            from meta_agent.pnl_attribution import reconcile_symbol
+            res = await reconcile_symbol(symbol)
+            if res["rows_updated"] > 0:
+                log.info(
+                    "Attributed P&L on %s: %d rows updated (events=%d, already_set=%d)",
+                    symbol, res["rows_updated"], res["events"], res["skipped_already_set"],
+                )
+        except Exception as exc:
+            log.warning("reconcile_symbol(%s) failed: %s", symbol, exc)
+
         log.info("Fill recorded: order_id=%s exec_id=%s", order_id, fill.execution.execId)
     except Exception as exc:
         log.error("Fill callback error: %s", exc)

@@ -44,6 +44,10 @@ The response includes `placed` (list of fills/errors) plus the same fields as dr
 
 If the response indicates risk-blocked or approval-rejected orders, surface them in Step 4 — they didn't fill, the desk stays partially un-rebalanced this hour.
 
+**Sub-10-share gate (new).** The allocator pre-filters orders against a 10-share/ticker minimum. The response now carries two extra keys:
+- `min_qty_dropped` — orders dropped because qty<10 AND price<$300 (cheap underlyings should be sized up; flag the contributing agents next hour to scale conviction or pick a leveraged ETF instead).
+- `pending_user_review` — orders skipped because qty<10 AND price≥$300 (expensive single names where the floor doesn't fit). To fill these, the user must explicitly approve via Telegram — surface them in Step 4 so the user knows what's waiting on them. Do NOT call `place_order` from inside the allocator to bypass; that re-prompts Telegram per order and chains pings. The user invokes those manually.
+
 ## STEP 4 — Output
 
 Print a structured summary to stdout (the log):

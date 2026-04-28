@@ -1,8 +1,9 @@
 TOOL_DEF = {
     "name": "get_pnl_summary",
     "description": (
-        "Get P&L summary for today or a specific date range. "
-        "Returns realized P&L (from closed trades), unrealized P&L (open positions), and trade count."
+        "Get attributed P&L summary for today or a specific date range. "
+        "Returns each agent's slice of Mike's realized P&L (apportioned by their "
+        "share of the conviction stack on each closed trade) and fill count."
     ),
     "input_schema": {
         "type": "object",
@@ -24,10 +25,8 @@ async def execute(period: str = "today", **_) -> str:
     import db.store as store
 
     rows = await store.get_pnl_summary(period=period)
-    totals = {"realized_pnl": 0.0, "unrealized_pnl": 0.0, "total_pnl": 0.0, "num_fills": 0}
+    totals = {"total_pnl": 0.0, "num_fills": 0}
     for r in rows:
-        totals["realized_pnl"] += r.get("realized_pnl", 0) or 0
-        totals["unrealized_pnl"] += r.get("unrealized_pnl", 0) or 0
         totals["total_pnl"] += r.get("total_pnl", 0) or 0
         totals["num_fills"] += r.get("num_fills", 0) or 0
 

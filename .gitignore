@@ -56,3 +56,6 @@ Thumbs.db
 # ── Misc local artifacts ──────────────────────────────────────────────────────
 notes_local.md
 TODO.local.md
+
+# Claude Code worktrees from plan-mode
+.claude/worktrees/

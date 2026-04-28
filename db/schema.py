@@ -80,8 +80,10 @@ SCHEMA_STATEMENTS = [
         fill_price    DOUBLE PRECISION NOT NULL,
         commission    DOUBLE PRECISION,
         exchange      TEXT,
-        mode          TEXT NOT NULL
+        mode          TEXT NOT NULL,
+        realized_pnl  DOUBLE PRECISION
     )""",
+    "ALTER TABLE fills ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION",
     """CREATE TABLE IF NOT EXISTS positions_snapshot (
         id             BIGSERIAL PRIMARY KEY,
         snapshot_at    TEXT NOT NULL,
@@ -240,6 +242,30 @@ SCHEMA_STATEMENTS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_pnl_attr_agent ON agent_pnl_attribution (agent_name, decided_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_pnl_attr_fill ON agent_pnl_attribution (fill_id)",
+    # Holding Kanban — hourly per-(agent, symbol) snapshot of attributed
+    # holdings, conviction, and equity. Written by meta_agent.holdings_snapshot
+    # immediately after every rebalance_desk decision (live or dry-run). Persistent;
+    # forms the trajectory of each agent's book over time. Cash is split among
+    # contributing agents by normalized conviction and stored as symbol='CASH'.
+    """CREATE TABLE IF NOT EXISTS holding_kanban (
+        id                 BIGSERIAL PRIMARY KEY,
+        snapshot_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        decision_id        BIGINT REFERENCES allocation_decision(id) ON DELETE SET NULL,
+        agent_name         TEXT NOT NULL,
+        symbol             TEXT NOT NULL,
+        holding_qty        NUMERIC NOT NULL,
+        attribution_share  NUMERIC,
+        conviction         NUMERIC,
+        direction          TEXT,
+        price_per_share    NUMERIC NOT NULL,
+        market_value       NUMERIC NOT NULL,
+        agent_equity       NUMERIC NOT NULL,
+        desk_nav           NUMERIC NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_kanban_at ON holding_kanban (snapshot_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_kanban_agent_at ON holding_kanban (agent_name, snapshot_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_kanban_symbol_at ON holding_kanban (symbol, snapshot_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_kanban_decision ON holding_kanban (decision_id)",
     # Per-agent narrative archive. Written by sector-archivist weekly. Each row
     # is one chapter covering [period_start, period_end] for one agent —
     # condensing closed theses, conviction history, and attributed P&L into a

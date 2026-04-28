@@ -27,7 +27,7 @@ Desk roster:
 - Maya — mean-reversion contrarian ($20k)
 - Atlas — long-side macro (SPY/QQQ/DIA/IWM, $20k)
 - Titan — short-side macro (inverse ETFs, $10k)
-- Vera — earnings catalyst ($20k, currently disabled)
+- Vera — earnings catalyst ($20k)
 - Mike — director, writes daily analysis (no trading)
 - Cassidy — overnight risk reviewer (no trading)
 

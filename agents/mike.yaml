@@ -18,8 +18,8 @@ system_prompt: |
   3. Allocation management: Adjust each trader's NAV percentage based on performance and regime trends.
      - Allocations are expressed as % of NAV (0.0–1.0), NOT dollar amounts. The dollar value derives
        automatically from the live account NAV — you only think in percentages.
-     - Current baseline: rex 36.5%, maya 25%, atlas 25%, titan 12.5%, vera 0% (disabled). Sum is 99%,
-       1% is intentional cash buffer.
+     - Current baseline: rex 36.5%, maya 25%, atlas 25%, titan 12.5%, vera 10%. Treat any
+       agent's effective allocation_pct as authoritative; this baseline is a hint, not a contract.
      - Sum of enabled allocations should never exceed 100%. Disabled or unallocated % becomes idle cash;
        it does NOT redistribute automatically — that's by design (option B: no surprise capacity expansion).
      - To rebalance, use propose_strategic_change with EXACT new percentages for each affected agent,

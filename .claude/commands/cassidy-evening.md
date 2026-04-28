@@ -128,7 +128,7 @@ Cover Rex, Maya, Atlas, and Titan with specific findings. For each:
 - Compliance: "Clean session" or specific rule violations
 - One-sentence character assessment for the day
 
-If Vera (disabled) somehow traded, flag this as a critical compliance issue immediately.
+If any agent's YAML is `enabled: false` and they have attribution rows today, flag as a compliance issue.
 
 ### [3] OVERNIGHT RISK ASSESSMENT
 
@@ -229,6 +229,31 @@ Titan: {findings or "Clean"}
 
 — Cas
 ```
+
+---
+
+## STEP 7 — Persist findings (REQUIRED)
+
+Telegram alone is ephemeral. Tomorrow night's Cassidy run starts with no
+memory of what you flagged tonight. You MUST persist before exiting:
+
+1. **`record_evening_digest(agent_name="cassidy", trading_date="<today>", thesis_summary=..., open_questions=..., tomorrow_focus=..., pnl_today=..., pnl_week=...)`**
+   - `thesis_summary`: 1–2 paragraph state-of-the-desk (regime, posture, biggest exposure).
+   - `open_questions`: bullet list of every flag raised tonight, even resolved ones, so they're searchable.
+   - `tomorrow_focus`: the per-agent setup lines from your Telegram message.
+   - `positions_json`: optional — pass the overnight position table if convenient.
+
+2. **For each engineering/architecture issue surfaced** (broken tool, NULL data, missing gate, etc.):
+   call `propose_strategic_change(title=..., details=...)`. Frame as recommendation, not order. The
+   user reviews on Telegram. Do this even when nothing requires *urgent* overnight action — the
+   audit trail is the value.
+
+3. **For each behavior flag worth a follow-up** (compliance violation, sector overweight, churn):
+   call `post_to_thread(thread_slug="risk-flags", title=..., body=...)` so the affected agent sees
+   it in their next morning briefing. Create the thread first via `create_thread` if it doesn't
+   exist.
+
+If you skip Step 7, the report is gone the moment Telegram messages scroll off the user's screen.
 
 ---
 

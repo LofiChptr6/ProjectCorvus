@@ -15,10 +15,19 @@ async def get_positions() -> list[dict]:
     positions = []
     for p in ib.positions():
         contract = p.contract
+        # IBKR's Position object carries marketPrice/marketValue/unrealizedPNL
+        # alongside avgCost. Surface them so every caller sees mark-to-market
+        # unrealized P&L without a second round-trip.
+        market_price = float(getattr(p, "marketPrice", 0.0) or 0.0)
+        market_value = float(getattr(p, "marketValue", 0.0) or 0.0)
+        unrealized_pnl = float(getattr(p, "unrealizedPNL", 0.0) or 0.0)
         positions.append({
             "symbol": contract.symbol,
             "quantity": p.position,
             "avg_cost": p.avgCost,
+            "market_price": market_price,
+            "market_value": market_value,
+            "unrealized_pnl": unrealized_pnl,
         })
     return positions
 

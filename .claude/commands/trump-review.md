@@ -83,6 +83,8 @@ c) **Expected return %** (signed): your point forecast.
 d) **Time to target (days)**: when you expect the move to play out.
 e) **Rationale** (1–2 sentences): cite which frameworks agree (e.g., "fundamental: hyperscaler capex raise; technical: RSI 28 + bounce off lower BBAND; quant: 2-sigma below sector momentum spread").
 
+**Symbol selection — favor leveraged ETFs over expensive single names.** The desk enforces a 10-share/ticker/order minimum to keep commission/share sane and encourage active day trading on volatility. To stay above the floor at any meaningful conviction size, prefer cheap-per-share leveraged sector ETFs (TQQQ, SQQQ, SOXL, SOXS, FAS, FAZ, ERX, ERY, LABU, LABD, etc.) when you can express the same dollar exposure as via an expensive single name. Sub-10-share orders on $300+/sh tickers will be skipped by the allocator (surfaced under `pending_user_review`) and require explicit user Telegram approval to fill.
+
 **Bearish handling — NO DIRECT SHORTS, you pick the inverse vehicle.** The desk does not short individual stocks. To express a bearish view:
 
 1. **Pick the inverse vehicle from the audited catalog** — full list with leverage, vendor, and verification status is injected into your system prompt under `[DESK POLICY: NO DIRECT SHORTS]`, sourced from `agents/inverse_etf_map.yaml`. If your underlying is on the "NO VERIFIED INVERSE" line, publish `direction="flat"` instead of inventing a ticker.
