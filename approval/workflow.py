@@ -24,6 +24,21 @@ async def request_approval(
 ) -> ApprovalResult:
     """Send Telegram approval request. Block until reply or timeout."""
     from approval.telegram import send_message, poll_for_reply, escape_markdown
+    from approval import bypass
+
+    if bypass.is_active():
+        note = bypass.reason()
+        log.info("Approval auto-granted: %s on %s %s x%s — %s",
+                 order.action, order.symbol, order.action, order.quantity, note)
+        try:
+            await send_message(
+                f"⚡ Auto-approved ({note}): {order.action} {order.symbol} "
+                f"x{order.quantity:,.0f} (~${estimated_notional:,.0f})",
+                parse_mode=None,
+            )
+        except Exception:
+            pass
+        return ApprovalResult(approved=True, reason=note, approver="bypass")
 
     timeout_s = cfg.get("approval", {}).get("timeout_s", 120)
     mode = cfg.get("trading", {}).get("mode", "paper")

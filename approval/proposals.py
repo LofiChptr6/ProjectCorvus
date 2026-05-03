@@ -80,30 +80,63 @@ def _fmt_message(p: dict, nudge: bool = False) -> str:
         f"*ID:* `{p['id'][:8]}`\n"
         f"*Title:* {p['title']}\n\n"
         f"{p['details']}\n\n"
-        f"Reply `y {p['id'][:8]}` to approve or `n {p['id'][:8]}` to reject.\n"
-        f"(Or just `y` / `n` for the oldest open proposal.)"
+        f"Tap a button below, or reply `/y` / `/n` for the oldest pending."
     )
 
 
+def _proposal_buttons(p: dict) -> dict:
+    """Inline-keyboard markup with one-tap approve/reject for this proposal."""
+    short = p["id"][:8]
+    return {
+        "inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": f"approve_{short}"},
+            {"text": "❌ Reject",  "callback_data": f"reject_{short}"},
+        ]]
+    }
+
+
 async def create(title: str, details: str) -> dict:
-    """Create a new pending proposal and send initial Telegram ping."""
+    """Create a new pending proposal and send initial Telegram ping.
+
+    If bypass mode is active, the proposal is created in `approved` state
+    immediately (audit trail preserved) and a different Telegram ping is
+    sent. No nudge loop runs for auto-approved proposals."""
+    from approval import bypass
+
+    now = time.time()
+    auto_approved = bypass.is_active()
+    bypass_reason = bypass.reason() if auto_approved else None
+
     proposal = {
         "id": str(uuid.uuid4()),
         "title": title,
         "details": details,
-        "created_at": time.time(),
-        "last_pinged_at": time.time(),
+        "created_at": now,
+        "last_pinged_at": now,
         "ping_count": 1,
-        "status": "pending",  # pending | approved | rejected
-        "resolved_at": None,
-        "resolved_reason": None,
+        "status": "approved" if auto_approved else "pending",
+        "resolved_at": now if auto_approved else None,
+        "resolved_reason": bypass_reason if auto_approved else None,
     }
     proposals = _load()
     proposals.append(proposal)
     _save(proposals)
 
-    await send_message(_fmt_message(proposal, nudge=False))
-    log.info("Created proposal id=%s title=%s", proposal["id"][:8], title)
+    if auto_approved:
+        await send_message(
+            f"⚡ *Strategic proposal auto-approved* ({bypass_reason})\n\n"
+            f"*ID:* `{proposal['id'][:8]}`\n"
+            f"*Title:* {title}\n\n"
+            f"{details}"
+        )
+        log.info("Auto-approved proposal id=%s title=%s (%s)",
+                 proposal["id"][:8], title, bypass_reason)
+    else:
+        await send_message(
+            _fmt_message(proposal, nudge=False),
+            reply_markup=_proposal_buttons(proposal),
+        )
+        log.info("Created proposal id=%s title=%s", proposal["id"][:8], title)
     return proposal
 
 
@@ -126,7 +159,10 @@ async def nudge_stale() -> int:
             continue
         if now - p["last_pinged_at"] < NUDGE_INTERVAL_S:
             continue
-        await send_message(_fmt_message(p, nudge=True))
+        await send_message(
+            _fmt_message(p, nudge=True),
+            reply_markup=_proposal_buttons(p),
+        )
         p["last_pinged_at"] = now
         p["ping_count"] += 1
         nudged += 1

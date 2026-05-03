@@ -168,19 +168,30 @@ async def write_fill(
     mode: str,
     realized_pnl: Optional[float] = None,
     db_path: str = DB_PATH,
-) -> None:
+) -> Optional[int]:
+    """Insert a fill row. Returns the inserted id, or the existing id if a
+    row with the same ibkr_exec_id already exists. Caller (the IBKR daemon
+    `_on_fill`) uses the id to write per-agent ledger events."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        await conn.execute(
+        row = await conn.fetchrow(
             """INSERT INTO fills
                (ibkr_exec_id, order_id, agent_name, filled_at, symbol, action,
                 quantity, fill_price, commission, exchange, mode, realized_pnl)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-               ON CONFLICT (ibkr_exec_id) DO NOTHING""",
+               ON CONFLICT (ibkr_exec_id) DO NOTHING
+               RETURNING id""",
             ibkr_exec_id, order_id, agent_name, filled_at,
             symbol, action, quantity, fill_price, commission, exchange, mode,
             realized_pnl,
         )
+        if row:
+            return int(row["id"])
+        # Row already existed (re-delivered fill event); look up the id
+        existing = await conn.fetchrow(
+            "SELECT id FROM fills WHERE ibkr_exec_id = $1", ibkr_exec_id,
+        )
+        return int(existing["id"]) if existing else None
 
 
 async def get_fills(
@@ -291,56 +302,32 @@ async def get_allocations(db_path: str = DB_PATH) -> list[dict]:
 
 # ── P&L ──────────────────────────────────────────────────────────────────────
 
-async def upsert_pnl_daily(
-    trade_date: str,
-    agent_name: str,
-    realized_pnl: float,
-    unrealized_pnl: float,
-    num_fills: int,
-    nav_end: Optional[float] = None,
-    db_path: str = DB_PATH,
-) -> None:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO pnl_daily
-               (trade_date, agent_name, realized_pnl, unrealized_pnl, total_pnl,
-                nav_end, num_fills, updated_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-               ON CONFLICT (trade_date, agent_name) DO UPDATE SET
-                 realized_pnl=EXCLUDED.realized_pnl,
-                 unrealized_pnl=EXCLUDED.unrealized_pnl,
-                 total_pnl=EXCLUDED.realized_pnl+EXCLUDED.unrealized_pnl,
-                 nav_end=EXCLUDED.nav_end,
-                 num_fills=EXCLUDED.num_fills,
-                 updated_at=EXCLUDED.updated_at""",
-            trade_date, agent_name, realized_pnl, unrealized_pnl,
-            realized_pnl + unrealized_pnl, nav_end, num_fills, _now(),
-        )
-
-
 async def get_pnl_summary(
     agent_name: Optional[str] = None,
     period: str = "today",
     db_path: str = DB_PATH,
 ) -> list[dict]:
-    # Aggregates from agent_pnl_attribution (the live source of truth post-
-    # 2026-04-26 sector migration). pnl_daily was the pre-migration daily roll-up
-    # and is no longer written; reading it returned empty results.
+    """Realized P&L summary derived from `agent_ledger` events. Returns rows
+    of {agent_name, trade_date, total_pnl, num_fills}. `total_pnl` here is
+    realized only — for combined (realized + unrealized) callers should use
+    `reporting.agent_pnl.get_pnl_combined()` which reads `agent_state`.
+
+    Periods are window starts: 'today' | 'week' | 'month' | 'all'.
+    """
     from datetime import date, timedelta
     today = date.today()
     params: list[Any] = []
     i = 1
     if period == "today":
-        date_clause = f"decided_at::date = ${i}"
+        date_clause = f"booked_at::date = ${i}"
         params.append(today)
         i += 1
     elif period == "week":
-        date_clause = f"decided_at::date >= ${i}"
+        date_clause = f"booked_at::date >= ${i}"
         params.append(today - timedelta(days=7))
         i += 1
     elif period == "month":
-        date_clause = f"decided_at::date >= ${i}"
+        date_clause = f"booked_at::date >= ${i}"
         params.append(today - timedelta(days=30))
         i += 1
     else:
@@ -354,13 +341,15 @@ async def get_pnl_summary(
 
     sql = f"""
         SELECT agent_name,
-               (decided_at::date)::text AS trade_date,
-               COALESCE(SUM(attributed_pnl), 0)::float8 AS total_pnl,
+               (booked_at::date)::text AS trade_date,
+               COALESCE(SUM(realized_pnl), 0)::float8 AS total_pnl,
                COUNT(*)::int AS num_fills
-        FROM agent_pnl_attribution
-        WHERE {date_clause} {agent_clause}
-        GROUP BY agent_name, decided_at::date
-        ORDER BY decided_at::date DESC, agent_name
+        FROM agent_ledger
+        WHERE event IN ('RETURN','DIVIDEND')
+          AND realized_pnl IS NOT NULL
+          AND {date_clause} {agent_clause}
+        GROUP BY agent_name, booked_at::date
+        ORDER BY booked_at::date DESC, agent_name
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
@@ -986,25 +975,6 @@ async def update_allocation_orders(decision_id: int, orders_placed: dict) -> Non
         )
 
 
-async def record_pnl_attribution(
-    decision_id: int,
-    agent_name: str,
-    symbol: str,
-    attribution_share: float,
-    fill_id: Optional[int] = None,
-) -> int:
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        row = await conn.fetchrow(
-            """INSERT INTO agent_pnl_attribution
-                 (decision_id, agent_name, symbol, attribution_share, fill_id)
-               VALUES ($1, $2, $3, $4, $5)
-               RETURNING id""",
-            decision_id, agent_name, symbol, attribution_share, fill_id,
-        )
-        return int(row["id"])
-
-
 async def get_decision_id_for_order(order_id: int) -> Optional[int]:
     """Reverse-lookup the allocation_decision that produced a given order_id,
     by scanning orders_placed_json. Returns None if the order wasn't placed
@@ -1020,60 +990,291 @@ async def get_decision_id_for_order(order_id: int) -> Optional[int]:
         return int(row["id"]) if row else None
 
 
-async def add_attributed_pnl(decision_id: int, symbol: str, realized_pnl: float) -> int:
-    """Distribute a closing fill's realized P&L across the agent_pnl_attribution
-    rows for (decision_id, symbol), proportional to attribution_share. Shares
-    sum to 1.0 by construction (split_attribution), so each row gets
-    realized_pnl × share. Idempotent in shape but not value — call once per fill.
-    Returns the number of rows updated."""
+# ── Per-agent ledger writers + readers ───────────────────────────────────────
+# Replaces record_pnl_attribution/add_attributed_pnl/record_holdings_snapshot
+# under the double-entry redesign. See DESK_POLICY §0 for the model.
+
+async def record_ledger_event(
+    *,
+    agent_name: str,
+    symbol: str,
+    event: str,
+    qty: float,
+    price_per_share: float,
+    fill_id: Optional[int] = None,
+    decision_id: Optional[int] = None,
+    realized_pnl: Optional[float] = None,
+    notes: Optional[str] = None,
+    booked_at: Optional[Any] = None,
+) -> int:
+    """Append one row to `agent_ledger`. Returns the inserted row id.
+
+    `booked_at` defaults to NOW() (live path). Backfill scripts pass an
+    explicit datetime so historical events keep their real timestamps."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        result = await conn.execute(
-            """UPDATE agent_pnl_attribution
-               SET attributed_pnl = COALESCE(attributed_pnl, 0)
-                                  + (attribution_share * $3)
-               WHERE decision_id = $1 AND symbol = $2""",
-            decision_id, symbol, realized_pnl,
-        )
-        try:
-            return int(result.split()[-1])
-        except (ValueError, IndexError):
-            return 0
+        if booked_at is None:
+            rid = await conn.fetchval(
+                """INSERT INTO agent_ledger
+                     (fill_id, decision_id, agent_name, symbol, event,
+                      qty, price_per_share, realized_pnl, notes)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id""",
+                fill_id, decision_id, agent_name, symbol.upper(), event,
+                float(qty), float(price_per_share),
+                None if realized_pnl is None else float(realized_pnl),
+                notes,
+            )
+        else:
+            rid = await conn.fetchval(
+                """INSERT INTO agent_ledger
+                     (booked_at, fill_id, decision_id, agent_name, symbol, event,
+                      qty, price_per_share, realized_pnl, notes)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id""",
+                booked_at, fill_id, decision_id, agent_name, symbol.upper(), event,
+                float(qty), float(price_per_share),
+                None if realized_pnl is None else float(realized_pnl),
+                notes,
+            )
+    return int(rid)
 
 
-async def record_holdings_snapshot(
-    decision_id: int,
-    desk_nav: float,
-    rows: list[dict],
+async def record_lend_for_fill(
+    *,
+    fill_id: Optional[int],
+    decision_id: Optional[int],
+    symbol: str,
+    fill_qty: float,
+    fill_price: float,
+    agent_shares: list[tuple],
+    booked_at: Optional[Any] = None,
 ) -> int:
-    """Batched insert of one (agent, symbol) row per dict in `rows`. Each
-    dict must contain: agent_name, symbol, holding_qty, attribution_share
-    (or None), conviction (or None), direction (or None), price_per_share,
-    market_value, agent_equity. Returns rows inserted."""
+    """One LEND row per agent who contributed to a BUY. `agent_shares` is
+    the output of `meta_agent.allocator.split_attribution` — list of
+    (agent_name, normalized_share). Each agent's lent qty = fill_qty × share.
+    `booked_at` defaults to NOW(); backfill passes the historical fill time.
+    Returns rows inserted."""
+    if not agent_shares:
+        return 0
+    written = 0
+    for agent, share in agent_shares:
+        share_f = float(share)
+        if share_f <= 0:
+            continue
+        lent_qty = float(fill_qty) * share_f
+        if lent_qty <= 0:
+            continue
+        await record_ledger_event(
+            agent_name=agent, symbol=symbol, event='LEND',
+            qty=lent_qty, price_per_share=fill_price,
+            fill_id=fill_id, decision_id=decision_id,
+            booked_at=booked_at,
+        )
+        written += 1
+    return written
+
+
+async def record_return_for_fill(
+    *,
+    fill_id: Optional[int],
+    decision_id: Optional[int],
+    symbol: str,
+    fill_qty: float,
+    fill_price: float,
+    booked_at: Optional[Any] = None,
+) -> dict:
+    """Pro-rata close: distribute a SELL fill's qty across all agents currently
+    holding `symbol`, in proportion to their current open qty (as of right now,
+    summed from agent_ledger). Each per-agent RETURN row carries:
+        qty             = fill_qty × (agent_qty / total_held_qty)
+        price_per_share = fill_price (sale price)
+        realized_pnl    = qty × (fill_price − that_agent's_weighted_avg_cost)
+
+    Weighted avg cost is invariant under pro-rata closes (see DESK_POLICY §0),
+    so we recompute it from the agent's LEND/RETURN history each time.
+
+    Returns {"rows_written": n, "agents": [...], "orphan_qty": qty_unclaimed}.
+    If no agent currently holds the symbol, returns orphan_qty = fill_qty and
+    writes nothing — the close stays on mike's book implicitly."""
+    holders = await get_current_holders(symbol)  # {agent: qty}
+    holders = {a: q for a, q in holders.items() if q > 1e-9}
+    total = sum(holders.values())
+    if total <= 0:
+        return {"rows_written": 0, "agents": [], "orphan_qty": float(fill_qty)}
+
+    fill_qty_f = float(fill_qty)
+    fill_price_f = float(fill_price)
+    written: list[dict] = []
+    distributed = 0.0
+    for agent, agent_qty in sorted(holders.items()):
+        return_qty = fill_qty_f * (agent_qty / total)
+        if return_qty <= 0:
+            continue
+        avg_cost = await get_agent_avg_cost(agent, symbol)
+        realized = return_qty * (fill_price_f - avg_cost)
+        await record_ledger_event(
+            agent_name=agent, symbol=symbol, event='RETURN',
+            qty=return_qty, price_per_share=fill_price_f,
+            realized_pnl=realized,
+            fill_id=fill_id, decision_id=decision_id,
+            booked_at=booked_at,
+        )
+        written.append({
+            "agent": agent, "qty": return_qty,
+            "avg_cost": avg_cost, "realized_pnl": realized,
+        })
+        distributed += return_qty
+
+    orphan = max(0.0, fill_qty_f - distributed)
+    return {"rows_written": len(written), "agents": written, "orphan_qty": orphan}
+
+
+async def get_current_holders(symbol: str) -> dict[str, float]:
+    """Return {agent_name: net_qty} for current holders of `symbol`. Sum of
+    LEND.qty − RETURN.qty per agent. Excludes DIVIDEND events (no qty change)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT agent_name,
+                      SUM(CASE WHEN event = 'LEND'   THEN qty
+                               WHEN event = 'RETURN' THEN -qty
+                               ELSE 0 END)::float8 AS qty
+               FROM agent_ledger
+               WHERE UPPER(symbol) = $1
+               GROUP BY agent_name
+               HAVING SUM(CASE WHEN event = 'LEND'   THEN qty
+                               WHEN event = 'RETURN' THEN -qty
+                               ELSE 0 END) > 1e-9""",
+            symbol.upper(),
+        )
+    return {r["agent_name"]: float(r["qty"]) for r in rows}
+
+
+async def get_agent_avg_cost(agent_name: str, symbol: str) -> float:
+    """Walk agent's LEND/RETURN events for `symbol` in time order, maintaining
+    weighted average cost. Returns 0 if the agent has no open position.
+
+    Pro-rata closes preserve avg_cost — but we still walk the full history
+    so we're robust against any future event types or off-rule closes."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT event, qty::float8 AS qty, price_per_share::float8 AS price
+               FROM agent_ledger
+               WHERE agent_name = $1 AND UPPER(symbol) = $2
+                 AND event IN ('LEND','RETURN')
+               ORDER BY booked_at, id""",
+            agent_name, symbol.upper(),
+        )
+    total_qty = 0.0
+    total_cost = 0.0
+    for r in rows:
+        q = float(r["qty"])
+        p = float(r["price"])
+        if r["event"] == "LEND":
+            total_qty += q
+            total_cost += q * p
+        else:  # RETURN
+            avg = (total_cost / total_qty) if total_qty > 0 else 0.0
+            total_qty -= q
+            total_cost -= q * avg
+            if total_qty < 1e-9:
+                total_qty = 0.0
+                total_cost = 0.0
+    return (total_cost / total_qty) if total_qty > 1e-9 else 0.0
+
+
+async def get_agent_holdings(
+    agent_name: str,
+    symbol: Optional[str] = None,
+) -> dict[str, dict]:
+    """Return {symbol: {qty, avg_cost, total_lent_cost, realized_pnl_to_date}}
+    for one agent's open positions. If `symbol` provided, restricts to that
+    one symbol (still returns dict, possibly empty).
+
+    Uses ledger walk for avg_cost; uses one aggregate query for realized."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if symbol:
+            sym_clause = "AND UPPER(symbol) = $2"
+            args = [agent_name, symbol.upper()]
+        else:
+            sym_clause = ""
+            args = [agent_name]
+        rows = await conn.fetch(
+            f"""SELECT UPPER(symbol) AS symbol,
+                       SUM(CASE WHEN event = 'LEND'   THEN qty
+                                WHEN event = 'RETURN' THEN -qty
+                                ELSE 0 END)::float8 AS qty,
+                       SUM(CASE WHEN event = 'LEND' THEN qty * price_per_share
+                                ELSE 0 END)::float8 AS gross_lent_cost,
+                       SUM(realized_pnl)::float8 AS realized
+                FROM agent_ledger
+                WHERE agent_name = $1 {sym_clause}
+                GROUP BY UPPER(symbol)
+                HAVING SUM(CASE WHEN event = 'LEND'   THEN qty
+                                WHEN event = 'RETURN' THEN -qty
+                                ELSE 0 END) > 1e-9""",
+            *args,
+        )
+    out: dict[str, dict] = {}
+    for r in rows:
+        sym = r["symbol"]
+        avg = await get_agent_avg_cost(agent_name, sym)
+        qty = float(r["qty"])
+        out[sym] = {
+            "qty": qty,
+            "avg_cost": avg,
+            "open_cost": qty * avg,
+            "realized_pnl_to_date": float(r["realized"] or 0.0),
+        }
+    return out
+
+
+async def get_all_active_agents() -> list[str]:
+    """Distinct agent_names that have any ledger activity. Used by the
+    refresh script to know who to snapshot."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT agent_name FROM agent_ledger ORDER BY agent_name"
+        )
+    return [r["agent_name"] for r in rows]
+
+
+async def record_agent_state(rows: list[dict]) -> int:
+    """UPSERT one (agent, hour_bucket) row per dict. Each dict must contain:
+    agent_name, realized_pnl, unrealized_pnl, total_pnl, open_cost,
+    open_market_value, n_positions, positions_json (list)."""
     if not rows:
         return 0
     pool = await get_pool()
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.executemany(
-                """INSERT INTO holding_kanban
-                     (decision_id, agent_name, symbol, holding_qty,
-                      attribution_share, conviction, direction,
-                      price_per_share, market_value, agent_equity, desk_nav)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+                """INSERT INTO agent_state
+                     (snapshot_at, agent_name, realized_pnl, unrealized_pnl,
+                      total_pnl, open_cost, open_market_value, n_positions,
+                      positions_json)
+                   VALUES (NOW(),$1,$2,$3,$4,$5,$6,$7,$8::jsonb)
+                   ON CONFLICT (agent_name, hour_bucket) DO UPDATE SET
+                     snapshot_at       = EXCLUDED.snapshot_at,
+                     realized_pnl      = EXCLUDED.realized_pnl,
+                     unrealized_pnl    = EXCLUDED.unrealized_pnl,
+                     total_pnl         = EXCLUDED.total_pnl,
+                     open_cost         = EXCLUDED.open_cost,
+                     open_market_value = EXCLUDED.open_market_value,
+                     n_positions       = EXCLUDED.n_positions,
+                     positions_json    = EXCLUDED.positions_json""",
                 [
                     (
-                        decision_id,
                         r["agent_name"],
-                        r["symbol"],
-                        float(r["holding_qty"]),
-                        float(r["attribution_share"]) if r.get("attribution_share") is not None else None,
-                        float(r["conviction"]) if r.get("conviction") is not None else None,
-                        r.get("direction"),
-                        float(r["price_per_share"]),
-                        float(r["market_value"]),
-                        float(r["agent_equity"]),
-                        float(desk_nav),
+                        float(r["realized_pnl"]),
+                        float(r["unrealized_pnl"]),
+                        float(r["total_pnl"]),
+                        float(r["open_cost"]),
+                        float(r["open_market_value"]),
+                        int(r["n_positions"]),
+                        json.dumps(r["positions_json"]),
                     )
                     for r in rows
                 ],
@@ -1081,81 +1282,168 @@ async def record_holdings_snapshot(
     return len(rows)
 
 
-async def get_agent_holdings_snapshots(
+async def get_latest_agent_state(
+    agent_name: Optional[str] = None,
+) -> list[dict]:
+    """Latest agent_state row per agent (the most recent hourly snapshot).
+    If `agent_name` provided, restricts to that one agent."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if agent_name:
+            rows = await conn.fetch(
+                """SELECT DISTINCT ON (agent_name) *
+                   FROM agent_state WHERE agent_name = $1
+                   ORDER BY agent_name, snapshot_at DESC""",
+                agent_name,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT DISTINCT ON (agent_name) *
+                   FROM agent_state
+                   ORDER BY agent_name, snapshot_at DESC"""
+            )
+    out = []
+    for r in rows:
+        d = dict(r)
+        # asyncpg returns JSONB as str; normalize
+        if isinstance(d.get("positions_json"), str):
+            d["positions_json"] = json.loads(d["positions_json"])
+        out.append(d)
+    return out
+
+
+async def record_nav_log(
+    desk_nav: float,
+    cash_balance: float,
+    decision_id: Optional[int] = None,
+    source: str = "mike",
+) -> int:
+    """Append one anchor row to nav_log. Mike calls this once per rebalance
+    with IBKR-canonical NAV + cash. The deterministic kanban refresh reads
+    the latest row, then applies fills since `recorded_at` to compute
+    current cash without touching IBKR. Returns the inserted row id."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rid = await conn.fetchval(
+            """INSERT INTO nav_log (decision_id, desk_nav, cash_balance, source)
+               VALUES ($1, $2, $3, $4) RETURNING id""",
+            decision_id, float(desk_nav), float(cash_balance), source,
+        )
+    return int(rid)
+
+
+async def get_latest_nav_anchor() -> Optional[dict]:
+    """Return the most recent nav_log row, or None if the table is empty.
+    Used by scripts/refresh_kanban.py to anchor the cash leg."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, recorded_at, decision_id, desk_nav, cash_balance, source
+               FROM nav_log ORDER BY recorded_at DESC LIMIT 1"""
+        )
+    return dict(row) if row else None
+
+
+async def record_positions_anchor(
+    positions: dict[str, float],
+    decision_id: Optional[int] = None,
+    source: str = "mike",
+) -> int:
+    """Append one positions anchor row. Mike calls this once per rebalance
+    with IBKR-canonical {symbol: quantity}. The deterministic kanban refresh
+    starts from the latest anchor and applies fills since `recorded_at` to
+    derive current positions, sidestepping the fills-vs-IBKR drift we'd hit
+    with a fills-only reconstruction. Returns the inserted row id."""
+    snap = {
+        str(sym).upper(): float(qty)
+        for sym, qty in (positions or {}).items()
+        if qty is not None
+    }
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rid = await conn.fetchval(
+            """INSERT INTO positions_anchor (decision_id, snapshot_json, source)
+               VALUES ($1, $2::jsonb, $3) RETURNING id""",
+            decision_id, json.dumps(snap), source,
+        )
+    return int(rid)
+
+
+async def get_latest_positions_anchor() -> Optional[dict]:
+    """Return the most recent positions_anchor row, or None if empty.
+    Caller should treat `snapshot_json` as the IBKR-truth at `recorded_at`
+    and apply any fills since then to compute current positions."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, recorded_at, decision_id, snapshot_json, source
+               FROM positions_anchor ORDER BY recorded_at DESC LIMIT 1"""
+        )
+    if not row:
+        return None
+    out = dict(row)
+    # asyncpg returns JSONB as a str; normalize to dict for callers.
+    if isinstance(out.get("snapshot_json"), str):
+        out["snapshot_json"] = json.loads(out["snapshot_json"])
+    return out
+
+
+async def get_agent_state_history(
     agent_name: str,
     lookback_hours: int = 24,
 ) -> list[dict]:
-    """Return holding_kanban rows for one agent over the lookback window,
-    ordered newest-first."""
+    """Return agent_state rows for one agent over the lookback window,
+    ordered newest-first. Each row is a hourly snapshot of cumulative P&L
+    and per-symbol detail (positions_json)."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT id, snapshot_at, decision_id, agent_name, symbol,
-                      holding_qty, attribution_share, conviction, direction,
-                      price_per_share, market_value, agent_equity, desk_nav
-               FROM holding_kanban
+            """SELECT id, snapshot_at, agent_name, realized_pnl, unrealized_pnl,
+                      total_pnl, open_cost, open_market_value, n_positions,
+                      positions_json
+               FROM agent_state
                WHERE agent_name=$1
                  AND snapshot_at >= NOW() - ($2 || ' hours')::interval
-               ORDER BY snapshot_at DESC, symbol""",
+               ORDER BY snapshot_at DESC""",
             agent_name, str(lookback_hours),
         )
-    return [dict(r) for r in rows]
+    out = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("positions_json"), str):
+            d["positions_json"] = json.loads(d["positions_json"])
+        out.append(d)
+    return out
 
 
-async def get_kanban_at(at: Optional[str] = None) -> list[dict]:
-    """Cross-section: every (agent, symbol) row at the snapshot tick nearest
-    to `at` (default: most recent tick). Returns rows from the single
-    timestamp closest to (and ≤) the requested time."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        if at:
-            at_dt = datetime.fromisoformat(at)
-            if at_dt.tzinfo is None:
-                at_dt = at_dt.replace(tzinfo=timezone.utc)
-            tick = await conn.fetchval(
-                """SELECT MAX(snapshot_at) FROM holding_kanban
-                   WHERE snapshot_at <= $1""",
-                at_dt,
-            )
-        else:
-            tick = await conn.fetchval("SELECT MAX(snapshot_at) FROM holding_kanban")
-        if tick is None:
-            return []
-        rows = await conn.fetch(
-            """SELECT id, snapshot_at, decision_id, agent_name, symbol,
-                      holding_qty, attribution_share, conviction, direction,
-                      price_per_share, market_value, agent_equity, desk_nav
-               FROM holding_kanban
-               WHERE snapshot_at = $1
-               ORDER BY agent_name, symbol""",
-            tick,
-        )
-    return [dict(r) for r in rows]
-
-
-async def get_agent_pnl_attribution(
+async def get_agent_ledger_events(
     agent_name: str,
     since: Optional[str] = None,
+    limit: int = 200,
 ) -> list[dict]:
+    """Per-agent ledger event log (LEND/RETURN/DIVIDEND), newest-first.
+    Replaces the old get_agent_pnl_attribution reader."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if since:
             rows = await conn.fetch(
-                """SELECT id, fill_id, decision_id, symbol, attribution_share,
-                          attributed_pnl, decided_at
-                   FROM agent_pnl_attribution
-                   WHERE agent_name=$1 AND decided_at >= $2::timestamptz
-                   ORDER BY decided_at DESC""",
+                """SELECT id, fill_id, decision_id, symbol, event,
+                          qty::float8 AS qty, price_per_share::float8 AS price_per_share,
+                          realized_pnl::float8 AS realized_pnl, booked_at, notes
+                   FROM agent_ledger
+                   WHERE agent_name=$1 AND booked_at >= $2::timestamptz
+                   ORDER BY booked_at DESC""",
                 agent_name, since,
             )
         else:
             rows = await conn.fetch(
-                """SELECT id, fill_id, decision_id, symbol, attribution_share,
-                          attributed_pnl, decided_at
-                   FROM agent_pnl_attribution
+                """SELECT id, fill_id, decision_id, symbol, event,
+                          qty::float8 AS qty, price_per_share::float8 AS price_per_share,
+                          realized_pnl::float8 AS realized_pnl, booked_at, notes
+                   FROM agent_ledger
                    WHERE agent_name=$1
-                   ORDER BY decided_at DESC LIMIT 200""",
-                agent_name,
+                   ORDER BY booked_at DESC LIMIT $2""",
+                agent_name, limit,
             )
         return [dict(r) for r in rows]
 
@@ -1211,12 +1499,13 @@ async def get_archive_payload(agent_name: str, before: str) -> dict:
 
         attr = await conn.fetch(
             """SELECT symbol,
-                      COUNT(*) AS fills,
-                      SUM(attribution_share) AS share_total,
-                      SUM(attributed_pnl) AS pnl_total
-               FROM agent_pnl_attribution
+                      COUNT(*) AS events,
+                      SUM(CASE WHEN event = 'LEND'
+                               THEN qty * price_per_share ELSE 0 END) AS gross_lent_cost,
+                      SUM(realized_pnl) AS pnl_total
+               FROM agent_ledger
                WHERE agent_name=$1
-                 AND decided_at <= $2::timestamptz
+                 AND booked_at <= $2::timestamptz
                GROUP BY symbol
                ORDER BY pnl_total DESC NULLS LAST""",
             agent_name, before,
@@ -1308,8 +1597,8 @@ async def prune_archived_rows(agent_name: str, before: str) -> dict:
             agent_name, before,
         )
         p = await conn.execute(
-            """DELETE FROM agent_pnl_attribution
-               WHERE agent_name=$1 AND decided_at <= $2::timestamptz""",
+            """DELETE FROM agent_ledger
+               WHERE agent_name=$1 AND booked_at <= $2::timestamptz""",
             agent_name, before,
         )
 
@@ -1322,7 +1611,7 @@ async def prune_archived_rows(agent_name: str, before: str) -> dict:
         return {
             "theses_deleted": _n(t),
             "convictions_deleted": _n(c),
-            "attributions_deleted": _n(p),
+            "ledger_events_deleted": _n(p),
         }
 
 
@@ -1404,23 +1693,26 @@ async def get_symbol_fills(symbol: str, lookback_days: int = 30) -> list[dict]:
 
 
 async def get_symbol_pnl_summary(symbol: str, since: str | None = None) -> list[dict]:
-    """Per-agent attributed P&L for one symbol (tools 1, 3, 7)."""
+    """Per-agent realized P&L for one symbol over the window (since `since`).
+    Reads `agent_ledger` RETURN/DIVIDEND events."""
     params: list = [symbol.upper()]
     clause = ""
     if since:
-        clause = "AND decided_at >= $2"
+        clause = "AND booked_at >= $2"
         params.append(_as_dt(since))
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""SELECT agent_name,
-                       COUNT(*)::int                              AS total_fills,
-                       SUM(attribution_share)::float8            AS attribution_share_sum,
-                       COALESCE(SUM(attributed_pnl), 0)::float8  AS attributed_pnl
-                FROM agent_pnl_attribution
-                WHERE symbol = $1 {clause}
+                       COUNT(*)::int                              AS total_events,
+                       SUM(CASE WHEN event = 'LEND'   THEN qty
+                                WHEN event = 'RETURN' THEN -qty
+                                ELSE 0 END)::float8               AS net_qty_change,
+                       COALESCE(SUM(realized_pnl), 0)::float8     AS realized_pnl
+                FROM agent_ledger
+                WHERE UPPER(symbol) = $1 {clause}
                 GROUP BY agent_name
-                ORDER BY attributed_pnl DESC NULLS LAST""",
+                ORDER BY realized_pnl DESC NULLS LAST""",
             *params)
         return [dict(r) for r in rows]
 
@@ -1525,23 +1817,25 @@ async def get_pnl_attribution_by_symbol(
     since: str,
     until: str | None = None,
 ) -> list[dict]:
-    """Symbol-level P&L rollup across all agents in a window (tool 3)."""
+    """Symbol-level realized P&L rollup across all agents in a window.
+    Sums realized_pnl from `agent_ledger` RETURN/DIVIDEND events."""
     params: list = [_as_dt(since)]
     clause = ""
     if until:
-        clause = "AND decided_at <= $2"
+        clause = "AND booked_at <= $2"
         params.append(_as_dt(until))
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            f"""SELECT symbol,
-                       COALESCE(SUM(attributed_pnl), 0)::float8   AS total_pnl,
-                       COUNT(DISTINCT fill_id)::int                AS fill_count,
-                       array_agg(DISTINCT agent_name)              AS agents
-                FROM agent_pnl_attribution
-                WHERE decided_at >= $1 {clause}
-                  AND attributed_pnl IS NOT NULL
-                GROUP BY symbol ORDER BY total_pnl DESC NULLS LAST""",
+            f"""SELECT UPPER(symbol) AS symbol,
+                       COALESCE(SUM(realized_pnl), 0)::float8 AS total_pnl,
+                       COUNT(DISTINCT fill_id)::int            AS fill_count,
+                       array_agg(DISTINCT agent_name)          AS agents
+                FROM agent_ledger
+                WHERE booked_at >= $1 {clause}
+                  AND event IN ('RETURN','DIVIDEND')
+                  AND realized_pnl IS NOT NULL
+                GROUP BY UPPER(symbol) ORDER BY total_pnl DESC NULLS LAST""",
             *params)
         return [dict(r) for r in rows]
 
@@ -1550,21 +1844,22 @@ async def get_pnl_attribution_by_agent(
     since: str,
     until: str | None = None,
 ) -> list[dict]:
-    """Agent-level P&L rollup in a window (tool 3)."""
+    """Agent-level realized P&L rollup in a window."""
     params: list = [_as_dt(since)]
     clause = ""
     if until:
-        clause = "AND decided_at <= $2"
+        clause = "AND booked_at <= $2"
         params.append(_as_dt(until))
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"""SELECT agent_name,
-                       COALESCE(SUM(attributed_pnl), 0)::float8 AS total_pnl,
-                       COUNT(DISTINCT fill_id)::int              AS fill_count
-                FROM agent_pnl_attribution
-                WHERE decided_at >= $1 {clause}
-                  AND attributed_pnl IS NOT NULL
+                       COALESCE(SUM(realized_pnl), 0)::float8 AS total_pnl,
+                       COUNT(DISTINCT fill_id)::int            AS fill_count
+                FROM agent_ledger
+                WHERE booked_at >= $1 {clause}
+                  AND event IN ('RETURN','DIVIDEND')
+                  AND realized_pnl IS NOT NULL
                 GROUP BY agent_name ORDER BY total_pnl DESC NULLS LAST""",
             *params)
         return [dict(r) for r in rows]
@@ -1624,17 +1919,21 @@ async def get_conviction_history_for_symbol(
     symbol: str,
     lookback_days: int = 60,
 ) -> list[dict]:
-    """Attribution rows for a symbol as a proxy for conviction-backed trade history (tool 7)."""
+    """Ledger events for a symbol as a proxy for conviction-backed trade history.
+    LEND/RETURN events are the new attribution audit trail."""
     from datetime import datetime, timedelta, timezone
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT agent_name, decided_at, attribution_share::float8,
-                      attributed_pnl::float8, decision_id
-               FROM agent_pnl_attribution
-               WHERE symbol = $1 AND decided_at >= $2
-               ORDER BY decided_at DESC LIMIT 300""",
+            """SELECT agent_name, booked_at, event,
+                      qty::float8 AS qty,
+                      price_per_share::float8 AS price_per_share,
+                      realized_pnl::float8 AS realized_pnl,
+                      decision_id
+               FROM agent_ledger
+               WHERE UPPER(symbol) = $1 AND booked_at >= $2
+               ORDER BY booked_at DESC LIMIT 300""",
             symbol.upper(), cutoff)
         return [dict(r) for r in rows]
 
@@ -1675,7 +1974,7 @@ async def get_unattributed_fills(
     since: str,
     until: str | None = None,
 ) -> list[dict]:
-    """Fills with no agent_pnl_attribution record — traded outside the allocator (tool 10)."""
+    """Fills with no agent_ledger event — traded outside the allocator pipeline."""
     params: list = [_as_dt(since)]
     clause = ""
     if until:
@@ -1689,9 +1988,9 @@ async def get_unattributed_fills(
                        f.fill_price::float8, f.commission::float8,
                        f.realized_pnl::float8, f.mode
                 FROM fills f
-                LEFT JOIN agent_pnl_attribution p ON p.fill_id = f.id
+                LEFT JOIN agent_ledger l ON l.fill_id = f.id
                 WHERE f.filled_at::timestamptz >= $1 {clause}
-                  AND p.id IS NULL
+                  AND l.id IS NULL
                 ORDER BY f.filled_at DESC LIMIT 200""",
             *params)
         return [dict(r) for r in rows]

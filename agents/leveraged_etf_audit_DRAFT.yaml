@@ -1,0 +1,623 @@
+# ════════════════════════════════════════════════════════════════════════════
+# LEVERAGED ETF DIRECTIONAL VEHICLE CATALOG — DRAFT
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Bidirectional expansion of agents/inverse_etf_map.yaml.
+#
+# Purpose: when a sector agent expresses a directional view on an underlying,
+# the desk routes to the highest-leverage, US-listed, currently trading,
+# daily-reset ETF that expresses that direction.
+#
+# Convention (per feedback_inverse_etf_routing 2026-04-27):
+#   - Always submit direction="long" on the chosen vehicle.
+#   - Sizing accounts for the leverage factor (e.g., 3x bull → 1/3 the
+#     dollar notional vs. trading the underlying directly).
+#   - Bear vehicle is held LONG, never shorted.
+#
+# Schema per entry:
+#   ticker         : the leveraged ETF
+#   leverage       : signed daily-reset multiplier (+3.0 = 3x bull, -2.0 = 2x bear)
+#   description    : vendor + product name
+#   vendor         : Direxion | ProShares | GraniteShares | T-REX (REX Shares) |
+#                    Tradr | Defiance | Leverage Shares | Invesco
+#   verified_url   : vendor product page
+#
+# Audit rules:
+#   - US-listed only (UK 5x products excluded — desk trades IBKR US only)
+#   - Cap leverage at 3x (no exotic 4x/5x even if available)
+#   - Daily-reset products only (no monthly-reset/capped buffer ETFs)
+#   - Listed in priority of leverage magnitude (highest first)
+#
+# ════════════════════════════════════════════════════════════════════════════
+
+version: 1
+last_audited: 2026-04-28
+last_audited_by: claude_via_websearch
+audit_sources:
+  - direxion.com (Direxion product pages — single-stock, sector 3X, single-stock 2X)
+  - proshares.com (Ultra/UltraPro/Short/UltraShort lineup)
+  - graniteshares.com (2x Long / 2x Short single-stock lineup)
+  - rexshares.com (T-REX 2X single-stock lineup)
+  - tradretfs.com (Tradr 2X Long / 2X Short single-stock lineup)
+  - defianceetfs.com (Defiance Daily Target 2X lineup)
+  - leverageshares.com/us (Leverage Shares 2x Long Daily lineup)
+  - stockanalysis.com (provider rosters cross-check)
+
+leveraged_etfs:
+
+  # ════════════════════════════════════════════════════════════════
+  # BROAD US INDICES
+  # ════════════════════════════════════════════════════════════════
+
+  SPY:
+    bull:
+      - { ticker: UPRO,  leverage: +3.0, description: "ProShares UltraPro S&P 500",                vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/upro" }
+      - { ticker: SPXL,  leverage: +3.0, description: "Direxion Daily S&P 500 Bull 3X",            vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-sp-500-bull-bear-3x-etfs" }
+      - { ticker: SSO,   leverage: +2.0, description: "ProShares Ultra S&P 500",                   vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/sso" }
+    bear:
+      - { ticker: SPXU,  leverage: -3.0, description: "ProShares UltraPro Short S&P 500",          vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/spxu" }
+      - { ticker: SPXS,  leverage: -3.0, description: "Direxion Daily S&P 500 Bear 3X",            vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-sp-500-bull-bear-3x-etfs" }
+      - { ticker: SDS,   leverage: -2.0, description: "ProShares UltraShort S&P 500",              vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/sds" }
+      - { ticker: SH,    leverage: -1.0, description: "ProShares Short S&P 500",                   vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/sh" }
+
+  QQQ:
+    bull:
+      - { ticker: TQQQ,  leverage: +3.0, description: "ProShares UltraPro QQQ",                    vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/tqqq" }
+      - { ticker: QLD,   leverage: +2.0, description: "ProShares Ultra QQQ",                       vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/qld" }
+    bear:
+      - { ticker: SQQQ,  leverage: -3.0, description: "ProShares UltraPro Short QQQ",              vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/sqqq" }
+      - { ticker: QID,   leverage: -2.0, description: "ProShares UltraShort QQQ",                  vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/qid" }
+      - { ticker: PSQ,   leverage: -1.0, description: "ProShares Short QQQ",                       vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/psq" }
+
+  DIA:
+    bull:
+      - { ticker: UDOW,  leverage: +3.0, description: "ProShares UltraPro Dow30",                  vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/udow" }
+      - { ticker: DDM,   leverage: +2.0, description: "ProShares Ultra Dow30",                     vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/ddm" }
+    bear:
+      - { ticker: SDOW,  leverage: -3.0, description: "ProShares UltraPro Short Dow30",            vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/sdow" }
+      - { ticker: DXD,   leverage: -2.0, description: "ProShares UltraShort Dow30",                vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/dxd" }
+      - { ticker: DOG,   leverage: -1.0, description: "ProShares Short Dow30",                     vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/dog" }
+
+  IWM:
+    bull:
+      - { ticker: TNA,   leverage: +3.0, description: "Direxion Daily Small Cap Bull 3X",          vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-small-cap-bull-bear-3x-etfs" }
+      - { ticker: URTY,  leverage: +3.0, description: "ProShares UltraPro Russell2000",            vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/urty" }
+      - { ticker: UWM,   leverage: +2.0, description: "ProShares Ultra Russell2000",               vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/uwm" }
+    bear:
+      - { ticker: TZA,   leverage: -3.0, description: "Direxion Daily Small Cap Bear 3X",          vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-small-cap-bull-bear-3x-etfs" }
+      - { ticker: SRTY,  leverage: -3.0, description: "ProShares UltraPro Short Russell2000",      vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/srty" }
+      - { ticker: TWM,   leverage: -2.0, description: "ProShares UltraShort Russell2000",          vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/twm" }
+      - { ticker: RWM,   leverage: -1.0, description: "ProShares Short Russell2000",               vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/rwm" }
+
+  EFA:
+    bull:
+      - { ticker: EFO,   leverage: +2.0, description: "ProShares Ultra MSCI EAFE",                 vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/efo" }
+    bear:
+      - { ticker: EFU,   leverage: -2.0, description: "ProShares UltraShort MSCI EAFE",            vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/efu" }
+      - { ticker: EFZ,   leverage: -1.0, description: "ProShares Short MSCI EAFE",                 vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/efz" }
+
+  EEM:
+    bull:
+      - { ticker: EDC,   leverage: +3.0, description: "Direxion Daily MSCI EM Bull 3X",            vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-msci-emerging-markets-bull-bear-3x-etfs" }
+      - { ticker: EET,   leverage: +2.0, description: "ProShares Ultra MSCI Emerging Markets",     vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/eet" }
+    bear:
+      - { ticker: EDZ,   leverage: -3.0, description: "Direxion Daily MSCI EM Bear 3X",            vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-msci-emerging-markets-bull-bear-3x-etfs" }
+      - { ticker: EEV,   leverage: -2.0, description: "ProShares UltraShort MSCI Emerging Markets", vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/eev" }
+      - { ticker: EUM,   leverage: -1.0, description: "ProShares Short MSCI Emerging Markets",     vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/eum" }
+
+  # ════════════════════════════════════════════════════════════════
+  # SECTOR ETFs (SPDR underlyings)
+  # ════════════════════════════════════════════════════════════════
+
+  XLK:
+    bull:
+      - { ticker: TECL,  leverage: +3.0, description: "Direxion Daily Technology Bull 3X",         vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-technology-bull-bear-3x-etfs" }
+      - { ticker: ROM,   leverage: +2.0, description: "ProShares Ultra Technology",                vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/rom" }
+    bear:
+      - { ticker: TECS,  leverage: -3.0, description: "Direxion Daily Technology Bear 3X",         vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-technology-bull-bear-3x-etfs" }
+      - { ticker: REW,   leverage: -2.0, description: "ProShares UltraShort Technology",           vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/rew" }
+
+  XLF:
+    bull:
+      - { ticker: FAS,   leverage: +3.0, description: "Direxion Daily Financial Bull 3X",          vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-financial-bull-bear-3x-etfs" }
+      - { ticker: UYG,   leverage: +2.0, description: "ProShares Ultra Financials",                vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/uyg" }
+    bear:
+      - { ticker: FAZ,   leverage: -3.0, description: "Direxion Daily Financial Bear 3X",          vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-financial-bull-bear-3x-etfs" }
+      - { ticker: SKF,   leverage: -2.0, description: "ProShares UltraShort Financials",           vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/skf" }
+      - { ticker: SEF,   leverage: -1.0, description: "ProShares Short Financials",                vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/sef" }
+
+  XLE:
+    bull:
+      - { ticker: ERX,   leverage: +2.0, description: "Direxion Daily Energy Bull 2X",             vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-energy-bull-bear-2x-etfs" }
+      - { ticker: DIG,   leverage: +2.0, description: "ProShares Ultra Energy",                    vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/dig" }
+      - { ticker: GUSH,  leverage: +2.0, description: "Direxion Daily S&P Oil & Gas E&P Bull 2X",  vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-sp-oil-gas-exp-prod-bull-bear-2x-etfs" }
+    bear:
+      - { ticker: ERY,   leverage: -2.0, description: "Direxion Daily Energy Bear 2X",             vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-energy-bull-bear-2x-etfs" }
+      - { ticker: DUG,   leverage: -2.0, description: "ProShares UltraShort Oil & Gas",            vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/dug" }
+      - { ticker: DRIP,  leverage: -2.0, description: "Direxion Daily S&P Oil & Gas E&P Bear 2X",  vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-sp-oil-gas-exp-prod-bull-bear-2x-etfs" }
+
+  XLV:
+    bull:
+      - { ticker: CURE,  leverage: +3.0, description: "Direxion Daily Healthcare Bull 3X",         vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-healthcare-bull-3x-etf" }
+      - { ticker: RXL,   leverage: +2.0, description: "ProShares Ultra Health Care",               vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/rxl" }
+    bear:
+      - { ticker: RXD,   leverage: -2.0, description: "ProShares UltraShort Health Care",          vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/rxd" }
+
+  XLI:
+    bull:
+      - { ticker: DUSL,  leverage: +3.0, description: "Direxion Daily Industrials Bull 3X",        vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-industrials-bull-3x-etf" }
+      - { ticker: UXI,   leverage: +2.0, description: "ProShares Ultra Industrials",               vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/uxi" }
+    bear:
+      - { ticker: SIJ,   leverage: -2.0, description: "ProShares UltraShort Industrials",          vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/sij" }
+
+  XLP:
+    bull:
+      - { ticker: UGE,   leverage: +2.0, description: "ProShares Ultra Consumer Staples",          vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/uge" }
+    bear:
+      - { ticker: SZK,   leverage: -2.0, description: "ProShares UltraShort Consumer Staples",     vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/szk" }
+
+  XLY:
+    bull:
+      - { ticker: UCC,   leverage: +2.0, description: "ProShares Ultra Consumer Discretionary",    vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/ucc" }
+    bear:
+      - { ticker: SCC,   leverage: -2.0, description: "ProShares UltraShort Consumer Discretionary", vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/scc" }
+
+  XLU:
+    bull:
+      - { ticker: UTSL,  leverage: +3.0, description: "Direxion Daily Utilities Bull 3X",          vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-utilities-bull-3x-etf" }
+      - { ticker: UPW,   leverage: +2.0, description: "ProShares Ultra Utilities",                 vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/upw" }
+    bear:
+      - { ticker: SDP,   leverage: -2.0, description: "ProShares UltraShort Utilities",            vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/sdp" }
+
+  XLB:
+    bull:
+      - { ticker: UYM,   leverage: +2.0, description: "ProShares Ultra Materials",                 vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/uym" }
+    bear:
+      - { ticker: SMN,   leverage: -2.0, description: "ProShares UltraShort Materials",            vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/smn" }
+
+  XLRE:
+    bull:
+      - { ticker: DRN,   leverage: +3.0, description: "Direxion Daily Real Estate Bull 3X",        vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-real-estate-bull-bear-3x-etfs" }
+      - { ticker: URE,   leverage: +2.0, description: "ProShares Ultra Real Estate",               vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/ure" }
+    bear:
+      - { ticker: DRV,   leverage: -3.0, description: "Direxion Daily Real Estate Bear 3X",        vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-real-estate-bull-bear-3x-etfs" }
+      - { ticker: SRS,   leverage: -2.0, description: "ProShares UltraShort Real Estate",          vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/srs" }
+      - { ticker: REK,   leverage: -1.0, description: "ProShares Short Real Estate",               vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/rek" }
+
+  XLC:
+    # Communications-services SPDR — no dedicated 2X/3X tracker. Closest proxy is QQQ leveraged.
+    bull: []
+    bear: []
+
+  SMH:
+    bull:
+      - { ticker: SOXL,  leverage: +3.0, description: "Direxion Daily Semiconductor Bull 3X (NYSE Semi Index ~ SMH/SOXX)", vendor: Direxion, verified_url: "https://www.direxion.com/product/daily-semiconductor-bull-bear-3x-etfs" }
+      - { ticker: USD,   leverage: +2.0, description: "ProShares Ultra Semiconductors",            vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/usd" }
+    bear:
+      - { ticker: SOXS,  leverage: -3.0, description: "Direxion Daily Semiconductor Bear 3X",      vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-semiconductor-bull-bear-3x-etfs" }
+      - { ticker: SSG,   leverage: -2.0, description: "ProShares UltraShort Semiconductors",       vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/ssg" }
+
+  KRE:
+    bull:
+      - { ticker: DPST,  leverage: +3.0, description: "Direxion Daily Regional Banks Bull 3X",     vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-regional-banks-bull-3x-etf" }
+    bear:
+      # Note: Direxion's WDRW (Regional Banks Bear 3X) was liquidated Apr 2020. No verified
+      # active leveraged inverse on KRE currently exists. Use FAZ/SKF for sector-broad bearish.
+      []
+
+  IYR:
+    # IYR (iShares US Real Estate) is closely tracked by XLRE leveraged products.
+    # ProShares URE/SRS and Direxion DRN/DRV reference Real Estate Select Sector / DJ US RE — sufficient proxy.
+    bull:
+      - { ticker: DRN,   leverage: +3.0, description: "Direxion Daily Real Estate Bull 3X (proxy)",  vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-real-estate-bull-bear-3x-etfs" }
+      - { ticker: URE,   leverage: +2.0, description: "ProShares Ultra Real Estate (proxy)",         vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/ure" }
+    bear:
+      - { ticker: DRV,   leverage: -3.0, description: "Direxion Daily Real Estate Bear 3X (proxy)",  vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-real-estate-bull-bear-3x-etfs" }
+      - { ticker: SRS,   leverage: -2.0, description: "ProShares UltraShort Real Estate (proxy)",    vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/srs" }
+
+  GDX:
+    bull:
+      - { ticker: NUGT,  leverage: +2.0, description: "Direxion Daily Gold Miners Bull 2X",        vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-gold-miners-bull-bear-2x-etfs" }
+    bear:
+      - { ticker: DUST,  leverage: -2.0, description: "Direxion Daily Gold Miners Bear 2X",        vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-gold-miners-bull-bear-2x-etfs" }
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK LEVERAGED PAIRS — MEGA-CAP TECH
+  # ════════════════════════════════════════════════════════════════
+
+  AAPL:
+    bull:
+      - { ticker: AAPU,  leverage: +2.0, description: "Direxion Daily AAPL Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-aapl-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: AAPB,  leverage: +2.0, description: "GraniteShares 2x Long AAPL Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/aapb/" }
+      - { ticker: AAPX,  leverage: +2.0, description: "T-REX 2X Long AAPL Daily Target",           vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+    bear:
+      - { ticker: AAPD,  leverage: -1.0, description: "Direxion Daily AAPL Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-aapl-bull-and-bear-leveraged-single-stock-etfs" }
+
+  NVDA:
+    bull:
+      - { ticker: NVDU,  leverage: +2.0, description: "Direxion Daily NVDA Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-nvda-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: NVDL,  leverage: +2.0, description: "GraniteShares 2x Long NVDA Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/nvdl/" }
+      - { ticker: NVDX,  leverage: +2.0, description: "T-REX 2X Long NVDA Daily Target",           vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+      - { ticker: NVDB,  leverage: +2.0, description: "ProShares Ultra NVDA",                      vendor: ProShares,   verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/nvdb" }
+    bear:
+      - { ticker: NVDQ,  leverage: -2.0, description: "T-REX 2X Inverse NVDA Daily Target",        vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+      - { ticker: NVD,   leverage: -2.0, description: "GraniteShares 2x Short NVDA Daily",         vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+      - { ticker: NVDS,  leverage: -1.5, description: "Tradr 1.5X Short NVDA Daily",               vendor: Tradr,       verified_url: "https://www.tradretfs.com/etfs" }
+      - { ticker: NVDD,  leverage: -1.0, description: "Direxion Daily NVDA Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-nvda-bull-and-bear-leveraged-single-stock-etfs" }
+
+  MSFT:
+    bull:
+      - { ticker: MSFU,  leverage: +2.0, description: "Direxion Daily MSFT Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-msft-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: MSFL,  leverage: +2.0, description: "GraniteShares 2x Long MSFT Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+      - { ticker: MSFX,  leverage: +2.0, description: "T-REX 2X Long MSFT Daily Target",           vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+    bear:
+      - { ticker: MSFD,  leverage: -1.0, description: "Direxion Daily MSFT Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-msft-bull-and-bear-leveraged-single-stock-etfs" }
+
+  GOOGL:
+    bull:
+      - { ticker: GGLL,  leverage: +2.0, description: "Direxion Daily GOOGL Bull 2X",              vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-googl-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: GOU,   leverage: +2.0, description: "GraniteShares 2x Long GOOGL Daily",         vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear:
+      - { ticker: GGLS,  leverage: -1.0, description: "Direxion Daily GOOGL Bear 1X",              vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-googl-bull-and-bear-leveraged-single-stock-etfs" }
+
+  GOOG:
+    # GOOG (class C) and GOOGL (class A) trade nearly identically; reuse GGLL/GGLS pair.
+    bull:
+      - { ticker: GOOX,  leverage: +2.0, description: "T-REX 2X Long GOOG Daily Target",           vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+      - { ticker: GGLL,  leverage: +2.0, description: "Direxion Daily GOOGL Bull 2X (proxy)",      vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-googl-bull-and-bear-leveraged-single-stock-etfs" }
+    bear:
+      - { ticker: GGLS,  leverage: -1.0, description: "Direxion Daily GOOGL Bear 1X (proxy)",      vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-googl-bull-and-bear-leveraged-single-stock-etfs" }
+
+  AMZN:
+    bull:
+      - { ticker: AMZU,  leverage: +2.0, description: "Direxion Daily AMZN Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-amzn-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: AMZZ,  leverage: +2.0, description: "GraniteShares 2x Long AMZN Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear:
+      - { ticker: AMZO,  leverage: -2.0, description: "Tradr 2X Short AMZN Daily",                 vendor: Tradr,       verified_url: "https://www.tradretfs.com/etfs" }
+      - { ticker: AMZD,  leverage: -1.0, description: "Direxion Daily AMZN Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-amzn-bull-and-bear-leveraged-single-stock-etfs" }
+
+  META:
+    bull:
+      - { ticker: METU,  leverage: +2.0, description: "Direxion Daily META Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-meta-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: FBL,   leverage: +2.0, description: "GraniteShares 2x Long META Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear:
+      - { ticker: METD,  leverage: -1.0, description: "Direxion Daily META Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-meta-bull-and-bear-leveraged-single-stock-etfs" }
+
+  TSLA:
+    bull:
+      - { ticker: TSLL,  leverage: +2.0, description: "Direxion Daily TSLA Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-tsla-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: TSLR,  leverage: +2.0, description: "GraniteShares 2x Long TSLA Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+      - { ticker: TSLT,  leverage: +2.0, description: "T-REX 2X Long TSLA Daily Target",           vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+      - { ticker: TSLI,  leverage: +2.0, description: "ProShares Ultra TSLA",                      vendor: ProShares,   verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/tsli" }
+    bear:
+      - { ticker: TSLZ,  leverage: -2.0, description: "T-REX 2X Inverse TSLA Daily Target",        vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+      - { ticker: TSDD,  leverage: -2.0, description: "GraniteShares 2x Short TSLA Daily",         vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+      - { ticker: TSLQ,  leverage: -2.0, description: "Tradr 2X Short TSLA Daily",                 vendor: Tradr,       verified_url: "https://www.tradretfs.com/etfs" }
+      - { ticker: TSLS,  leverage: -1.0, description: "Direxion Daily TSLA Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-tsla-bull-and-bear-leveraged-single-stock-etfs" }
+
+  AMD:
+    bull:
+      - { ticker: AMUU,  leverage: +2.0, description: "Direxion Daily AMD Bull 2X",                vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-amd-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: AMDL,  leverage: +2.0, description: "GraniteShares 2x Long AMD Daily",           vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear:
+      - { ticker: DAMD,  leverage: -2.0, description: "Defiance Daily Target 2X Short AMD",        vendor: Defiance,    verified_url: "https://www.defianceetfs.com/" }
+      - { ticker: AMDD,  leverage: -1.0, description: "Direxion Daily AMD Bear 1X",                vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-amd-bull-and-bear-leveraged-single-stock-etfs" }
+
+  NFLX:
+    bull:
+      - { ticker: NFXL,  leverage: +2.0, description: "Direxion Daily NFLX Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-nflx-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: NFLU,  leverage: +2.0, description: "T-REX 2X Long NFLX Daily Target",           vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+    bear:
+      - { ticker: NFXS,  leverage: -1.0, description: "Direxion Daily NFLX Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-nflx-bull-and-bear-leveraged-single-stock-etfs" }
+
+  AVGO:
+    bull:
+      - { ticker: AVL,   leverage: +2.0, description: "Direxion Daily AVGO Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-avgo-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: AVGU,  leverage: +2.0, description: "GraniteShares 2x Long AVGO Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+      - { ticker: AVGX,  leverage: +2.0, description: "Defiance Daily Target 2X Long AVGO",        vendor: Defiance,    verified_url: "https://www.defianceetfs.com/" }
+    bear:
+      - { ticker: AVS,   leverage: -1.0, description: "Direxion Daily AVGO Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-avgo-bull-and-bear-leveraged-single-stock-etfs" }
+
+  CRM:
+    # No US-listed Salesforce single-stock leveraged ETF currently (Leverage Shares 2CRM is UK-only).
+    bull: []
+    bear: []
+
+  ADBE:
+    bull:
+      - { ticker: ADBU,  leverage: +2.0, description: "Direxion Daily ADBE Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-adbe-bull-leveraged-single-stock-etf" }
+    bear: []
+
+  ORCL:
+    bull:
+      - { ticker: ORCU,  leverage: +2.0, description: "Direxion Daily ORCL Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-orcl-bull-bear-leveraged-inverse-single-stock-etfs" }
+      - { ticker: ORCX,  leverage: +2.0, description: "Defiance Daily Target 2X Long ORCL",        vendor: Defiance,    verified_url: "https://www.defianceetfs.com/" }
+    bear:
+      - { ticker: ORCS,  leverage: -1.0, description: "Direxion Daily ORCL Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-orcl-bull-bear-leveraged-inverse-single-stock-etfs" }
+
+  INTC:
+    bull:
+      - { ticker: LINT,  leverage: +2.0, description: "Direxion Daily INTC Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-intc-bull-leveraged-single-stock-etf" }
+      - { ticker: INTW,  leverage: +2.0, description: "GraniteShares 2x Long INTC Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/intw/" }
+    bear: []
+
+  QCOM:
+    bull:
+      - { ticker: QCMU,  leverage: +2.0, description: "Direxion Daily QCOM Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-qcom-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: QCML,  leverage: +2.0, description: "GraniteShares 2x Long QCOM Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear:
+      - { ticker: QCMD,  leverage: -1.0, description: "Direxion Daily QCOM Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-qcom-bull-and-bear-leveraged-single-stock-etfs" }
+
+  MU:
+    bull:
+      - { ticker: MUU,   leverage: +2.0, description: "Direxion Daily MU Bull 2X",                 vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-mu-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: MULL,  leverage: +2.0, description: "GraniteShares 2x Long MU Daily",            vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear:
+      - { ticker: MUD,   leverage: -1.0, description: "Direxion Daily MU Bear 1X",                 vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-mu-bull-and-bear-leveraged-single-stock-etfs" }
+
+  TSM:
+    bull:
+      - { ticker: TSMX,  leverage: +2.0, description: "Direxion Daily TSM Bull 2X",                vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-tsm-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: TSMU,  leverage: +2.0, description: "GraniteShares 2x Long TSM Daily",           vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear:
+      - { ticker: TSMZ,  leverage: -1.0, description: "Direxion Daily TSM Bear 1X",                vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-tsm-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: STSM,  leverage: -2.0, description: "Defiance Daily Target 2X Short TSM",        vendor: Defiance,    verified_url: "https://www.defianceetfs.com/" }
+
+  ASML:
+    bull:
+      - { ticker: ASMU,  leverage: +2.0, description: "Direxion Daily ASML Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-asml-bull-leveraged-single-stock-etf" }
+    bear: []
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK — FINANCIALS
+  # ════════════════════════════════════════════════════════════════
+  # No US-listed single-stock leveraged ETFs exist for JPM/BAC/WFC/GS/MS as of audit date.
+  # Use FAS/UYG (bull) or FAZ/SKF/SEF (bear) as sector-broad expressions.
+
+  JPM:    { bull: [], bear: [] }
+  BAC:    { bull: [], bear: [] }
+  WFC:    { bull: [], bear: [] }
+  GS:     { bull: [], bear: [] }
+  MS:     { bull: [], bear: [] }
+
+  BRKB:
+    bull:
+      - { ticker: BRKU,  leverage: +2.0, description: "Direxion Daily BRKB Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-brkb-bull-and-bear-leveraged-single-stock-etfs" }
+    bear: []
+    # Note: Direxion announced BRKD (Bear 1X) liquidation 4/10/26 — exclude.
+
+  V:      { bull: [], bear: [] }   # No US-listed single-stock leveraged. Leverage Shares 2x V is UK-only.
+  MA:     { bull: [], bear: [] }   # No US-listed single-stock leveraged.
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK — CONSUMER
+  # ════════════════════════════════════════════════════════════════
+
+  COST:
+    bull:
+      - { ticker: COTG,  leverage: +2.0, description: "Leverage Shares 2X Long COST Daily",        vendor: Leverage_Shares, verified_url: "https://leverageshares.com/us/etfs/leverage-shares-2x-long-cost-daily-etf/" }
+    bear: []
+
+  HD:     { bull: [], bear: [] }
+  WMT:    { bull: [], bear: [] }
+  PG:     { bull: [], bear: [] }
+  KO:     { bull: [], bear: [] }
+  PEP:    { bull: [], bear: [] }
+  MO:     { bull: [], bear: [] }
+  PM:     { bull: [], bear: [] }
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK — HEALTHCARE
+  # ════════════════════════════════════════════════════════════════
+
+  UNH:
+    bull:
+      - { ticker: UNHU,  leverage: +2.0, description: "Direxion Daily UNH Bull 2X",                vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-unh-bull-leveraged-single-stock-etf" }
+    bear: []
+
+  PFE:    { bull: [], bear: [] }
+  JNJ:    { bull: [], bear: [] }
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK — INDUSTRIALS
+  # ════════════════════════════════════════════════════════════════
+
+  BA:
+    bull:
+      - { ticker: BOEU,  leverage: +2.0, description: "Direxion Daily BA Bull 2X",                 vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-ba-bull-and-bear-leveraged-single-stock-etfs" }
+    bear: []
+    # Note: Direxion announced BOED (Bear 1X) liquidation 4/10/26 — exclude.
+
+  CAT:    { bull: [], bear: [] }
+  GE:     { bull: [], bear: [] }   # GE Aerospace has no US 2X. (GEV — separate ticker — has GEVX/GEVG; not GE itself.)
+  F:      { bull: [], bear: [] }   # FRDU/FRDD slated to liquidate 4/10/26 — exclude as forward-looking.
+  GM:     { bull: [], bear: [] }   # Direxion filings only; no live listing confirmed at audit.
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK — CHINA / EM
+  # ════════════════════════════════════════════════════════════════
+
+  BABA:
+    bull:
+      - { ticker: BABU,  leverage: +2.0, description: "Direxion Daily BABA Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-baba-bull-leveraged-single-stock-etf" }
+      - { ticker: BABX,  leverage: +2.0, description: "GraniteShares 2x Long BABA Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear: []
+
+  BIDU:
+    bull:
+      - { ticker: BIDG,  leverage: +2.0, description: "Leverage Shares 2X Long BIDU Daily",        vendor: Leverage_Shares, verified_url: "https://leverageshares.com/us/etfs/leverage-shares-2x-long-bidu-daily-etf/" }
+    bear: []
+
+  NIO:    { bull: [], bear: [] }   # Leverage Shares filed late-2025 NIO product — verify before using.
+  BYDDY:  { bull: [], bear: [] }   # No US-listed single-stock leveraged ETF.
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK — CRYPTO / FINTECH / SPECULATIVE
+  # ════════════════════════════════════════════════════════════════
+
+  COIN:
+    bull:
+      - { ticker: CONX,  leverage: +2.0, description: "Direxion Daily COIN Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-coin-bull-leveraged-single-stock-etf" }
+      - { ticker: CONL,  leverage: +2.0, description: "GraniteShares 2x Long COIN Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/conl/" }
+      - { ticker: COIA,  leverage: +2.0, description: "ProShares Ultra COIN",                      vendor: ProShares,   verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/coia" }
+    bear:
+      - { ticker: CONI,  leverage: -2.0, description: "GraniteShares 2x Short COIN Daily",         vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+
+  MSTR:
+    bull:
+      - { ticker: MSTU,  leverage: +2.0, description: "T-REX 2X Long MSTR Daily Target",           vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+      - { ticker: MSTX,  leverage: +2.0, description: "Defiance Daily Target 2X Long MSTR",        vendor: Defiance,    verified_url: "https://www.defianceetfs.com/mstx/" }
+      - { ticker: MSTP,  leverage: +2.0, description: "GraniteShares 2x Long MSTR Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear:
+      - { ticker: MSTZ,  leverage: -2.0, description: "T-REX 2X Inverse MSTR Daily Target",        vendor: T-REX,       verified_url: "https://www.rexshares.com/t-rex-leveraged-etfs/" }
+      - { ticker: SMST,  leverage: -2.0, description: "Defiance Daily Target 2X Short MSTR",       vendor: Defiance,    verified_url: "https://www.defianceetfs.com/smst/" }
+      - { ticker: MSDD,  leverage: -2.0, description: "GraniteShares 2x Short MSTR Daily",         vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+
+  PLTR:
+    bull:
+      - { ticker: PLTU,  leverage: +2.0, description: "Direxion Daily PLTR Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-pltr-bull-and-bear-leveraged-single-stock-etfs" }
+      - { ticker: PTIR,  leverage: +2.0, description: "GraniteShares 2x Long PLTR Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+      - { ticker: PLTA,  leverage: +2.0, description: "ProShares Ultra PLTR",                      vendor: ProShares,   verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/plta" }
+    bear:
+      - { ticker: PLTZ,  leverage: -2.0, description: "Defiance Daily Target 2X Short PLTR",       vendor: Defiance,    verified_url: "https://www.defianceetfs.com/" }
+      - { ticker: PLTD,  leverage: -1.0, description: "Direxion Daily PLTR Bear 1X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-pltr-bull-and-bear-leveraged-single-stock-etfs" }
+
+  SOFI:
+    bull:
+      - { ticker: SOFA,  leverage: +2.0, description: "Direxion Daily SOFI Bull 2X",               vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-sofi-bull-leveraged-single-stock-etf" }
+      - { ticker: SOFX,  leverage: +2.0, description: "Defiance Daily Target 2X Long SOFI",        vendor: Defiance,    verified_url: "https://www.defianceetfs.com/" }
+    bear: []
+
+  RIVN:
+    bull:
+      - { ticker: RVNL,  leverage: +2.0, description: "GraniteShares 2x Long RIVN Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/" }
+    bear: []
+
+  MARA:
+    bull:
+      - { ticker: MRAL,  leverage: +2.0, description: "GraniteShares 2x Long MARA Daily",          vendor: GraniteShares, verified_url: "https://graniteshares.com/institutional/us/en-us/etfs/mral/" }
+    bear: []
+
+  RIOT:
+    bull:
+      - { ticker: RIOX,  leverage: +2.0, description: "Defiance Daily Target 2X Long RIOT",        vendor: Defiance,    verified_url: "https://www.defianceetfs.com/" }
+    bear: []
+
+  # ════════════════════════════════════════════════════════════════
+  # SINGLE-STOCK — ENERGY
+  # ════════════════════════════════════════════════════════════════
+
+  XOM:
+    bull:
+      - { ticker: XOMX,  leverage: +2.0, description: "Direxion Daily XOM Bull 2X",                vendor: Direxion,    verified_url: "https://www.direxion.com/product/daily-xom-bull-and-bear-leveraged-single-stock-etfs" }
+    bear: []
+    # Sector-broad XOM bearish: use ERY/DUG/DRIP under XLE.
+
+  CVX:    { bull: [], bear: [] }   # No verified single-stock 2X. Use ERX/ERY for sector exposure.
+  OXY:    { bull: [], bear: [] }   # No verified single-stock 2X.
+
+  # ════════════════════════════════════════════════════════════════
+  # COMMODITIES & CURRENCIES
+  # ════════════════════════════════════════════════════════════════
+
+  GLD:
+    bull:
+      - { ticker: UGL,   leverage: +2.0, description: "ProShares Ultra Gold",                      vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/ugl" }
+    bear:
+      - { ticker: GLL,   leverage: -2.0, description: "ProShares UltraShort Gold",                 vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/gll" }
+
+  SLV:
+    bull:
+      - { ticker: AGQ,   leverage: +2.0, description: "ProShares Ultra Silver",                    vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/agq" }
+    bear:
+      - { ticker: ZSL,   leverage: -2.0, description: "ProShares UltraShort Silver",               vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/zsl" }
+
+  USO:
+    bull:
+      - { ticker: UCO,   leverage: +2.0, description: "ProShares Ultra Bloomberg Crude Oil",       vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/uco" }
+    bear:
+      - { ticker: SCO,   leverage: -2.0, description: "ProShares UltraShort Bloomberg Crude Oil",  vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/sco" }
+
+  UNG:
+    bull:
+      - { ticker: BOIL,  leverage: +2.0, description: "ProShares Ultra Bloomberg Natural Gas",     vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/boil" }
+    bear:
+      - { ticker: KOLD,  leverage: -2.0, description: "ProShares UltraShort Bloomberg Natural Gas", vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/kold" }
+
+  TLT:
+    bull:
+      - { ticker: TMF,   leverage: +3.0, description: "Direxion Daily 20+ Year Treasury Bull 3X",  vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-20-year-treasury-bull-bear-3x-etfs" }
+      - { ticker: UBT,   leverage: +2.0, description: "ProShares Ultra 20+ Year Treasury",         vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/ubt" }
+    bear:
+      - { ticker: TMV,   leverage: -3.0, description: "Direxion Daily 20+ Year Treasury Bear 3X",  vendor: Direxion,  verified_url: "https://www.direxion.com/product/daily-20-year-treasury-bull-bear-3x-etfs" }
+      - { ticker: TTT,   leverage: -3.0, description: "ProShares UltraPro Short 20+ Year Treasury", vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/ttt" }
+      - { ticker: TBT,   leverage: -2.0, description: "ProShares UltraShort 20+ Year Treasury",    vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/tbt" }
+      - { ticker: TBF,   leverage: -1.0, description: "ProShares Short 20+ Year Treasury",         vendor: ProShares, verified_url: "https://www.proshares.com/our-etfs/leveraged-and-inverse/tbf" }
+
+  UUP:
+    # No US-listed leveraged dollar bull product currently. UDN is the 1X bearish counterpart fund (separate
+    # dollar-bearish vehicle, not a daily-reset inverse of UUP). Leave both empty — desk should
+    # express dollar views via FX-correlated underlyings (e.g., emerging-market or yen products) instead.
+    bull: []
+    bear: []
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# UNDERLYINGS WITH NO VERIFIED LEVERAGED EXPRESSION
+# ════════════════════════════════════════════════════════════════════════════
+# These names lack any US-listed, currently-trading, daily-reset leveraged ETF
+# in either direction. Sector agents should publish 'flat' (or route via the
+# closest sector ETF leveraged proxy — see notes per name).
+# ════════════════════════════════════════════════════════════════════════════
+
+no_verified_leveraged:
+
+  # Financials individual names — no single-stock 2X. Use FAS/FAZ for sector-broad.
+  - { underlying: JPM,   note: "Use FAS/UYG (bull) or FAZ/SKF/SEF (bear)" }
+  - { underlying: BAC,   note: "Use FAS/UYG (bull) or FAZ/SKF/SEF (bear)" }
+  - { underlying: WFC,   note: "Use FAS/UYG (bull) or FAZ/SKF/SEF (bear)" }
+  - { underlying: GS,    note: "Use FAS/UYG (bull) or FAZ/SKF/SEF (bear)" }
+  - { underlying: MS,    note: "Use FAS/UYG (bull) or FAZ/SKF/SEF (bear)" }
+
+  # Payments — Leverage Shares 2x V/MA exist UK-only.
+  - { underlying: V,     note: "No US-listed single-stock leveraged. Use FAS for sector-broad bull." }
+  - { underlying: MA,    note: "No US-listed single-stock leveraged. Use FAS for sector-broad bull." }
+
+  # Consumer staples / discretionary individual names — use UGE/SZK (XLP) or UCC/SCC (XLY).
+  - { underlying: HD,    note: "Use UCC (bull) / SCC (bear) — XLY proxy" }
+  - { underlying: WMT,   note: "Use UCC (bull) / SCC (bear) — XLY proxy" }
+  - { underlying: PG,    note: "Use UGE (bull) / SZK (bear) — XLP proxy" }
+  - { underlying: KO,    note: "Use UGE (bull) / SZK (bear) — XLP proxy" }
+  - { underlying: PEP,   note: "Use UGE (bull) / SZK (bear) — XLP proxy" }
+  - { underlying: MO,    note: "Use UGE (bull) / SZK (bear) — XLP proxy" }
+  - { underlying: PM,    note: "Use UGE (bull) / SZK (bear) — XLP proxy" }
+
+  # Healthcare individual names — use CURE (bull) / RXD (bear).
+  - { underlying: PFE,   note: "Use CURE/RXL (bull) / RXD (bear) — XLV proxy" }
+  - { underlying: JNJ,   note: "Use CURE/RXL (bull) / RXD (bear) — XLV proxy" }
+
+  # Industrials individual names — use DUSL/UXI (bull) / SIJ (bear).
+  - { underlying: CAT,   note: "Use DUSL/UXI (bull) / SIJ (bear) — XLI proxy" }
+  - { underlying: GE,    note: "Use DUSL/UXI (bull) / SIJ (bear) — XLI proxy. (GEV != GE; GEVX is on Vernova.)" }
+  - { underlying: F,     note: "FRDU/FRDD slated to close 4/10/26. Use UCC/SCC — XLY proxy." }
+  - { underlying: GM,    note: "Filed but not confirmed live. Use UCC/SCC — XLY proxy." }
+
+  # Energy individual names — use ERX/GUSH (bull) / ERY/DUG/DRIP (bear).
+  - { underlying: CVX,   note: "Use ERX/DIG/GUSH (bull) / ERY/DUG/DRIP (bear) — XLE proxy" }
+  - { underlying: OXY,   note: "Use GUSH (bull) / DRIP (bear) — E&P sub-sector" }
+
+  # China/EM individual names where no US single-stock 2X exists.
+  - { underlying: NIO,   note: "Leverage Shares filing late-2025; verify live before use. Use EDC/EDZ for EM proxy." }
+  - { underlying: BYDDY, note: "ADR with no leveraged ETF. Use EDC/EDZ — EM proxy." }
+
+  # Berkshire bear — Direxion BRKD slated for 4/10/26 liquidation.
+  - { underlying: BRKB_bear, note: "BRKD liquidates 4/10/26. No verified bear vehicle." }
+
+  # Salesforce — US 2x doesn't exist (Leverage Shares 2CRM is UK-only).
+  - { underlying: CRM,   note: "No US-listed single-stock leveraged. Use ROM (bull) / REW (bear) — XLK proxy" }
+
+  # Sector w/ no leveraged tracker
+  - { underlying: XLC,   note: "No dedicated XLC leveraged. Use TQQQ/SQQQ (QQQ is highly correlated)" }
+
+  # Currency
+  - { underlying: UUP,   note: "No US-listed leveraged dollar bull. Express dollar via international leveraged ETFs." }

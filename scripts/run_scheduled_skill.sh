@@ -25,42 +25,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Per-skill IBKR clientId (must match run_scheduled_skill.bat)
-case "$SKILL" in
-    mike-morning)    export IBKR_CLIENT_ID=11 ;;
-    mike-midday)     export IBKR_CLIENT_ID=12 ;;
-    cassidy-evening) export IBKR_CLIENT_ID=13 ;;
-    hourly-review)   export IBKR_CLIENT_ID=14 ;;
-    rex-review)      export IBKR_CLIENT_ID=15 ;;
-    maya-review)     export IBKR_CLIENT_ID=16 ;;
-    atlas-review)    export IBKR_CLIENT_ID=17 ;;
-    titan-review)    export IBKR_CLIENT_ID=18 ;;
-    vera-review)     export IBKR_CLIENT_ID=19 ;;
-    fab-review)      export IBKR_CLIENT_ID=20 ;;
-    trump-review)    export IBKR_CLIENT_ID=21 ;;
-    rex-evening)     export IBKR_CLIENT_ID=22 ;;
-    maya-evening)    export IBKR_CLIENT_ID=23 ;;
-    atlas-evening)   export IBKR_CLIENT_ID=24 ;;
-    titan-evening)   export IBKR_CLIENT_ID=25 ;;
-    fab-evening)     export IBKR_CLIENT_ID=26 ;;
-    trump-evening)   export IBKR_CLIENT_ID=27 ;;
-    vera-evening)    export IBKR_CLIENT_ID=28 ;;
-    iron-review)     export IBKR_CLIENT_ID=29 ;;
-    volt-review)     export IBKR_CLIENT_ID=30 ;;
-    iron-evening)    export IBKR_CLIENT_ID=31 ;;
-    volt-evening)    export IBKR_CLIENT_ID=32 ;;
-    mike-allocator)  export IBKR_CLIENT_ID=33 ;;
-    fabless-review)  export IBKR_CLIENT_ID=34 ;;
-    fabless-evening) export IBKR_CLIENT_ID=35 ;;
-    sector-archivist) export IBKR_CLIENT_ID=36 ;;
-esac
+# IBKR connections are now multiplexed through ibkr-daemon.service (one
+# clientId=1 connection at 127.0.0.1:7790). Skills no longer need their own
+# clientIds; the per-skill case block was removed 2026-04-28 with the daemon
+# refactor. See ibkr/daemon.py.
 
 mkdir -p logs
 LOG_FILE="logs/${SKILL}.log"
-echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting /${SKILL} (IBKR_CLIENT_ID=${IBKR_CLIENT_ID:-unset}, FLAG=${FLAG})" >> "$LOG_FILE"
-
-# Preflight: verify IBKR clientId is free; non-fatal.
-python scripts/ibkr_preflight.py >> "$LOG_FILE" 2>&1 || true
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting /${SKILL} (FLAG=${FLAG})" >> "$LOG_FILE"
 
 if [[ -n "$DEV_PREFIX" ]]; then
     PROMPT="${DEV_PREFIX} /${SKILL}"

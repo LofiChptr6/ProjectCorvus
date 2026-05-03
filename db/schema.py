@@ -84,33 +84,8 @@ SCHEMA_STATEMENTS = [
         realized_pnl  DOUBLE PRECISION
     )""",
     "ALTER TABLE fills ADD COLUMN IF NOT EXISTS realized_pnl DOUBLE PRECISION",
-    """CREATE TABLE IF NOT EXISTS positions_snapshot (
-        id             BIGSERIAL PRIMARY KEY,
-        snapshot_at    TEXT NOT NULL,
-        session_id     TEXT,
-        agent_name     TEXT,
-        symbol         TEXT NOT NULL,
-        quantity       DOUBLE PRECISION NOT NULL,
-        avg_cost       DOUBLE PRECISION NOT NULL,
-        market_price   DOUBLE PRECISION,
-        market_value   DOUBLE PRECISION,
-        unrealized_pnl DOUBLE PRECISION,
-        realized_pnl   DOUBLE PRECISION
-    )""",
-    """CREATE TABLE IF NOT EXISTS pnl_daily (
-        id             BIGSERIAL PRIMARY KEY,
-        trade_date     TEXT NOT NULL,
-        agent_name     TEXT NOT NULL,
-        realized_pnl   DOUBLE PRECISION NOT NULL DEFAULT 0,
-        unrealized_pnl DOUBLE PRECISION NOT NULL DEFAULT 0,
-        total_pnl      DOUBLE PRECISION NOT NULL DEFAULT 0,
-        nav_start      DOUBLE PRECISION,
-        nav_end        DOUBLE PRECISION,
-        num_trades     INTEGER DEFAULT 0,
-        num_fills      INTEGER DEFAULT 0,
-        updated_at     TEXT NOT NULL,
-        UNIQUE(trade_date, agent_name)
-    )""",
+    # NOTE: positions_snapshot + pnl_daily were deprecated by the per-agent
+    # double-entry ledger redesign. See agent_ledger / agent_state below.
     """CREATE TABLE IF NOT EXISTS agent_allocations (
         id              BIGSERIAL PRIMARY KEY,
         agent_name      TEXT NOT NULL UNIQUE,
@@ -228,44 +203,90 @@ SCHEMA_STATEMENTS = [
         notes                    TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_alloc_decided ON allocation_decision (decided_at DESC)",
-    # P&L attribution — each fill is divided across contributing agents
-    # proportionally to their share of the conviction that drove the trade.
-    """CREATE TABLE IF NOT EXISTS agent_pnl_attribution (
-        id                  BIGSERIAL PRIMARY KEY,
-        fill_id             BIGINT,
-        decision_id         BIGINT REFERENCES allocation_decision(id),
-        agent_name          TEXT NOT NULL,
-        symbol              TEXT NOT NULL,
-        attribution_share   NUMERIC NOT NULL,
-        attributed_pnl      NUMERIC,
-        decided_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    # ─────────────────────────────────────────────────────────────────────
+    # Per-agent double-entry ledger. Replaces the old `agent_pnl_attribution`
+    # + `holding_kanban` model. Each row is one accounting event in an agent's
+    # book:
+    #   - LEND: mike's allocator filled a BUY → fractional shares are lent
+    #     to each contributing agent (qty proportional to their normalized
+    #     conviction in `meta_agent.allocator.split_attribution`). cost basis
+    #     = fill price.
+    #   - RETURN: mike's allocator filled a SELL → close qty is distributed
+    #     pro-rata across agents currently holding the symbol; each row's
+    #     realized_pnl = qty × (sale_price − that_agent's_weighted_avg_cost).
+    #   - DIVIDEND: corp-action feed credits each holder pro-rata to held qty.
+    # Cash is NEVER on an agent's ledger — it stays on mike's book (nav_log).
+    # See DESK_POLICY §0/§7 for the full model.
+    """CREATE TABLE IF NOT EXISTS agent_ledger (
+        id              BIGSERIAL PRIMARY KEY,
+        booked_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        fill_id         BIGINT REFERENCES fills(id) ON DELETE SET NULL,
+        decision_id     BIGINT REFERENCES allocation_decision(id) ON DELETE SET NULL,
+        agent_name      TEXT NOT NULL,
+        symbol          TEXT NOT NULL,
+        event           TEXT NOT NULL CHECK (event IN ('LEND','RETURN','DIVIDEND')),
+        qty             NUMERIC NOT NULL CHECK (qty > 0),
+        price_per_share NUMERIC NOT NULL,
+        realized_pnl    NUMERIC,
+        notes           TEXT
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_pnl_attr_agent ON agent_pnl_attribution (agent_name, decided_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_pnl_attr_fill ON agent_pnl_attribution (fill_id)",
-    # Holding Kanban — hourly per-(agent, symbol) snapshot of attributed
-    # holdings, conviction, and equity. Written by meta_agent.holdings_snapshot
-    # immediately after every rebalance_desk decision (live or dry-run). Persistent;
-    # forms the trajectory of each agent's book over time. Cash is split among
-    # contributing agents by normalized conviction and stored as symbol='CASH'.
-    """CREATE TABLE IF NOT EXISTS holding_kanban (
-        id                 BIGSERIAL PRIMARY KEY,
-        snapshot_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        decision_id        BIGINT REFERENCES allocation_decision(id) ON DELETE SET NULL,
-        agent_name         TEXT NOT NULL,
-        symbol             TEXT NOT NULL,
-        holding_qty        NUMERIC NOT NULL,
-        attribution_share  NUMERIC,
-        conviction         NUMERIC,
-        direction          TEXT,
-        price_per_share    NUMERIC NOT NULL,
-        market_value       NUMERIC NOT NULL,
-        agent_equity       NUMERIC NOT NULL,
-        desk_nav           NUMERIC NOT NULL
+    "CREATE INDEX IF NOT EXISTS idx_agent_ledger_agent_at ON agent_ledger (agent_name, booked_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_ledger_symbol_at ON agent_ledger (symbol, booked_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_ledger_fill ON agent_ledger (fill_id)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_ledger_agent_symbol ON agent_ledger (agent_name, symbol, booked_at)",
+    # Hourly materialized snapshot: one row per (agent, hour_bucket) with
+    # cumulative P&L plus per-symbol detail in JSONB. The headline numbers
+    # (realized_pnl, unrealized_pnl, total_pnl) are CUMULATIVE since inception
+    # so day-over-day P&L is simply total_pnl(t1) − total_pnl(t0) — settlement
+    # noise disappears because RETURNs move money from unrealized to realized
+    # without changing the total. Refreshed by scripts/refresh_agent_state.py.
+    """CREATE TABLE IF NOT EXISTS agent_state (
+        id                BIGSERIAL PRIMARY KEY,
+        snapshot_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        hour_bucket       TIMESTAMP GENERATED ALWAYS AS
+                            (date_trunc('hour', snapshot_at AT TIME ZONE 'UTC')) STORED,
+        agent_name        TEXT NOT NULL,
+        realized_pnl      NUMERIC NOT NULL,
+        unrealized_pnl    NUMERIC NOT NULL,
+        total_pnl         NUMERIC NOT NULL,
+        open_cost         NUMERIC NOT NULL,
+        open_market_value NUMERIC NOT NULL,
+        n_positions       INTEGER NOT NULL,
+        positions_json    JSONB NOT NULL
     )""",
-    "CREATE INDEX IF NOT EXISTS idx_kanban_at ON holding_kanban (snapshot_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_kanban_agent_at ON holding_kanban (agent_name, snapshot_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_kanban_symbol_at ON holding_kanban (symbol, snapshot_at DESC)",
-    "CREATE INDEX IF NOT EXISTS idx_kanban_decision ON holding_kanban (decision_id)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_state_at ON agent_state (snapshot_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_agent_state_agent_at ON agent_state (agent_name, snapshot_at DESC)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_agent_state_hour_unique ON agent_state (agent_name, hour_bucket)",
+    # Cash + NAV anchor written by mike's allocator every rebalance. The
+    # deterministic kanban refresh script (scripts/refresh_kanban.py) reads
+    # the latest row, then applies fills since `recorded_at` to derive
+    # current cash without touching the IBKR gateway. mike is the only
+    # writer; all other paths are read-only.
+    """CREATE TABLE IF NOT EXISTS nav_log (
+        id            BIGSERIAL PRIMARY KEY,
+        recorded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        decision_id   BIGINT REFERENCES allocation_decision(id) ON DELETE SET NULL,
+        desk_nav      NUMERIC NOT NULL,
+        cash_balance  NUMERIC NOT NULL,
+        source        TEXT NOT NULL DEFAULT 'mike'
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_nav_log_recorded ON nav_log (recorded_at DESC)",
+    # Per-symbol position anchor written by mike's allocator every rebalance.
+    # Mirrors `nav_log` for the position leg: mike captures IBKR-canonical
+    # quantities into `snapshot_json` ({"AAPL": 100, "MSFT": 50, ...}); the
+    # deterministic refresh starts from the latest anchor and applies fills
+    # made *after* `recorded_at`. This avoids the fills-vs-IBKR drift we hit
+    # when the fills table was missing pre-system fills (e.g. XLF: IBKR shows
+    # 105 shares, fills only have 90) or carried orphan SLDs without matching
+    # BOTs (e.g. VOO: 1 SLD, no BOT, refresh thought desk was short 1).
+    """CREATE TABLE IF NOT EXISTS positions_anchor (
+        id            BIGSERIAL PRIMARY KEY,
+        recorded_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        decision_id   BIGINT REFERENCES allocation_decision(id) ON DELETE SET NULL,
+        snapshot_json JSONB NOT NULL,
+        source        TEXT NOT NULL DEFAULT 'mike'
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_positions_anchor_recorded ON positions_anchor (recorded_at DESC)",
     # Per-agent narrative archive. Written by sector-archivist weekly. Each row
     # is one chapter covering [period_start, period_end] for one agent —
     # condensing closed theses, conviction history, and attributed P&L into a

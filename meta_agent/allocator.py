@@ -43,6 +43,7 @@ def compute_target_weights(
     gross_leverage: float = 1.0,
     max_per_symbol: float = 0.20,
     min_trade_threshold: float = 0.005,
+    top_n: Optional[int] = 10,
 ) -> TargetWeights:
     """Aggregate signed convictions into normalized target weights.
 
@@ -53,6 +54,10 @@ def compute_target_weights(
         gross_leverage: Total |weight| sum after normalization. 1.0 = no margin.
         max_per_symbol: Cap any single name at this fraction of NAV.
         min_trade_threshold: Drop names below this absolute weight.
+        top_n: Keep only the top-N highest |signed-conviction| symbols (after
+            agent aggregation). CASH is held aside before this trim and is
+            ALWAYS retained. Set to None to disable. Default 10 — concentration
+            policy: own fewer, bigger positions to amortize commission floor.
 
     Returns:
         TargetWeights with `.weights` and `.contributors`.
@@ -85,6 +90,19 @@ def compute_target_weights(
     if not signed and cash_w == 0:
         return TargetWeights(weights={}, contributors=contributors,
                              cash_weight=0.0, cash_contributors=cash_contributors)
+
+    # Concentration trim: keep only the top-N |signed| symbols. CASH was pulled
+    # out above and is always preserved. Drops the long tail of low-conviction
+    # tickers that would otherwise produce sub-$500 fills hammering the
+    # commission floor.
+    if top_n is not None and len(signed) > top_n:
+        ranked = sorted(signed.items(), key=lambda kv: abs(kv[1]), reverse=True)
+        kept = dict(ranked[:top_n])
+        # Drop dropped-symbol contributors so attribution stays consistent
+        for sym in list(contributors.keys()):
+            if sym != "CASH" and sym not in kept:
+                contributors.pop(sym, None)
+        signed = kept
 
     # Normalize so abs-weights (including the cash share) sum to gross_leverage.
     # The cash share doesn't deploy capital, so it pulls deployed gross down

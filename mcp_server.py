@@ -120,19 +120,21 @@ async def _ensure_init_light() -> None:
 
 
 async def _ensure_init() -> None:
-    """Full init: config + DB + IBKR connection. Required for any trading tool.
-    Stateless on the IBKR side — get_ib() reuses an active socket or reconnects
-    so a stale connection from a Gateway daily-restart self-heals here.
-    On IBKR connect failure, pings Telegram before raising so the user is notified."""
+    """Full init: config + DB + IBKR daemon healthcheck. Required for any trading tool.
+    The daemon owns the live ib_async socket; we just verify it's connected so the
+    existing Telegram alert still fires on Gateway-down."""
     await _ensure_init_light()
-    from ibkr.client import configure, get_ib
+    from ibkr.client import configure
     configure(_cfg)
     try:
-        await get_ib()
+        from ibkr import _rpc
+        health = await _rpc.get("/healthz")
+        if not health.get("connected"):
+            raise RuntimeError(f"daemon up but IBKR disconnected (mode={health.get('mode')})")
     except Exception as exc:
         try:
             from approval.telegram import send_message
-            await send_message(f"⚠️ *IBKR connect failed*\n`{type(exc).__name__}: {exc}`\nTool call aborted. Check IB Gateway.")
+            await send_message(f"⚠️ *IBKR daemon unreachable*\n`{type(exc).__name__}: {exc}`\nTool call aborted. Check ibkr-daemon.service / IB Gateway.")
         except Exception:
             pass
         raise
@@ -498,67 +500,84 @@ async def compute_technicals(symbol: str, indicators: list[str]) -> str:
 
 
 @mcp.tool()
-async def get_pnl_summary(period: str = "today", agent_name: Optional[str] = None) -> str:
+async def get_agent_pnl_windows(agent_name: Optional[str] = None) -> str:
     """
-    Get P&L by agent. For period='today' (default), returns COMBINED P&L
-    (realized + unrealized) — open-position mark-to-market is split across
-    agents by their current conviction weight on each held symbol. For
-    'week'/'month'/'all', returns realized-only (unrealized is right-now,
-    not historical).
+    Per-agent P&L over rolling windows (1d, week-to-date, 1 month, 3 month)
+    computed from `agent_state.total_pnl` deltas — no IBKR call. Each window:
+        pnl_usd = total_pnl(now) − total_pnl(window_start)
+    where window_start resolves to the latest snapshot at-or-before the
+    calendar window start. Windows with no snapshot return None.
+
+    `total_pnl` is cumulative since inception (realized + unrealized), so
+    settlement noise and cash-attribution artifacts don't appear in the
+    delta — see DESK_POLICY §0/§7. Reflects the agent_state table as-of
+    its most recent UPSERT (hourly cron + every mike rebalance).
 
     Args:
-        period: 'today', 'week', 'month', or 'all'
-        agent_name: Filter by agent (omit for all agents)
+        agent_name: Filter to one agent. Omit for the full per-agent table.
     """
     await _ensure_init_light()
-    if period == "today":
-        from reporting.combined_pnl import get_pnl_combined
-        combined = await get_pnl_combined(agent_name=agent_name)
-        totals = {
-            "total_pnl": combined["desk"]["combined_total"],
-            "realized_pnl": combined["desk"]["realized_total"],
-            "unrealized_pnl": combined["desk"]["unrealized_total"],
-            "num_fills": sum(r["num_fills"] for r in combined["rows"]),
-            "commission_gap": combined["desk"]["commission_gap"],
-            "orphan_unrealized": combined["desk"]["orphan_unrealized"],
-        }
-        return json.dumps({"period": period, "by_agent": combined["rows"], "totals": totals})
-    import db.store as store
-    rows = await store.get_pnl_summary(agent_name=agent_name, period=period)
-    totals = {"total_pnl": 0.0, "num_fills": 0}
-    for r in rows:
-        totals["total_pnl"] += r.get("total_pnl", 0) or 0
-        totals["num_fills"] += r.get("num_fills", 0) or 0
-    return json.dumps({"period": period, "by_agent": rows, "totals": totals})
+    from reporting.agent_pnl import get_pnl_windows
+    return json.dumps(await get_pnl_windows(agent_name=agent_name), default=str)
+
+
+@mcp.tool()
+async def get_pnl_summary(agent_name: Optional[str] = None) -> str:
+    """
+    COMBINED (realized + unrealized) P&L by agent — the primary leaderboard.
+    Reads the latest `agent_state` snapshot per agent (no IBKR call). Numbers
+    are CUMULATIVE since inception, not windowed; for windowed P&L use
+    `get_agent_pnl_windows`.
+
+    Each row: {agent_name, realized_pnl, unrealized_pnl, total_pnl,
+               open_cost, open_market_value, n_positions, snapshot_at}.
+    Desk totals roll up underneath in `totals`.
+
+    Args:
+        agent_name: Filter by agent (omit for all agents).
+    """
+    await _ensure_init_light()
+    from reporting.agent_pnl import get_pnl_combined
+    combined = await get_pnl_combined(agent_name=agent_name)
+    totals = {
+        "total_pnl": combined["desk"]["combined_total"],
+        "realized_pnl": combined["desk"]["realized_total"],
+        "unrealized_pnl": combined["desk"]["unrealized_total"],
+        "n_agents": combined["desk"]["n_agents"],
+        "snapshot_at": combined["desk"]["snapshot_at"],
+    }
+    return json.dumps({"by_agent": combined["rows"], "totals": totals})
 
 
 @mcp.tool()
 async def get_my_pnl(agent_name: str) -> str:
     """
-    Combined (realized + unrealized) P&L for your agent — the correct number to report.
+    COMBINED (realized + unrealized) P&L for your agent from the latest
+    `agent_state` snapshot. Use in evening reviews. No IBKR call.
 
-    Unrealized P&L is split using the stored attribution_shares from open fills, so
-    this works correctly at end-of-day after conviction views have expired.
-
-    Always use this instead of get_pnl_summary for your own P&L in evening reviews.
-
-    Returns: {realized_pnl, unrealized_pnl, total_pnl, num_fills, desk_total}
+    Returns: {realized_pnl, unrealized_pnl, total_pnl, n_positions,
+              snapshot_at, desk_total_pnl}
     """
     await _ensure_init_light()
-    from reporting.combined_pnl import get_pnl_combined
+    from reporting.agent_pnl import get_pnl_combined
     combined = await get_pnl_combined(agent_name=agent_name)
     agent_row = next((r for r in combined["rows"] if r["agent_name"] == agent_name), {
         "agent_name": agent_name, "realized_pnl": 0.0,
-        "unrealized_pnl": 0.0, "total_pnl": 0.0, "num_fills": 0,
+        "unrealized_pnl": 0.0, "total_pnl": 0.0,
+        "open_cost": 0.0, "open_market_value": 0.0,
+        "n_positions": 0, "snapshot_at": None,
     })
     return json.dumps({
         "agent_name": agent_name,
         "realized_pnl": agent_row.get("realized_pnl", 0.0),
         "unrealized_pnl": agent_row.get("unrealized_pnl", 0.0),
         "total_pnl": agent_row.get("total_pnl", 0.0),
-        "num_fills": agent_row.get("num_fills", 0),
+        "open_cost": agent_row.get("open_cost", 0.0),
+        "open_market_value": agent_row.get("open_market_value", 0.0),
+        "n_positions": agent_row.get("n_positions", 0),
+        "snapshot_at": agent_row.get("snapshot_at"),
         "desk_total_pnl": combined["desk"]["combined_total"],
-        "note": "unrealized attributed via open fill shares, not live convictions",
+        "note": "lifetime cumulative; deltas via get_agent_pnl_windows",
     })
 
 
@@ -1285,6 +1304,39 @@ async def generate_agent_chart(agent_name: str, date: Optional[str] = None) -> s
     return json.dumps({"chart_path": stdout.decode().strip()})
 
 
+@mcp.tool()
+async def generate_pnl_curve(
+    agent_name: Optional[str] = None,
+    since: str = "7d",
+) -> str:
+    """
+    Render an hour-by-hour P&L curve PNG from `agent_state` snapshots and
+    return its path. Shows realized (line) + total (line) with a shaded
+    band representing unrealized — green when total > realized (gain on
+    open positions), red when total < realized (drawdown on open positions).
+
+    Args:
+        agent_name: Agent name (e.g. "rex", "maya"). Omit / null for the
+                    desk-aggregated curve summed across all agents per hour.
+        since: Window — ISO timestamp ("2026-05-01T00:00:00Z") or duration
+               ("1d", "24h", "7d", "30d", "all"). Default "7d".
+
+    Returns:
+        {"chart_path": "data/charts/pnl_curve_..._YYYYMMDD_HHMMSS.png"}
+        {"error": "..."} on failure.
+    """
+    await _ensure_init_light()
+    from reporting.pnl_curve import render_agent_curve, render_desk_curve
+    try:
+        if agent_name:
+            path = await render_agent_curve(agent_name, since=since)
+        else:
+            path = await render_desk_curve(since=since)
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+    return json.dumps({"chart_path": str(path)})
+
+
 # ── Custom indicator dispatch ─────────────────────────────────────────────────
 
 @mcp.tool()
@@ -1582,8 +1634,8 @@ async def rebalance_desk(
 
     Reads every agent's active conviction views, computes signed target weights,
     diffs against current positions, and (in live mode) places delta orders.
-    Writes one allocation_decision row per run; in live mode also writes
-    agent_pnl_attribution rows for each contributing agent per fill.
+    Writes one allocation_decision row per run; in live mode the IBKR daemon's
+    fill callback writes agent_ledger LEND/RETURN events as fills land.
 
     Args:
         caller: Must be 'mike'.
@@ -1641,9 +1693,11 @@ async def rebalance_desk(
     tw.weights = netted_weights
     tw.contributors = netted_contributors
 
-    # NAV + current positions
+    # NAV + current positions. Mike is the ONLY path allowed to query IBKR
+    # for live cash/nav; everyone else reads the kanban / nav_log mirror.
     summary = await get_account_summary()
     nav = float(summary.get("nav") or 0.0)
+    cash_balance = float(summary.get("cash") or 0.0)
     positions_resp = await store.get_open_positions() if hasattr(store, "get_open_positions") else None
     # Fall back to ibkr live positions if store helper not present.
     # NOTE: ibkr.account.get_positions returns {symbol, quantity, avg_cost} —
@@ -1817,6 +1871,28 @@ async def rebalance_desk(
         notes=f"{'dry_run' if dry_run else 'live'}; cash_weight={cash_weight:.4f}",
     )
 
+    # Anchor cash + nav + positions for the deterministic kanban refresh.
+    # Best-effort: a failure here doesn't block the rebalance, but the next
+    # hourly refresh will fall back to fills-only / cash=0 until mike runs
+    # again successfully. The positions anchor is what avoids fills-vs-IBKR
+    # drift (e.g. XLF showing 90 from fills while IBKR has 105 — see DESK_POLICY §7).
+    try:
+        await store.record_nav_log(
+            desk_nav=nav, cash_balance=cash_balance,
+            decision_id=decision_id, source="mike",
+        )
+        anchor_positions = {
+            (p.get("symbol") or "").upper(): float(p.get("quantity", 0) or 0)
+            for p in (pos_rows or [])
+            if (p.get("symbol") and float(p.get("quantity", 0) or 0) != 0)
+        }
+        await store.record_positions_anchor(
+            positions=anchor_positions,
+            decision_id=decision_id, source="mike",
+        )
+    except Exception as exc:
+        log.warning("anchor writes failed (nav_log/positions_anchor): %s", exc)
+
     proposed_dump = [
         {"symbol": o.symbol, "side": o.side, "qty": o.qty,
          "delta_value": o.delta_value, "rationale": o.rationale}
@@ -1834,18 +1910,6 @@ async def rebalance_desk(
     ]
 
     if dry_run:
-        try:
-            from meta_agent.holdings_snapshot import snapshot_after_decision
-            kanban = await snapshot_after_decision(
-                decision_id=decision_id, nav=nav,
-                target_weights=tw.weights,
-                contributing_views=contributing_views_json,
-                cash_weight=cash_weight,
-                cash_contributors=cash_contributors_json,
-            )
-        except Exception as exc:
-            log.warning("holding_kanban snapshot failed (dry_run): %s", exc)
-            kanban = {"error": f"{type(exc).__name__}: {exc}"}
         return json.dumps({
             "dry_run": True, "decision_id": decision_id,
             "nav": nav, "target_weights": tw.weights,
@@ -1858,14 +1922,16 @@ async def rebalance_desk(
             "min_qty_dropped": min_qty_dropped,
             "pending_user_review": pending_user_review,
             "netted_pairs": netted_pairs_dump,
-            "holding_kanban": kanban,
         })
 
-    # Live mode: place orders, then record attribution. Route through the
-    # existing risk-checked place_order MCP tool function rather than the
-    # bare ibkr.orders layer — that way every allocator order also picks up
-    # kill_switch + market_hours + order_size + position_size checks plus
-    # the Telegram approval gate for orders ≥ approval.threshold_usd.
+    # Live mode: place orders. The IBKR daemon's _on_fill callback writes
+    # per-agent ledger events (LEND for BUYs, RETURN for SELLs) when fills
+    # land — see meta_agent/ledger_writer.py. Mike's allocator does NOT
+    # write attribution rows synchronously here; that would race the fills.
+    # Route orders through the risk-checked place_order MCP tool so every
+    # allocator order picks up kill_switch + market_hours + order_size +
+    # position_size checks plus the Telegram approval gate for orders
+    # ≥ approval.threshold_usd.
     placed: list[dict] = []
     for o in proposed:
         try:
@@ -1882,47 +1948,20 @@ async def rebalance_desk(
             except (TypeError, ValueError):
                 res = {"raw": str(res_json)}
             placed.append({"symbol": o.symbol, "side": o.side, "qty": o.qty, "result": res})
-
-            # Record attribution slices
-            from meta_agent.allocator import split_attribution
-            contribs = tw.contributors.get(o.symbol, [])
-            # If this symbol was an inverse ETF for a bearish view on a different
-            # symbol, the contributors list lives under the original symbol —
-            # find which target symbol resolved to o.symbol.
-            if not contribs:
-                for orig_sym, w in tw.weights.items():
-                    if w < 0:
-                        v, _ = resolve_bearish_vehicle(orig_sym, sector_map)
-                        if v.upper() == o.symbol.upper():
-                            contribs = tw.contributors.get(orig_sym, [])
-                            break
-
-            shares = split_attribution(contribs, o.side)
-            for agent_name, share in shares:
-                await store.record_pnl_attribution(
-                    decision_id=decision_id, agent_name=agent_name,
-                    symbol=o.symbol, attribution_share=share,
-                )
         except Exception as e:
             placed.append({"symbol": o.symbol, "error": f"{type(e).__name__}: {e}"})
 
     await store.update_allocation_orders(decision_id, placed)
 
-    # Holding Kanban snapshot — persistent per-agent×symbol row capturing
-    # who owns what right after Mike acts. Best-effort: failures are logged
-    # but don't fail the rebalance.
+    # Refresh agent_state hourly snapshot so the post-rebalance read paths
+    # see the new positions immediately. Best-effort: hourly cron will catch
+    # up on the next tick if this fails.
     try:
-        from meta_agent.holdings_snapshot import snapshot_after_decision
-        kanban = await snapshot_after_decision(
-            decision_id=decision_id, nav=nav,
-            target_weights=tw.weights,
-            contributing_views=contributing_views_json,
-            cash_weight=cash_weight,
-            cash_contributors=cash_contributors_json,
-        )
+        from scripts.refresh_agent_state import refresh as refresh_agent_state
+        agent_state_summary = await refresh_agent_state()
     except Exception as exc:
-        log.warning("holding_kanban snapshot failed (live): %s", exc)
-        kanban = {"error": f"{type(exc).__name__}: {exc}"}
+        log.warning("agent_state refresh failed: %s", exc)
+        agent_state_summary = {"error": f"{type(exc).__name__}: {exc}"}
 
     return json.dumps({
         "dry_run": False, "decision_id": decision_id,
@@ -1936,36 +1975,53 @@ async def rebalance_desk(
         "min_qty_dropped": min_qty_dropped,
         "pending_user_review": pending_user_review,
         "netted_pairs": netted_pairs_dump,
-        "holding_kanban": kanban,
+        "agent_state": agent_state_summary,
     }, default=str)
 
 
 @mcp.tool()
-async def get_agent_pnl_attribution(
+async def get_agent_ledger(
     agent_name: str,
     since: Optional[str] = None,
+    limit: int = 200,
 ) -> str:
     """
-    Attributed P&L slice for one agent. Each fill Mike places is divided across
-    contributing agents proportionally to their share of the conviction stack.
+    Per-agent ledger event log (LEND / RETURN / DIVIDEND), newest-first.
+    Each row is one accounting event in the agent's book — see DESK_POLICY §0.
+
+    Use this to audit how a specific position got built up (which decisions
+    drove which lent qty), or to see exactly what realized P&L came from
+    which closing fill. For aggregate P&L numbers, use `get_my_pnl` /
+    `get_pnl_summary`; for per-symbol current holdings, use `get_my_standing`.
 
     Args:
-        agent_name: Whose attribution to read.
-        since: ISO date or timestamp; if omitted returns recent ~200 rows.
+        agent_name: Whose ledger to read.
+        since: ISO timestamp; if omitted returns the most recent `limit` rows.
+        limit: max rows when `since` is omitted (default 200).
     """
     await _ensure_init_light()
     from db import store
-    rows = await store.get_agent_pnl_attribution(agent_name, since=since)
-    return json.dumps({"attribution": rows}, default=str)
+    rows = await store.get_agent_ledger_events(agent_name, since=since, limit=limit)
+
+    realized_sum = sum(
+        float(r.get("realized_pnl") or 0.0)
+        for r in rows
+        if r.get("event") in ("RETURN", "DIVIDEND") and r.get("realized_pnl") is not None
+    )
+    return json.dumps({
+        "events": rows,
+        "summary": {
+            "n_events": len(rows),
+            "realized_pnl_in_window": realized_sum,
+        },
+    }, default=str)
 
 
 @mcp.tool()
 async def get_my_standing(agent_name: str, lookback_hours: int = 24) -> str:
     """
-    Holding Kanban: this agent's per-symbol holdings, conviction, and equity
-    over the last N hours, one row per (symbol, snapshot tick). Use this in
-    your evening review to see your trajectory — which symbols you held,
-    how attribution shifted, and how your agent_equity moved tick-by-tick.
+    This agent's per-symbol holdings + cumulative P&L over the last N hours
+    of `agent_state` snapshots. Use in evening reviews to see your trajectory.
 
     Args:
         agent_name: whose standing to read.
@@ -1974,80 +2030,47 @@ async def get_my_standing(agent_name: str, lookback_hours: int = 24) -> str:
     Returns:
         {
           "snapshots": [<row>, ...],          # newest first
-          "latest": {                         # convenience: agent's most recent tick
-            "snapshot_at": ..., "agent_equity": float, "holdings":
-              [{symbol, holding_qty, market_value, conviction, direction}, ...]
+          "latest": {                         # most recent snapshot for this agent
+            "snapshot_at": ..., "total_pnl": float, "realized_pnl": float,
+            "unrealized_pnl": float,
+            "positions": [{sym, qty, avg_cost, mark, market_value, unrealized}, ...]
           },
         }
     """
     await _ensure_init_light()
     from db import store
-    rows = await store.get_agent_holdings_snapshots(agent_name, lookback_hours=lookback_hours)
+    rows = await store.get_agent_state_history(agent_name, lookback_hours=lookback_hours)
     latest = None
     if rows:
-        most_recent_ts = rows[0]["snapshot_at"]
-        latest_rows = [r for r in rows if r["snapshot_at"] == most_recent_ts]
+        r0 = rows[0]
         latest = {
-            "snapshot_at": most_recent_ts,
-            "agent_equity": float(latest_rows[0].get("agent_equity") or 0.0) if latest_rows else 0.0,
-            "desk_nav": float(latest_rows[0].get("desk_nav") or 0.0) if latest_rows else 0.0,
-            "holdings": [
-                {
-                    "symbol": r["symbol"],
-                    "holding_qty": float(r["holding_qty"] or 0),
-                    "market_value": float(r["market_value"] or 0),
-                    "conviction": float(r["conviction"]) if r.get("conviction") is not None else None,
-                    "direction": r.get("direction"),
-                    "attribution_share": float(r["attribution_share"]) if r.get("attribution_share") is not None else None,
-                }
-                for r in latest_rows
-            ],
+            "snapshot_at": r0["snapshot_at"],
+            "realized_pnl": float(r0["realized_pnl"]),
+            "unrealized_pnl": float(r0["unrealized_pnl"]),
+            "total_pnl": float(r0["total_pnl"]),
+            "open_cost": float(r0["open_cost"]),
+            "open_market_value": float(r0["open_market_value"]),
+            "n_positions": int(r0["n_positions"]),
+            "positions": r0["positions_json"],
         }
     return json.dumps({"snapshots": rows, "latest": latest}, default=str)
 
 
 @mcp.tool()
-async def get_kanban_snapshot(at: Optional[str] = None) -> str:
+async def get_desk_snapshot() -> str:
     """
-    Cross-section of the Holding Kanban: every (agent, symbol) row at the
-    snapshot tick nearest to (and ≤) `at` (default: most recent tick).
-    Use for desk-wide visualisation — who holds what at a given moment.
-
-    Args:
-        at: ISO timestamp; omitted returns the latest tick.
+    Cross-section: latest agent_state row per agent. Use for desk-wide
+    visualisation — who holds what (with cumulative P&L) at the most recent
+    hourly snapshot. For per-agent trajectory across hours, use
+    `get_my_standing` with `lookback_hours=N`.
     """
     await _ensure_init_light()
     from db import store
-    rows = await store.get_kanban_at(at=at)
-    snapshot_at = rows[0]["snapshot_at"] if rows else None
-    return json.dumps({"snapshot_at": snapshot_at, "rows": rows}, default=str)
-
-
-@mcp.tool()
-async def generate_kanban_chart(date: Optional[str] = None) -> str:
-    """
-    Render a stacked-bar visualization of the latest holding_kanban tick
-    (or the most recent tick on `date`). Each bar = symbol; segments
-    coloured by agent; height = market_value. Saves PNG under data/charts/
-    and returns its path.
-
-    Args:
-        date: YYYY-MM-DD; omitted = today.
-    """
-    await _ensure_init_light()
-    import asyncio as _asyncio
-    from datetime import date as _date
-    d = date or _date.today().isoformat()
-    proc = await _asyncio.create_subprocess_exec(
-        sys.executable, "-m", "reporting.kanban_chart",
-        "--date", d,
-        stdout=_asyncio.subprocess.PIPE,
-        stderr=_asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        return json.dumps({"error": (stderr or b"").decode().strip()})
-    return json.dumps({"chart_path": (stdout or b"").decode().strip()})
+    rows = await store.get_latest_agent_state()
+    return json.dumps({
+        "n_agents": len(rows),
+        "rows": rows,
+    }, default=str)
 
 
 @mcp.tool()
@@ -2388,7 +2411,7 @@ async def get_trading_briefing() -> str:
     # MCP wrapper) because we use it for read-only display, not allocation.
     # combined_pnl pulls IBKR account + positions + attribution + active
     # convictions; it's the single source of truth for "right-now" desk P&L.
-    from reporting.combined_pnl import get_pnl_combined as _get_combined
+    from reporting.agent_pnl import get_pnl_combined as _get_combined
     acct, positions, combined, conv_view = await asyncio.gather(
         get_account_summary(),
         _get_positions(),
@@ -2401,7 +2424,7 @@ async def get_trading_briefing() -> str:
     total_pnl = float(desk["combined_total"])
     realized_total = float(desk["realized_total"])
     unrealized_total = float(desk["unrealized_total"])
-    commission_gap = float(desk["commission_gap"])
+    commission_gap = 0.0  # ledger model has no commission_gap concept
     nav = float(acct.get("nav") or 0.0)
     pnl_pct = (total_pnl / nav * 100) if nav else 0.0
 
@@ -2555,7 +2578,7 @@ async def get_position_dossier(symbol: str) -> str:
     if not ok:
         return json.dumps({"error": reason})
     import db.store as store
-    from reporting.combined_pnl import get_symbol_unrealized
+    from reporting.agent_pnl import get_symbol_unrealized
     sym = symbol.upper()
     convictions, fills, pnl, unrealized = await asyncio.gather(
         store.get_convictions_for_symbol(sym),
@@ -2600,7 +2623,7 @@ async def get_agent_overview(agent_id: str) -> str:
     """
     await _ensure_init_light()
     import db.store as store
-    from reporting.combined_pnl import get_pnl_combined
+    from reporting.agent_pnl import get_pnl_combined
     (convictions, open_theses, resolutions, combined_today, pnl_week,
      allocations, digest, stories) = await asyncio.gather(
         store.get_agent_active_convictions(agent_id),
@@ -2668,14 +2691,12 @@ async def get_pnl_attribution(window: str = "today") -> str:
     commission_gap = 0.0
     orphan_unrealized = 0.0
     if window == "today":
-        from reporting.combined_pnl import get_pnl_combined
+        from reporting.agent_pnl import get_pnl_combined
         combined = await get_pnl_combined()
         by_agent = combined["rows"]
         desk_realized = combined["desk"]["realized_total"]
         desk_unrealized = combined["desk"]["unrealized_total"]
         desk_combined = combined["desk"]["combined_total"]
-        commission_gap = combined["desk"]["commission_gap"]
-        orphan_unrealized = combined["desk"]["orphan_unrealized"]
 
     if not by_symbol and not by_agent:
         note = f"No P&L recorded for {window}."
@@ -2857,7 +2878,7 @@ async def get_position_history(symbol: str, lookback_days: int = 30) -> str:
     if not ok:
         return json.dumps({"error": reason})
     import db.store as store
-    from reporting.combined_pnl import get_symbol_unrealized
+    from reporting.agent_pnl import get_symbol_unrealized
     sym = symbol.upper()
     lookback_days = min(max(1, lookback_days), 90)
     fills, pnl_by_agent, conv_arc, current, unrealized = await asyncio.gather(

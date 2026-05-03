@@ -90,11 +90,18 @@ async def _chat_id() -> str:
     return discovered
 
 
-async def send_message(text: str, parse_mode: Optional[str] = "Markdown") -> Optional[dict]:
+async def send_message(
+    text: str,
+    parse_mode: Optional[str] = "Markdown",
+    reply_markup: Optional[dict] = None,
+) -> Optional[dict]:
     """Send a message to the configured (or auto-detected) Telegram chat.
 
     parse_mode=None means plain text. Omit the field entirely in that case —
     Telegram returns 400 "unsupported parse_mode" for a literal null.
+
+    reply_markup, if given, is the Telegram inline-keyboard / reply-keyboard
+    markup dict (e.g. {"inline_keyboard": [[{"text": "✅", "callback_data": "approve_xxx"}]]}).
     """
     url = _BASE.format(token=_token()) + "/sendMessage"
     async with httpx.AsyncClient(timeout=15) as client:
@@ -103,6 +110,8 @@ async def send_message(text: str, parse_mode: Optional[str] = "Markdown") -> Opt
             payload: dict = {"chat_id": chat_id, "text": text}
             if parse_mode is not None:
                 payload["parse_mode"] = parse_mode
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
             r = await client.post(url, json=payload)
             if r.status_code == 400 and parse_mode == "Markdown":
                 # Most common cause: stray markdown specials in `text` (backticks,

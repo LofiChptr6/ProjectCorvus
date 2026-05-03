@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Verify IBKR Gateway is reachable. Run this before anything else."""
+"""Verify the ibkr-daemon (and through it, IB Gateway) is reachable.
+
+The daemon at 127.0.0.1:7790 owns the live IBKR connection. This preflight
+script asks `/healthz` (unauthenticated) and `/balances` (authenticated) so
+both transport and credentials are validated.
+"""
 
 import asyncio
 import sys
@@ -8,40 +13,40 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from dotenv import load_dotenv
-import yaml
 
 load_dotenv()
 
 
 async def main():
-    config_path = Path("config.yaml")
-    if not config_path.exists():
-        print("ERROR: config.yaml not found. Copy config.example.yaml → config.yaml")
+    from ibkr import _rpc
+    from ibkr.account import get_account_summary
+
+    print("[1/2] Pinging ibkr-daemon /healthz...")
+    try:
+        health = await _rpc.get("/healthz")
+    except Exception as e:
+        print(f"  ✗ daemon unreachable: {e}")
+        print("  → systemctl --user status ibkr-daemon")
         sys.exit(1)
 
-    with open(config_path) as f:
-        cfg = yaml.safe_load(f)
+    if not health.get("connected"):
+        print(f"  ✗ daemon up but IBKR disconnected (mode={health.get('mode')})")
+        print("  → check IB Gateway is running on configured host:port")
+        sys.exit(1)
+    print(f"  ✓ daemon up — mode={health['mode']}, uptime={health['uptime_s']}s, "
+          f"clientId={health['client_id']}")
 
-    print(f"Config loaded. Trading mode: {cfg.get('trading', {}).get('mode', '?')}")
-
-    print("\n[1/2] Connecting to IBKR Gateway...")
+    print("\n[2/2] Fetching account summary via daemon...")
     try:
-        from ibkr.client import configure, get_ib
-        configure(cfg)
-        ib = await get_ib()
-        print("  ✓ Connected to IBKR")
-
-        print("\n[2/2] Fetching account summary...")
-        from ibkr.account import get_account_summary
         summary = await get_account_summary()
         print(f"  ✓ NAV: ${summary.get('nav', 0):,.2f}")
         print(f"  ✓ Cash: ${summary.get('cash', 0):,.2f}")
         print(f"  ✓ Mode: {summary.get('mode', '?')}")
-
     except Exception as e:
-        print(f"  ✗ IBKR connection failed: {e}")
-        print("  → Is IB Gateway running? Is API enabled in IB Gateway settings?")
+        print(f"  ✗ account summary failed: {e}")
         sys.exit(1)
+    finally:
+        await _rpc.close()
 
     print("\n✅ All systems OK. Ready to trade.")
 

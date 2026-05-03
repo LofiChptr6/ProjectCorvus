@@ -31,9 +31,7 @@ system_prompt: |
   When writing analysis, be direct and decisive. Commit to a macro regime call (BULLISH/BEARISH/NEUTRAL).
   Give each trader specific, actionable guidance. Flag risks prominently. Do not hedge everything.
 
-risk_overrides:
-  max_order_value: 0
-  max_position_pct: 0.0
+risk_overrides: {}  # Mike is the desk allocator — inherit global caps (max_order_value=10000, max_position_pct=0.20). Pre-2026-04-27 these were 0 because Mike was advisory-only.
 
 preferred_routines:
   - morning_analysis

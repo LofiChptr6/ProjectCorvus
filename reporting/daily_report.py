@@ -20,8 +20,8 @@ async def generate(trade_date: Optional[str] = None, output_dir: str = "data/rep
 
     # All fills for the day
     all_fills = await store.get_fills(date=trade_date, limit=500)
-    # Combined (realized + unrealized) per agent + desk-level reconciliation.
-    from reporting.combined_pnl import get_pnl_combined
+    # Combined (realized + unrealized) per agent — reads latest agent_state snapshot.
+    from reporting.agent_pnl import get_pnl_combined
     combined = await get_pnl_combined()
     pnl_rows = combined["rows"]
     desk = combined["desk"]
@@ -30,8 +30,10 @@ async def generate(trade_date: Optional[str] = None, output_dir: str = "data/rep
     total_pnl = float(desk["combined_total"])
     realized_total = float(desk["realized_total"])
     unrealized_total = float(desk["unrealized_total"])
-    commission_gap = float(desk["commission_gap"])
-    orphan_unreal = float(desk["orphan_unrealized"])
+    # ledger model has no commission_gap or orphan_unreal; left here as 0 for
+    # backwards-compat in the report layout.
+    commission_gap = 0.0
+    orphan_unreal = 0.0
     total_fills = len(all_fills)
 
     starting_nav = await _starting_nav(trade_date)

@@ -53,14 +53,13 @@ def status(
 
     async def _show():
         from db.schema import init_db
-        from ibkr.client import configure, get_ib
+        from ibkr.client import configure
         from ibkr.account import get_positions, get_open_orders
         import db.store as store
         from cli.display import console, positions_table, orders_table, pnl_table
 
         await init_db()
         configure(cfg)
-        await get_ib()
 
         positions = await get_positions()
         orders = await get_open_orders()

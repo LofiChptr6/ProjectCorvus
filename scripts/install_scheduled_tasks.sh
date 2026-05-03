@@ -13,9 +13,20 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LAUNCHER="$REPO_ROOT/scripts/run_scheduled_skill.sh"
-chmod +x "$LAUNCHER"
+AGENT_STATE_REFRESH="$REPO_ROOT/scripts/refresh_agent_state.sh"
+EOD_CHARTS="$REPO_ROOT/scripts/send_eod_charts.sh"
+chmod +x "$LAUNCHER" "$AGENT_STATE_REFRESH" "$EOD_CHARTS"
 
 TAG="#CLAUDE_TRADING"
+
+# Hourly per-agent state refresh — deterministic, runs every hour every day
+# regardless of trading hours. Bypasses the LLM launcher entirely.
+AGENT_STATE_CRON="5 * * * *"
+
+# End-of-day Telegram broadcast: 7-day P&L curves for every sector agent +
+# desk aggregate. 14:30 MST is post-close in both DST regimes (16:30 EST,
+# 17:30 EDT). Mon-Fri only.
+EOD_CHARTS_CRON="30 14 * * 1-5"
 
 # (cron_expr, skill_name) — local time, Mon-Fri unless noted
 ENTRIES=(
@@ -57,6 +68,11 @@ for entry in "${ENTRIES[@]}"; do
     NEW+=$'\n'"$cron $LAUNCHER $skill >/dev/null 2>&1 $TAG"
 done
 
+# Direct (non-LLM) entries — invoke their target script straight, not via the
+# Claude Code launcher.
+NEW+=$'\n'"$AGENT_STATE_CRON $AGENT_STATE_REFRESH >/dev/null 2>&1 $TAG"
+NEW+=$'\n'"$EOD_CHARTS_CRON $EOD_CHARTS >/dev/null 2>&1 $TAG"
+
 echo "$NEW" | crontab -
-echo "Installed ${#ENTRIES[@]} cron entries (tagged $TAG)."
+echo "Installed $((${#ENTRIES[@]} + 2)) cron entries (tagged $TAG)."
 crontab -l | grep "$TAG"
