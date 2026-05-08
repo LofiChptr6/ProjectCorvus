@@ -118,13 +118,28 @@ SCHEMA_STATEMENTS = [
         deactivated_at TEXT
     )""",
     """CREATE TABLE IF NOT EXISTS news_items (
-        id         BIGSERIAL PRIMARY KEY,
-        fetched_at TEXT NOT NULL,
-        symbol     TEXT,
-        headline   TEXT NOT NULL,
-        article_id TEXT,
-        provider   TEXT
+        id           BIGSERIAL PRIMARY KEY,
+        fetched_at   TEXT NOT NULL,
+        symbol       TEXT,
+        headline     TEXT NOT NULL,
+        article_id   TEXT,
+        provider     TEXT,
+        url          TEXT,
+        body         TEXT,
+        sentiment    TEXT,
+        channels     TEXT[],
+        published_at TIMESTAMPTZ
     )""",
+    # Benzinga add-on (May 2026): surface extra metadata. Forward-only ALTERs;
+    # existing rows get NULLs in the new columns. Idempotent — IF NOT EXISTS.
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS url TEXT",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS body TEXT",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS sentiment TEXT",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS channels TEXT[]",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ",
+    # Dedup on Massive's article_id so the news ingestor can ON CONFLICT DO NOTHING.
+    "CREATE UNIQUE INDEX IF NOT EXISTS news_items_article_id_uniq ON news_items (article_id) WHERE article_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS news_items_symbol_published_idx ON news_items (symbol, published_at DESC NULLS LAST)",
     # Per-agent thesis/memory journal (append-only). Status updates on existing
     # rows; new ideas append new rows. parent_id chains supersedes/refinements.
     """CREATE TABLE IF NOT EXISTS agent_thesis (

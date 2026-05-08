@@ -6,8 +6,22 @@ allocator + concierge running as a systemd service, all in **America/Phoenix**
 local time (the desk's reference TZ).
 
 If you ever need to redo this, the canonical scripts are everything under
-`scripts/*.sh`. The `.bat` / `.ps1` files in that folder are leftover Windows
-artefacts kept for reference; ignore them on Linux.
+`scripts/*.sh`.
+
+> **Branch note (`local-llm`):** This branch replaces all Anthropic API calls
+> with a local Qwen3-32B-FP8 served by vLLM. vLLM 0.20+ natively exposes the
+> Anthropic `/v1/messages` endpoint and aliases `claude-*` model names to
+> the local Qwen, so the `claude` CLI just needs `ANTHROPIC_BASE_URL` pointed
+> at `http://localhost:8000` — no proxy layer. You'll need:
+>
+> - A CUDA GPU with **≥ 40 GB VRAM** (Blackwell/Ada/Hopper). The reference
+>   machine is an RTX PRO 6000 Blackwell (96 GB).
+> - **Python 3.12** for the vLLM venv (separate from the repo's 3.14 venv).
+> - **~40 GB free disk** for the model weights (cached under `~/.cache/huggingface`).
+> - No `ANTHROPIC_API_KEY` (concierge no longer reads it).
+>
+> Section 7 below covers the local-LLM bootstrap. Run it before installing
+> scheduled jobs (Section 5) — the launcher needs the proxy live to work.
 
 ---
 
@@ -75,9 +89,11 @@ asyncio.run((async lambda: (await init_db(), await close_pool()))())"
 Create `~/trading/.env` (keep it out of git):
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
 TELEGRAM_BOT_TOKEN=...
 TELEGRAM_CHAT_ID=...           # optional; pins concierge to one chat
+MASSIVE_API_KEY=...            # market data + Benzinga news
+LOCAL_LLM_BASE_URL=http://localhost:8000/v1
+LOCAL_MODEL=Qwen/Qwen3-32B-FP8
 PG_HOST=localhost
 PG_PORT=5432
 PG_DATABASE=trading
@@ -157,6 +173,73 @@ journalctl --user -u trading-concierge -f
 
 To stop: `systemctl --user stop trading-concierge`. The lock at
 `data/concierge.lock` is reaped automatically on graceful shutdown.
+
+---
+
+## 7. Local LLM (vLLM + LiteLLM proxy) — `local-llm` branch only
+
+This replaces every Claude API call with a local Qwen3-32B-FP8 server. Skip
+this section on `main` (which still uses the Anthropic API).
+
+### 7.1 Bootstrap the vLLM venv
+
+```bash
+cd ~/trading
+sudo dnf install python3.12-devel    # required for vLLM's Triton FP8 JIT
+python3.12 -m venv .venv-vllm
+.venv-vllm/bin/pip install --upgrade pip wheel
+.venv-vllm/bin/pip install vllm openai
+```
+
+vLLM's wheel is built for CUDA 12.x; recent NVIDIA drivers (550+) are
+forward-compatible. Verify with `.venv-vllm/bin/vllm --version`.
+
+### 7.2 Pre-pull the model weights
+
+```bash
+.venv-vllm/bin/hf download Qwen/Qwen3-32B-FP8 --max-workers 6
+```
+
+~34 GB. Cached at `~/.cache/huggingface/hub/`. Doing this before the first
+`systemctl start trading-vllm` keeps the unit's `TimeoutStartSec=600s`
+budget honest.
+
+### 7.3 Install the systemd units
+
+```bash
+scripts/install_schedules.sh
+```
+
+This now installs **one long-running service** in addition to the timers:
+
+- `trading-vllm.service` — vLLM serving Qwen3-32B-FP8 on `127.0.0.1:8000`. Exposes
+  both OpenAI `/v1/chat/completions` (concierge) and Anthropic `/v1/messages`
+  (`claude` CLI), plus aliases `claude-opus-4-7` etc. to the local backend.
+
+Plus a new timer:
+
+- `trading-news-ingest.timer` — every 15 min during RTH, pulls Massive
+  (Benzinga add-on) news for every watchlist ticker into `news_items`.
+
+### 7.4 Smoke test
+
+```bash
+# vLLM is up; lists Qwen + claude-* aliases
+curl -s http://127.0.0.1:8000/v1/models | jq
+
+# Anthropic-shape /v1/messages with a claude-named model
+curl -s http://127.0.0.1:8000/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-opus-4-7","max_tokens":64,"messages":[{"role":"user","content":"Say OK"}]}' | jq
+
+# Skill smoke test (no orders, [DEV] prefix on Telegram)
+bash scripts/run_scheduled_skill.sh atlas-review --dev
+```
+
+### 7.5 Rollback
+
+`git checkout main` and restart the timers. The `.venv-vllm/` and weight
+cache survive the checkout, so flipping back to local-llm is fast.
 
 ---
 

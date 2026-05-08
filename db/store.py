@@ -364,29 +364,59 @@ async def write_news(
     headline: str,
     article_id: Optional[str],
     provider: Optional[str],
+    *,
+    url: Optional[str] = None,
+    body: Optional[str] = None,
+    sentiment: Optional[str] = None,
+    channels: Optional[list[str]] = None,
+    published_at: Optional[str] = None,
     db_path: str = DB_PATH,
 ) -> None:
+    """Insert a news item; ON CONFLICT (article_id) DO NOTHING so reruns are safe."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "INSERT INTO news_items (fetched_at, symbol, headline, article_id, provider) VALUES ($1,$2,$3,$4,$5)",
+            """
+            INSERT INTO news_items
+                (fetched_at, symbol, headline, article_id, provider,
+                 url, body, sentiment, channels, published_at)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+            ON CONFLICT (article_id) WHERE article_id IS NOT NULL DO NOTHING
+            """,
             _now(), symbol, headline, article_id, provider,
+            url, body, sentiment, channels or None,
+            published_at,
         )
 
 
 async def get_recent_news(
     symbol: Optional[str] = None, limit: int = 10, db_path: str = DB_PATH
 ) -> list[dict]:
+    """Return news items newest-first. Sort by published_at when present, fetched_at otherwise."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         if symbol:
             rows = await conn.fetch(
-                "SELECT * FROM news_items WHERE symbol=$1 ORDER BY fetched_at DESC LIMIT $2",
+                """
+                SELECT id, fetched_at, symbol, headline, article_id, provider,
+                       url, body, sentiment, channels, published_at
+                FROM news_items
+                WHERE symbol=$1
+                ORDER BY COALESCE(published_at::text, fetched_at) DESC
+                LIMIT $2
+                """,
                 symbol, limit,
             )
         else:
             rows = await conn.fetch(
-                "SELECT * FROM news_items ORDER BY fetched_at DESC LIMIT $1", limit,
+                """
+                SELECT id, fetched_at, symbol, headline, article_id, provider,
+                       url, body, sentiment, channels, published_at
+                FROM news_items
+                ORDER BY COALESCE(published_at::text, fetched_at) DESC
+                LIMIT $1
+                """,
+                limit,
             )
         return [dict(r) for r in rows]
 

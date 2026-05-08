@@ -68,19 +68,6 @@ def release_lock() -> None:
 def _pid_alive(pid: int) -> bool:
     if pid <= 0:
         return False
-    if sys.platform == "win32":
-        # Windows: query tasklist
-        import subprocess
-        try:
-            out = subprocess.check_output(
-                ["tasklist", "/FI", f"PID eq {pid}"],
-                stderr=subprocess.DEVNULL,
-                timeout=5,
-            )
-            return str(pid).encode() in out
-        except Exception:
-            return False
-    # Unix: signal 0 check
     try:
         os.kill(pid, 0)
         return True
@@ -184,9 +171,13 @@ async def _run() -> None:
         log.warning("Concierge disabled in config.yaml; exiting.")
         return
 
-    if not os.environ.get("ANTHROPIC_API_KEY", "").strip():
-        log.error("ANTHROPIC_API_KEY not set — exiting.")
-        await send_message("⚠️ Concierge cannot start: ANTHROPIC_API_KEY is missing in .env.", parse_mode=None)
+    base_url = os.environ.get("LOCAL_LLM_BASE_URL", "").strip() or "http://localhost:8000/v1"
+    if not base_url:
+        log.error("LOCAL_LLM_BASE_URL not set — exiting.")
+        await send_message(
+            "⚠️ Concierge cannot start: LOCAL_LLM_BASE_URL is missing in .env.",
+            parse_mode=None,
+        )
         return
     if not os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
         log.error("TELEGRAM_BOT_TOKEN not set — exiting.")
@@ -198,12 +189,8 @@ async def _run() -> None:
         log.info("Shutdown signal received")
         stop_event.set()
 
-    try:
-        signal.signal(signal.SIGINT, _signal_handler)
-        signal.signal(signal.SIGTERM, _signal_handler)
-    except Exception:
-        # Windows may not support SIGTERM; SIGINT still works.
-        pass
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
     await send_message("🤖 Concierge online. Ask me anything, or /help for commands.", parse_mode=None)
 

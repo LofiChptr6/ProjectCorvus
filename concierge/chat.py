@@ -1,15 +1,18 @@
-"""Sonnet tool-use loop for the concierge.
+"""Local-LLM tool-use loop for the concierge.
 
-Given a user message (free text), run a bounded tool-use conversation and
-produce a plain-text reply to send back via Telegram.
+Same external surface as the previous Sonnet-backed implementation
+(`async def handle(user_text, cfg) -> str`), but talks to a local vLLM
+endpoint via the OpenAI Python SDK instead of Anthropic.
 
-Caching: the system prompt + tool definitions are marked `cache_control` so
-repeated concierge requests re-use the same prompt prefix. A busy day of
-chat-ops then costs ~10× less than cold prompts.
+History is persisted in OpenAI message shape — `{role, content}` plus
+`tool_calls`/`tool_call_id` blocks. The migration loader at the top of
+`handle()` detects an Anthropic-shape history file and resets it (one-time
+cost on cutover; the file is just a chat-ops Telegram log).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -22,14 +25,9 @@ _SYSTEM_PROMPT = """You are the Concierge for a multi-agent quant trading desk. 
 with you via Telegram. Your job is to answer questions about the desk and, when
 appropriate, help the user raise or resolve proposals.
 
-Desk roster:
-- Rex — momentum breakout trader ($30k)
-- Maya — mean-reversion contrarian ($20k)
-- Atlas — long-side macro (SPY/QQQ/DIA/IWM, $20k)
-- Titan — short-side macro (inverse ETFs, $10k)
-- Vera — earnings catalyst ($20k)
-- Mike — director, writes daily analysis (no trading)
-- Cassidy — overnight risk reviewer (no trading)
+The desk is organised by SECTOR agents (Atlas/Fab/Fabless/Iron/Maya/Rex/Trump/
+Vera/Volt/Energy/Commodity) that publish CONVICTION VIEWS, plus Mike (allocator
+that places real orders based on those views) and Cassidy (overnight risk).
 
 Hard rules:
 1. ALWAYS call tools for live data — never invent numbers. If a tool errors,
@@ -46,8 +44,8 @@ Hard rules:
    Telegram but keep it minimal — bullet lists are great, long paragraphs
    are not. Target ≤ 15 lines unless the user asked for detail.
 5. If the user asks to place a trade, explain that trades are executed by
-   the scheduled agents and offer to file a `propose_strategic_change`
-   capturing their intent so Mike can review at the next run.
+   Mike (the allocator) based on sector convictions, and offer to file a
+   `propose_strategic_change` capturing their intent so Mike sees it next run.
 6. Work efficiently: only call tools you actually need to answer the
    question. If one tool answers everything, stop there.
 
@@ -58,137 +56,141 @@ Formatting conventions:
 """
 
 
-def _build_tools_block(config_allowed: list[str] | None) -> list[dict[str, Any]]:
-    """Return the tool schemas with cache_control on the final entry."""
-    schemas = [dict(t) for t in tools.filter_tools(config_allowed)]
-    if schemas:
-        # Mark only the LAST schema — cache_control on any block in the tools
-        # list caches the entire tools array prefix up to that point.
-        schemas[-1] = {**schemas[-1], "cache_control": {"type": "ephemeral"}}
-    return schemas
+def _to_openai_tools(config_allowed: list[str] | None) -> list[dict[str, Any]]:
+    """Translate Anthropic-shape tool schemas → OpenAI function-tool shape.
 
-
-def _system_blocks() -> list[dict[str, Any]]:
-    return [
-        {
-            "type": "text",
-            "text": _SYSTEM_PROMPT,
-            "cache_control": {"type": "ephemeral"},
-        }
-    ]
-
-
-def _extract_text(content: list[Any]) -> str:
-    parts: list[str] = []
-    for block in content:
-        # Anthropic SDK returns typed blocks — handle TextBlock and dict.
-        if hasattr(block, "type") and block.type == "text":
-            parts.append(block.text)
-        elif isinstance(block, dict) and block.get("type") == "text":
-            parts.append(block.get("text", ""))
-    return "\n".join(p.strip() for p in parts if p.strip()).strip()
-
-
-def _serialize_assistant_content(content: list[Any]) -> list[dict[str, Any]]:
-    """Convert SDK-typed content blocks back into plain dicts for history storage."""
+    Anthropic tool schema:  {name, description, input_schema}
+    OpenAI function schema: {type:"function", function:{name, description, parameters}}
+    """
     out: list[dict[str, Any]] = []
-    for block in content:
-        if hasattr(block, "model_dump"):
-            out.append(block.model_dump(exclude_none=True))
-        elif isinstance(block, dict):
-            out.append(block)
-        else:
-            # Best-effort fallback.
-            out.append({"type": getattr(block, "type", "text"), "text": str(block)})
+    for t in tools.filter_tools(config_allowed):
+        out.append({
+            "type": "function",
+            "function": {
+                "name": t["name"],
+                "description": t.get("description", ""),
+                "parameters": t.get("input_schema", {"type": "object", "properties": {}}),
+            },
+        })
     return out
+
+
+def _looks_anthropic(history: list[dict[str, Any]]) -> bool:
+    """Detect Anthropic-shape persisted history (content blocks with type=tool_use|tool_result)."""
+    for msg in history:
+        c = msg.get("content")
+        if isinstance(c, list):
+            for blk in c:
+                if isinstance(blk, dict) and blk.get("type") in ("tool_use", "tool_result"):
+                    return True
+    return False
 
 
 async def handle(user_text: str, cfg: dict[str, Any]) -> str:
     """Main entry: take the user's free-text message, run tool-use, return reply."""
-    from anthropic import AsyncAnthropic
+    from openai import AsyncOpenAI
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not api_key:
-        return "⚠️ Concierge is not configured — ANTHROPIC_API_KEY missing."
+    base_url = os.environ.get("LOCAL_LLM_BASE_URL", "").strip() or "http://localhost:8000/v1"
+    api_key = os.environ.get("LOCAL_LLM_API_KEY", "local-dummy")
+    model = (
+        os.environ.get("CONCIERGE_MODEL")
+        or cfg.get("model")
+        or os.environ.get("LOCAL_MODEL")
+        or "Qwen/Qwen3-32B-FP8"
+    )
 
-    cap = float(cfg.get("daily_usd_cap", 0) or 0)
-    if cap and state.budget_exceeded(cap):
+    # Token cap (replaces the old USD cap — local inference has no $ cost,
+    # but a runaway tool-loop can still burn GPU time).
+    cap = int(cfg.get("daily_token_cap", 0) or os.environ.get("CONCIERGE_DAILY_TOKEN_CAP", 0) or 0)
+    if cap and state.token_cap_exceeded(cap):
         u = state.load_usage()
-        return f"🛑 Daily budget reached (${u['usd']:.2f} / ${cap:.2f}). Resets at UTC midnight."
+        return (
+            f"🛑 Daily token cap reached ({u['input_tokens'] + u['output_tokens']} / {cap}). "
+            "Resets at UTC midnight."
+        )
 
-    model = os.environ.get("CONCIERGE_MODEL") or cfg.get("model") or "claude-sonnet-4-5-20250929"
     max_iter = int(cfg.get("max_tool_iterations", 5))
     max_turns = int(cfg.get("history_turns", 40))
     allowed_tools = cfg.get("allowed_tools")
 
-    client = AsyncAnthropic(api_key=api_key)
+    client = AsyncOpenAI(base_url=base_url, api_key=api_key)
 
     history = state.load_history()
+    if _looks_anthropic(history):
+        log.warning("Detected Anthropic-shape history on local-LLM cutover — resetting.")
+        history = []
+
     history.append({"role": "user", "content": user_text})
 
-    system_blocks = _system_blocks()
-    tool_schemas = _build_tools_block(allowed_tools)
+    # Prepend the system prompt every call. Local model has no prompt cache, so
+    # the old `cache_control` trick is moot; just pay the prefix cost.
+    messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT}, *history]
+
+    tool_schemas = _to_openai_tools(allowed_tools)
 
     final_text: str = ""
 
     for iteration in range(max_iter + 1):
         try:
-            resp = await client.messages.create(
+            resp = await client.chat.completions.create(
                 model=model,
                 max_tokens=1024,
-                system=system_blocks,
                 tools=tool_schemas if tool_schemas else None,
-                messages=history,
+                tool_choice="auto" if tool_schemas else None,
+                messages=messages,
             )
         except Exception as exc:
-            log.exception("Anthropic call failed")
-            return f"⚠️ Concierge error talking to Claude: {type(exc).__name__}: {exc}"
+            log.exception("Local LLM call failed")
+            return f"⚠️ Concierge error talking to local model: {type(exc).__name__}: {exc}"
 
         if resp.usage is not None:
             state.record_usage(resp.usage)
 
-        # Persist the assistant turn.
-        assistant_blocks = _serialize_assistant_content(resp.content)
-        history.append({"role": "assistant", "content": assistant_blocks})
+        choice = resp.choices[0]
+        msg = choice.message
 
-        if resp.stop_reason != "tool_use":
-            final_text = _extract_text(resp.content)
+        # Persist the assistant turn in OpenAI shape.
+        assistant_dict: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            assistant_dict["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+                }
+                for tc in msg.tool_calls
+            ]
+        history.append(assistant_dict)
+        messages.append(assistant_dict)
+
+        # No tool calls? We're done.
+        if choice.finish_reason != "tool_calls" or not msg.tool_calls:
+            final_text = msg.content or ""
             break
 
-        # Collect tool_use blocks and dispatch each.
-        tool_results: list[dict[str, Any]] = []
-        for block in resp.content:
-            btype = getattr(block, "type", None) or (block.get("type") if isinstance(block, dict) else None)
-            if btype != "tool_use":
-                continue
-            # Anthropic SDK returns Pydantic ToolUseBlock; older code paths used dicts.
-            # Don't fall through `or` on attr lookups — `input` is often an empty {}
-            # (falsy but valid) which would crash on the dict-fallback branch.
-            _is_dict = isinstance(block, dict)
-            tool_name = block.get("name") if _is_dict else getattr(block, "name", None)
-            tool_input = (block.get("input") if _is_dict else getattr(block, "input", None)) or {}
-            tool_use_id = block.get("id") if _is_dict else getattr(block, "id", None)
-            result_text = await tools.dispatch(tool_name, tool_input)
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
+        # Dispatch each tool call and append role=tool messages back into the loop.
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            try:
+                tool_input = json.loads(tc.function.arguments or "{}")
+            except json.JSONDecodeError as e:
+                log.warning("Bad tool-call JSON for %s: %s", name, e)
+                tool_input = {}
+            result_text = await tools.dispatch(name, tool_input)
+            tool_msg = {
+                "role": "tool",
+                "tool_call_id": tc.id,
                 "content": result_text,
-            })
-        # If stop_reason said "tool_use" but the response actually contained no
-        # tool_use blocks (a known edge with text-only stop_reason mismatches),
-        # don't push an empty user message — the next API call would 400 with
-        # "user messages must have non-empty content". Break with whatever text
-        # the assistant did emit.
-        if not tool_results:
-            log.warning("stop_reason=tool_use but no tool_use blocks in response — breaking")
-            final_text = _extract_text(resp.content) or "(no actionable response from model)"
-            break
-        history.append({"role": "user", "content": tool_results})
+            }
+            history.append(tool_msg)
+            messages.append(tool_msg)
 
         if iteration == max_iter:
-            final_text = ("I hit my tool-iteration cap trying to answer that — "
-                          "please narrow the question and I'll try again.")
-            history.append({"role": "assistant", "content": [{"type": "text", "text": final_text}]})
+            final_text = (
+                "I hit my tool-iteration cap trying to answer that — "
+                "please narrow the question and I'll try again."
+            )
+            history.append({"role": "assistant", "content": final_text})
             break
 
     history = state.prune_history(history, max_turns)

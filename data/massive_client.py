@@ -188,7 +188,14 @@ async def get_bars(
 # ── get_news ─────────────────────────────────────────────────────────────────
 
 async def get_news(symbol: Optional[str] = None, max_items: int = 10) -> dict:
-    """Return shape: {symbol, headlines: [{time, symbol, headline, provider, article_id}]}."""
+    """Return shape: {symbol, headlines: [{time, symbol, headline, provider, article_id, ...}]}.
+
+    Core fields (always present) match the original Polygon-shape contract so older
+    callers don't break. With the Benzinga add-on enabled, additional fields are
+    populated when present in the response: `body`, `url`, `sentiment` (-1..1 if
+    Massive scores it, else None), `channels` (list of Benzinga channel slugs).
+    Absent fields are emitted as None / [] so JSON shape stays predictable.
+    """
     if not symbol:
         return {"symbol": symbol, "headlines": []}
     sym = symbol.upper()
@@ -203,12 +210,26 @@ async def get_news(symbol: Optional[str] = None, max_items: int = 10) -> dict:
     headlines = []
     for n in results:
         publisher = n.get("publisher") or {}
+        # Sentiment may live under several keys depending on Massive's flattening
+        # of Benzinga insights. Try the obvious ones; surface None if not present.
+        sentiment = n.get("sentiment")
+        if sentiment is None:
+            insights = n.get("insights") or []
+            if isinstance(insights, list) and insights:
+                # Take the entry whose `ticker` matches our symbol if any.
+                match = next((i for i in insights if (i or {}).get("ticker") == sym), insights[0])
+                sentiment = (match or {}).get("sentiment")
         headlines.append({
             "time": n.get("published_utc", ""),
             "symbol": sym,
             "headline": n.get("title", ""),
             "provider": publisher.get("name", ""),
             "article_id": n.get("id", ""),
+            # Benzinga-enriched fields (None / [] when absent)
+            "url": n.get("article_url") or n.get("url"),
+            "body": n.get("description") or n.get("body"),
+            "sentiment": sentiment,
+            "channels": n.get("keywords") or n.get("channels") or [],
         })
     return {"symbol": sym, "headlines": headlines}
 

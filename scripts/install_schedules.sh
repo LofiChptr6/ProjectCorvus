@@ -1,22 +1,26 @@
 #!/usr/bin/env bash
-# Install the four director-routine systemd USER timers:
-#   trading-hourly-review     (every hour, quiet-window gated inside the command)
+# Install the systemd USER timers that drive the desk:
+#   trading-hourly-review     (every hour — orchestrator fans out 11 sector
+#                              reviews + mike-allocator + heartbeat;
+#                              self-gates on quiet window + weekend)
 #   trading-mike-morning      (weekdays 9:06 ET)
 #   trading-mike-midday       (weekdays 11:00 ET)
 #   trading-cassidy-evening   (weekdays 23:00 Phoenix)
+#   trading-sector-evenings   (weekdays 20:00 Phoenix — orchestrator fans
+#                              out 11 sector-evening attribution reviews)
 #
-# Each timer fires its matching .service, which runs:
+# Each timer fires its matching .service. The director timers (mike-morning,
+# mike-midday, cassidy-evening) run a single Claude Code skill. The orchestrator
+# timers (hourly-review, sector-evenings) run a bash fan-out via xargs that
+# launches multiple skills in parallel.
+#
+# Skill prompts are in .claude/commands/*.md and use the ibkr-trading MCP
+# server (.mcp.json). Each .service ultimately calls:
 #   claude -p "/<command-name>" --dangerously-skip-permissions
-# from the project working directory. The slash commands are defined in
-# .claude/commands/*.md and use the ibkr-trading MCP server (.mcp.json).
+# via scripts/run_scheduled_skill.sh.
 #
 # Idempotent: re-running this script just refreshes the unit files, then
 # re-enables the timers. Safe to run on every deploy / config change.
-#
-# Per-agent routines (morning_scan, monitor_fills, daily_summary,
-# close_positions) are NOT installed by this script — those are Python
-# scripts in agent/routines/ that the YAML files schedule per agent, and
-# need a dispatcher that doesn't exist yet. See INSTALL.md.
 
 set -euo pipefail
 
@@ -24,17 +28,34 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 UNIT_SRC="${REPO_ROOT}/scripts/systemd"
 UNIT_DST="${HOME}/.config/systemd/user"
 
+# Long-running services (no timer pair).
+# trading-vllm exposes BOTH OpenAI /v1/chat/completions (for concierge) AND
+# Anthropic /v1/messages (for the `claude` CLI). No separate proxy needed —
+# vLLM 0.20+ handles both natively + aliases claude-* model names.
+LONG_RUNNING=(
+    trading-vllm
+)
+
+# Timer-driven units (each has a .service + matching .timer).
 UNITS=(
     trading-hourly-review
     trading-mike-morning
     trading-mike-midday
     trading-cassidy-evening
+    trading-sector-evenings
+    trading-news-ingest
 )
 
 # Sanity: claude CLI present?
 if ! command -v claude >/dev/null 2>&1; then
     echo "ERROR: 'claude' CLI not found in PATH. Install Claude Code before running this." >&2
     exit 1
+fi
+
+# Sanity: local-LLM venv present? (vLLM + litellm depend on it)
+if [[ ! -x "${REPO_ROOT}/.venv-vllm/bin/vllm" ]]; then
+    echo "WARNING: ${REPO_ROOT}/.venv-vllm/bin/vllm missing — trading-vllm will fail to start." >&2
+    echo "         Bootstrap with: python3.12 -m venv .venv-vllm && .venv-vllm/bin/pip install vllm 'litellm[proxy]'" >&2
 fi
 CLAUDE_BIN="$(command -v claude)"
 if [[ "$CLAUDE_BIN" != "/home/tianyizhang/.local/bin/claude" ]]; then
@@ -45,6 +66,10 @@ fi
 mkdir -p "$UNIT_DST" "${REPO_ROOT}/logs"
 
 echo "Installing units to $UNIT_DST ..."
+for u in "${LONG_RUNNING[@]}"; do
+    install -m 0644 "${UNIT_SRC}/${u}.service" "${UNIT_DST}/${u}.service"
+    echo "  + ${u}.service (long-running)"
+done
 for u in "${UNITS[@]}"; do
     install -m 0644 "${UNIT_SRC}/${u}.service" "${UNIT_DST}/${u}.service"
     install -m 0644 "${UNIT_SRC}/${u}.timer"   "${UNIT_DST}/${u}.timer"
@@ -52,6 +77,11 @@ for u in "${UNITS[@]}"; do
 done
 
 systemctl --user daemon-reload
+
+echo "Enabling long-running LLM services ..."
+for u in "${LONG_RUNNING[@]}"; do
+    systemctl --user enable --now "${u}.service"
+done
 
 echo "Enabling and starting timers ..."
 for u in "${UNITS[@]}"; do

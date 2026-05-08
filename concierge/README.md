@@ -34,21 +34,18 @@ Two recommended setups; pick the one that matches how reliable you need it.
 
 ### Foreground (easiest, for testing)
 
-**Linux/macOS:**
 ```bash
 scripts/start_concierge.sh         # streams logs to stdout
 # Ctrl-C to stop. Graceful shutdown pings Telegram.
 ```
 
-**Windows:** double-click `scripts\start_concierge.bat`. Ctrl-C to stop.
-
-Closing the terminal/window kills the concierge — fine for ad-hoc testing,
-not for overnight reliability.
+Closing the terminal kills the concierge — fine for ad-hoc testing, not for
+overnight reliability.
 
 ### Always-on (recommended)
 
-**Linux/macOS — systemd user service.** The recommended production setup.
-See [INSTALL.md §6](../INSTALL.md) for the full procedure. Summary:
+systemd user service. See [INSTALL.md §6](../INSTALL.md) for the full
+procedure. Summary:
 
 ```bash
 chmod +x scripts/start_concierge.sh scripts/stop_concierge.sh
@@ -63,12 +60,6 @@ loginctl enable-linger "$USER"      # survive logout
 Manage with `systemctl --user {status,restart,stop} trading-concierge` and
 tail logs via `journalctl --user -u trading-concierge -f`.
 
-**Windows — NSSM service.** Run `scripts\install_concierge_service.bat` as
-administrator (requires `nssm.exe` on PATH). Creates a `TradingConcierge`
-service that auto-starts on boot. `net start/stop TradingConcierge` to
-manage; `scripts\uninstall_concierge_service.bat` to remove. Less common
-now that we've migrated; kept for reference.
-
 **Lock invariant:** regardless of mode, only one concierge runs at a time.
 `data/concierge.lock` holds the PID; a second start aborts with a clear
 error. Stale locks (dead PIDs) are auto-cleaned on next start.
@@ -78,27 +69,34 @@ error. Stale locks (dead PIDs) are auto-cleaned on next start.
 Required in `.env`:
 
 ```
-ANTHROPIC_API_KEY=sk-ant-...
 TELEGRAM_BOT_TOKEN=...
+LOCAL_LLM_BASE_URL=http://localhost:8000/v1
+LOCAL_MODEL=Qwen/Qwen3-32B-FP8
 ```
 
 Optional:
 
 ```
-CONCIERGE_MODEL=claude-sonnet-4-5-20250929   # override the config.yaml default
-CONCIERGE_DAILY_USD_CAP=5.00                 # override the config.yaml cap
+CONCIERGE_MODEL=Qwen/Qwen3-32B-FP8           # override config.yaml's model
+CONCIERGE_DAILY_TOKEN_CAP=2000000            # halts after this many in+out tokens (UTC reset)
+LOCAL_LLM_API_KEY=local-dummy                # vLLM doesn't auth, but the SDK requires a string
 TELEGRAM_CHAT_ID=...                         # pin the allowed chat (otherwise auto-detected)
 ```
+
+> Concierge no longer uses the Anthropic API. It connects to the local vLLM
+> endpoint directly via the OpenAI SDK. (The scheduled skills go through the
+> LiteLLM Anthropic-emulation proxy at `LOCAL_PROXY_URL`; the concierge bypasses
+> that proxy and uses OpenAI shape natively.)
 
 ## Config (`config.yaml` → `concierge:`)
 
 ```yaml
 concierge:
   enabled: true
-  model: claude-sonnet-4-5-20250929
+  model: Qwen/Qwen3-32B-FP8
   max_tool_iterations: 5        # hard cap per user message
   history_turns: 40             # conversation history retained
-  daily_usd_cap: 5.00           # UTC-midnight reset
+  daily_token_cap: 2000000      # halts when in+out exceed this (UTC reset)
   nudge_interval_s: 60
   allowed_tools: [...]          # whitelist; see TOOL_SCHEMAS in concierge/tools.py
 ```
@@ -110,7 +108,7 @@ concierge:
 - `/pnl` — today's per-agent P&L
 - `/proposals` — list pending with short IDs
 - `/pause <agent>` — raise a "pause this agent" proposal
-- `/budget` — today's Sonnet spend vs. cap
+- `/budget` — today's local-LLM token usage vs. cap
 - `/help` — list commands
 
 ## Safety features
@@ -156,10 +154,9 @@ concierge:
 - **"Daily budget reached"** — raise `CONCIERGE_DAILY_USD_CAP` or wait for
   UTC-midnight reset.
 - **Replies stop coming** — check `logs/concierge.log` for crashes (or
-  `journalctl --user -u trading-concierge` on Linux). The service is
-  conservative and will log + continue on most errors, but an Anthropic
-  outage will surface as a plain-text error message back to you.
+  `journalctl --user -u trading-concierge`). The service is conservative
+  and will log + continue on most errors, but an Anthropic outage will
+  surface as a plain-text error message back to you.
 - **Key rotation** — rotate at console.anthropic.com, replace the value in
-  `.env`, then `systemctl --user restart trading-concierge` (Linux) or
-  Ctrl-C + restart `start_concierge.bat` (Windows). The key that was pasted
-  in chat on 2026-04-24 **should** be rotated.
+  `.env`, then `systemctl --user restart trading-concierge`. The key that
+  was pasted in chat on 2026-04-24 **should** be rotated.

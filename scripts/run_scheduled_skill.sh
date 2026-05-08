@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Generic launcher for Claude Code scheduled skills on Linux/macOS.
-# Mirrors run_scheduled_skill.bat — cron should call:
+# Generic launcher for Claude Code scheduled skills.
+# Called by the systemd .service units and by the orchestrator scripts:
 #   /path/to/trading/scripts/run_scheduled_skill.sh <skill-name> [--dev|--force]
 
 set -u
@@ -40,12 +40,20 @@ else
     PROMPT="/${SKILL}"
 fi
 
-# Inner timeout: defends against a single Claude/API hang independent of the
-# orchestrator's outer timeout. Lower than the orchestrator's per-skill cap so
-# the inner kill is the one that fires first (cleaner exit + log line).
+# Inner timeout: defends against a single Claude/LLM-proxy hang independent of
+# the orchestrator's outer timeout. Lower than the orchestrator's per-skill cap
+# so the inner kill is the one that fires first (cleaner exit + log line).
 INNER_TIMEOUT_SEC="${SKILL_INNER_TIMEOUT_SEC:-840}"
+
+# Route the `claude` CLI directly at the local vLLM server. vLLM 0.20+ exposes
+# /v1/messages natively in Anthropic shape and aliases claude-* model names to
+# the local Qwen3-32B-FP8 (see --served-model-name in trading-vllm.service).
+# The --model flag is intentionally OMITTED so the CLI's default name is sent.
+# ANTHROPIC_API_KEY can be any non-empty string — vLLM doesn't auth.
+ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-http://localhost:8000}" \
+ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-local-dummy}" \
 timeout --foreground "$INNER_TIMEOUT_SEC" \
-    claude --dangerously-skip-permissions --model claude-opus-4-7 -p "$PROMPT" >> "$LOG_FILE" 2>&1
+    claude --dangerously-skip-permissions -p "$PROMPT" >> "$LOG_FILE" 2>&1
 EC=$?
 if [[ $EC -eq 124 ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] /${SKILL} TIMED OUT after ${INNER_TIMEOUT_SEC}s" >> "$LOG_FILE"

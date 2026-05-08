@@ -268,13 +268,19 @@ async def _raise_pause(agent: str) -> None:
 
 
 async def _send_budget(cfg: dict[str, Any]) -> None:
+    import os
     u = state.load_usage()
-    cap = float(cfg.get("daily_usd_cap", 0) or 0)
-    cap_str = f" / ${cap:.2f}" if cap else ""
+    cap = int(
+        cfg.get("daily_token_cap", 0)
+        or os.environ.get("CONCIERGE_DAILY_TOKEN_CAP", 0)
+        or 0
+    )
+    total = u.get("input_tokens", 0) + u.get("output_tokens", 0)
+    cap_str = f" / {cap:,}" if cap else ""
     await send_message(
-        f"Concierge today: ${u['usd']:.3f}{cap_str}\n"
-        f"{u['requests']} requests · {u['input_tokens']}in / {u['output_tokens']}out tokens\n"
-        f"Cache: {u['cache_write_tokens']}w / {u['cache_read_tokens']}r",
+        f"Concierge today: {total:,} tokens{cap_str}\n"
+        f"{u.get('requests', 0)} requests · "
+        f"{u.get('input_tokens', 0):,}in / {u.get('output_tokens', 0):,}out",
         parse_mode=None,
     )
 
