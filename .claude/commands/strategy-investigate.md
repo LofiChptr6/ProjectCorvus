@@ -7,7 +7,7 @@ You are running an **investigation session** for the agent named `$ARGUMENTS`. T
 
 You are **NOT running the agent's hourly review**. Do not publish convictions on a normal review cadence. Do not place orders. Do not toggle the kill switch. This is an introspection + tuning surface.
 
-If `$ARGUMENTS` is empty or doesn't match a known agent (atlas, fab, fabless, iron, maya, rex, titan, trump, vera, volt, mike, cassidy), stop and tell the user the valid names.
+If `$ARGUMENTS` is empty or doesn't match a known agent (atlas, fab, fabless, iron, maya, rex, trump, vera, volt, energy, commodity, mike, cassidy), stop and tell the user the valid names.
 
 ---
 

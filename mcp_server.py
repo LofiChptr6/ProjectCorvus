@@ -20,8 +20,8 @@ import yaml
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 
-# Heavy imports go here at module load, BEFORE the asyncio event loop starts.
-# Deferring these to first tool call deadlocks the Windows ProactorEventLoop.
+# Heavy imports go here at module load, BEFORE the asyncio event loop starts —
+# deferring them to first tool call has historically caused event-loop deadlocks.
 import pandas as _pd
 import pandas_market_calendars as _mcal
 
@@ -835,10 +835,17 @@ async def write_mike_analysis(
     date: str = "today",
     regime: Optional[str] = None,
     risk_tone: Optional[str] = None,
-    rex_guidance: Optional[str] = None,
-    maya_guidance: Optional[str] = None,
     atlas_guidance: Optional[str] = None,
-    titan_guidance: Optional[str] = None,
+    fab_guidance: Optional[str] = None,
+    fabless_guidance: Optional[str] = None,
+    iron_guidance: Optional[str] = None,
+    maya_guidance: Optional[str] = None,
+    rex_guidance: Optional[str] = None,
+    trump_guidance: Optional[str] = None,
+    vera_guidance: Optional[str] = None,
+    volt_guidance: Optional[str] = None,
+    energy_guidance: Optional[str] = None,
+    commodity_guidance: Optional[str] = None,
     sector_rotation: Optional[str] = None,
     overnight_notes: Optional[str] = None,
 ) -> str:
@@ -847,8 +854,9 @@ async def write_mike_analysis(
     - YYYY-MM-DD.txt — full free-form analysis (appended, with UTC separator)
     - YYYY-MM-DD.json — structured per-agent sections (overwritten each call)
 
-    Both morning and midday calls update the JSON. Traders read the JSON per-agent
-    via get_mike_analysis(agent_name=...) so they only see their own guidance.
+    Both morning and midday calls update the JSON. Sector agents read the JSON
+    per-agent via get_mike_analysis(agent_name=...) so they only see their own
+    guidance.
 
     Args:
         analysis: Full analysis text (markdown). Always required — this is the
@@ -857,8 +865,9 @@ async def write_mike_analysis(
         regime: One of 'BULLISH', 'BEARISH', 'NEUTRAL', 'TRANSITIONAL'. Required for
             the first write of the day; optional for updates.
         risk_tone: One-sentence summary of today's risk appetite.
-        rex_guidance / maya_guidance / atlas_guidance / titan_guidance: Per-trader
-            directives. Each trader sees only their own section in their context.
+        <agent>_guidance: Per-agent directives. The 11 sector agents are
+            atlas, fab, fabless, iron, maya, rex, trump, vera, volt, energy,
+            commodity. Each agent sees only its own section.
         sector_rotation: One paragraph on sector leadership.
         overnight_notes: Observations on overnight positions (if any).
     """
@@ -893,10 +902,17 @@ async def write_mike_analysis(
             "regime": regime,
             "risk_tone": risk_tone,
             "sector_rotation": sector_rotation,
-            "rex_guidance": rex_guidance,
-            "maya_guidance": maya_guidance,
             "atlas_guidance": atlas_guidance,
-            "titan_guidance": titan_guidance,
+            "fab_guidance": fab_guidance,
+            "fabless_guidance": fabless_guidance,
+            "iron_guidance": iron_guidance,
+            "maya_guidance": maya_guidance,
+            "rex_guidance": rex_guidance,
+            "trump_guidance": trump_guidance,
+            "vera_guidance": vera_guidance,
+            "volt_guidance": volt_guidance,
+            "energy_guidance": energy_guidance,
+            "commodity_guidance": commodity_guidance,
             "overnight_notes": overnight_notes,
         }
         for k, v in updates.items():
@@ -928,15 +944,16 @@ async def write_mike_analysis(
 @mcp.tool()
 async def get_mike_analysis(date: str = "today", agent_name: Optional[str] = None) -> str:
     """
-    Retrieve Mike's market analysis. If `agent_name` is one of rex/maya/atlas/titan,
-    returns only that trader's section + regime + risk_tone (compact view).
-    Otherwise returns the full structured JSON + full text.
+    Retrieve Mike's market analysis. If `agent_name` is any of the 11 sector
+    agents (atlas, fab, fabless, iron, maya, rex, trump, vera, volt, energy,
+    commodity), returns only that agent's guidance + regime + risk_tone
+    (compact view). Otherwise returns the full structured JSON + full text.
 
     Returns an advisory message if Mike hasn't written for this date yet.
 
     Args:
         date: 'today' (default, America/New_York) or 'YYYY-MM-DD'.
-        agent_name: Optional — 'rex', 'maya', 'atlas', 'titan' for per-agent view.
+        agent_name: Optional — one of the 11 sector agents for per-agent view.
     """
     date_str = _resolve_date(date)
     base = Path("data/mike_analysis")
@@ -1305,6 +1322,102 @@ async def generate_agent_chart(agent_name: str, date: Optional[str] = None) -> s
 
 
 @mcp.tool()
+async def generate_evening_slide(
+    agent_name: str,
+    headline: str,
+    macro_thesis: Optional[list] = None,
+    trends: Optional[list] = None,
+    theses: Optional[list] = None,
+    philosophy: Optional[list] = None,
+    open_questions: Optional[list] = None,
+) -> str:
+    """
+    Render the agent's 1-page evening summary slide and return its path.
+
+    Layout:
+      - Header banner (agent name + date + headline P&L).
+      - Top "Today's thesis" panel — 2-3 prose bullets in human language,
+        the agent's fundamental read on what's happening in the world,
+        sector, or specific names.
+      - Hourly combined-P&L chart (left, trading-hours-compressed).
+      - Top-N forecast panel with per-ticker indicator overlays (right).
+      - Four bullet panels at the bottom — trends/catalysts, theses,
+        trading philosophy, open questions/waiting-on.
+
+    Use this in the evening review INSTEAD OF sending the P&L chart and
+    forecast panel as separate Telegram messages. One message per agent.
+
+    Args:
+        agent_name: Sector agent name (e.g., "fab", "vera").
+        headline: One-line P&L summary, e.g.
+                  "P&L: -$155 today (real -$18 / unreal -$137, 4 positions)".
+        macro_thesis: 2-3 prose bullets for the top panel. When omitted,
+                      auto-aggregates from agent_thesis records of the
+                      past 24h (kind IN ('thesis','observation')).
+                      Override only when you want fresh prose at EOD that
+                      isn't already in the journal.
+        trends: bullets — news, catalysts, sector tape (3-6 short items).
+        theses: bullets — your active framework calls (3-6 short items).
+        philosophy: bullets — sizing rules / style notes in play this hour.
+        open_questions: bullets — unresolved questions, calendar events
+                        you're waiting on, data gaps.
+
+    Returns: {"chart_path": "data/charts/slide_{agent}_{stamp}.png"} or
+             {"error": "..."}.
+    """
+    await _ensure_init_light()
+    from reporting.evening_slide import render_evening_slide
+    try:
+        path = await render_evening_slide(
+            agent_name,
+            headline=headline,
+            macro_thesis=list(macro_thesis) if macro_thesis is not None else None,
+            trends=list(trends or []),
+            theses=list(theses or []),
+            philosophy=list(philosophy or []),
+            open_questions=list(open_questions or []),
+        )
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+    if path is None:
+        return json.dumps({"error": "slide not produced (component charts missing)"})
+    return json.dumps({"chart_path": str(path)})
+
+
+@mcp.tool()
+async def generate_forecast_panel(agent_name: str) -> str:
+    """
+    Build the agent's top-10 forecast panel PNG and return its path.
+
+    One row per ticker, stacked vertically. Each row shows the last 5 trading
+    days of close prices plus a dashed forecast line extending to the
+    conviction's `time_to_target_days`, ending at
+        today_price × (1 + expected_return_pct/100 × conviction).
+    A vertical horizon marker labels `time_to_target_days = N` so the agent's
+    timescale is legible at a glance. Tickers are picked from
+    (active convictions ∪ current positions), deduped, ranked by abs(market
+    value) primary and abs(conviction) secondary.
+
+    Use in the evening review alongside `generate_pnl_curve` /
+    `generate_agent_chart`. Returns {"chart_path": "..."} or
+    {"error": "..."} on failure or {"empty": true} when the agent has no
+    convictions and no positions.
+
+    Args:
+        agent_name: Sector agent name (e.g. "fab", "fabless", "vera").
+    """
+    await _ensure_init_light()
+    from reporting.forecast_panel import render_forecast_panel
+    try:
+        path = await render_forecast_panel(agent_name)
+    except Exception as exc:
+        return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+    if path is None:
+        return json.dumps({"empty": True, "agent": agent_name})
+    return json.dumps({"chart_path": str(path)})
+
+
+@mcp.tool()
 async def generate_pnl_curve(
     agent_name: Optional[str] = None,
     since: str = "7d",
@@ -1413,6 +1526,110 @@ async def compute_custom_indicator(
     return json.dumps({"model": model_name, "symbol": symbol, "result": result}, default=str)
 
 
+@mcp.tool()
+async def compute_all_models(
+    agent_name: str,
+    symbol: str,
+    bar_size: str = "1 day",
+    duration: str = "1 Y",
+) -> str:
+    """
+    Auto-discover and run every quant model in agents/<agent_name>/models/.
+
+    For each .py file in the directory that exposes compute(symbol, bars, context),
+    the model is invoked with (symbol, bars, context) and its result is collected.
+    Per-model failures are isolated — one bad model does NOT block the others.
+    Modules are reloaded each call so model edits land without an MCP server restart.
+
+    Returns JSON of shape:
+        {
+          "agent": "<agent_name>",
+          "symbol": "<SYM>",
+          "error_count": <int — # of models whose error is not null>,
+          "errored_models": ["<name>", ...],
+          "flat_count": <int — # of models whose result.direction == 'flat'>,
+          "models": {
+            "<model_name>": {
+              "version": "X.Y" | "unset",
+              "result": <whatever model.compute returns> | null,
+              "error": "TypeError: ..." | null
+            },
+            ...
+          }
+        }
+
+    The top-level error_count / errored_models / flat_count fields are summary
+    signals — agents must check error_count >= 1 and apply the BROKEN MODEL
+    DECISION RULE (see desk policy) before using ANY model output. flat_count
+    on a single symbol is a per-call signal; if every model returns flat across
+    a sweep of N symbols, that's a portfolio problem — see QUANT ENGAGEMENT
+    DOCTRINE for the universe-flatness check.
+
+    Sector-review skills should call this once per symbol and reason across the
+    portfolio — where models agree (high-conviction setup), where they disagree
+    (information; pick a side and justify), and where one errors (fix inline if
+    <30 lines + one-sentence diagnosis, otherwise file a model:* observation
+    thesis + tool gap before continuing). For targeting a specific model by name
+    (debugging, model-tune verification), use compute_custom_indicator instead.
+
+    Bar window defaults to 1 Y (~252 trading days of daily bars). This window is
+    sized to cover the deepest model in any sector portfolio (fab/iron use SMA_200,
+    needing 200 bars). The earlier 3 M default starved 200-bar models silently —
+    raised by fab as model:equipment_cycle:bars_underflow (thesis #214 2026-05-05).
+    If you add a model that needs more than 252 bars, pass duration="2 Y".
+
+    Args:
+        agent_name: Sector agent (e.g. 'atlas', 'fab', 'energy').
+        symbol: Ticker.
+        bar_size: '1 min', '5 mins', '15 mins', '1 hour', '1 day'.
+        duration: '1 D', '5 D', '1 M', '3 M', '1 Y' (3 M ≈ 60 trading days).
+    """
+    await _ensure_init()
+    import re
+    from data.massive_client import get_bars as _get_bars
+    from ibkr.account import get_account_summary
+    from meta_agent.model_loader import run_all_models
+
+    _ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+    if not _ID_RE.match(agent_name or ""):
+        return json.dumps({"error": "invalid agent_name (must match [a-z][a-z0-9_]{0,31})"})
+
+    bars_response = await _get_bars(symbol, bar_size, duration, "TRADES")
+    bars = bars_response.get("bars", []) if isinstance(bars_response, dict) else bars_response
+    summary = await get_account_summary()
+
+    # Build context — same shape as compute_custom_indicator (regime from today's
+    # mike_analysis if present).
+    regime = None
+    try:
+        mike_path = Path("data/mike_analysis") / f"{_market_date()}.json"
+        if mike_path.exists():
+            with open(mike_path, "r", encoding="utf-8") as f:
+                regime = (json.load(f) or {}).get("regime")
+    except Exception:
+        pass
+    context = {"nav": summary.get("nav"), "regime": regime, "agent_name": agent_name}
+
+    results = run_all_models(agent_name, symbol, bars, context)
+    error_count = sum(1 for m in results.values() if m.get("error"))
+    errored_models = [name for name, m in results.items() if m.get("error")]
+    flat_count = sum(
+        1 for m in results.values()
+        if isinstance(m.get("result"), dict) and m["result"].get("direction") == "flat"
+    )
+    return json.dumps(
+        {
+            "agent": agent_name,
+            "symbol": symbol,
+            "error_count": error_count,
+            "errored_models": errored_models,
+            "flat_count": flat_count,
+            "models": results,
+        },
+        default=str,
+    )
+
+
 # ── Conviction views (sector-shard architecture) ─────────────────────────────
 #
 # Sector agents publish signed conviction views per symbol; Mike (the allocator)
@@ -1470,7 +1687,7 @@ def _validate_symbol(symbol: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _validate_rationale(rationale: str, max_len: int = 512) -> tuple[bool, str]:
+def _validate_rationale(rationale: str, max_len: int = 2048) -> tuple[bool, str]:
     """Cap rationale length and ban control chars. Without this, a runaway agent
     can poison the audit log, blow Telegram's 4096-char message ceiling, or
     sneak hidden newlines past downstream consumers."""
@@ -1521,7 +1738,9 @@ async def submit_conviction_view(
     expected_return_pct: Optional[float] = None,
     time_to_target_days: Optional[int] = None,
     model_inputs: Optional[dict] = None,
-    expires_in_hours: int = 4,
+    expires_in_hours: int = 1,
+    momentum_confirmed: Optional[bool] = None,
+    stop_pct: Optional[float] = None,
 ) -> str:
     """
     Publish a signed conviction view on one symbol. Upserts on (agent_name, symbol)
@@ -1533,11 +1752,34 @@ async def submit_conviction_view(
         direction: 'long' | 'short' | 'flat'. 'flat' must have conviction == 0.
         conviction: Positive float ≈ E[return] / time_to_target_days. Higher = stronger.
                     Use your own forecast formula; Cassidy reviews calibration in evening.
-        rationale: 1–2 sentence why (audit trail).
-        expected_return_pct: Your forecast (informational, used by calibration tracker).
-        time_to_target_days: Your horizon (informational).
+        rationale: 1–2 sentence why (audit trail). For inverse-ETF symbols this is
+                   what the user reads on the Telegram approval prompt — be concrete.
+        expected_return_pct: REQUIRED for direction != 'flat'. Your forecast as a
+                             signed % move on this name (e.g. +8.5 = expect a 8.5%
+                             rise; -6.0 = expect a 6% drop). Drives the evening
+                             forecast panel and the calibration tracker.
+        time_to_target_days: REQUIRED for direction != 'flat' and must be > 0.
+                             Your horizon in trading days. Sets the x-axis length
+                             of the forecast line in your evening panel.
         model_inputs: Raw quant model output for replay (optional dict).
-        expires_in_hours: Auto-expire after N hours (default 4). Re-submit to refresh.
+        expires_in_hours: Auto-expire after N hours (default 1 — hour-to-hour
+                          reconciliation: if you don't re-publish in the next
+                          review cycle the position auto-closes). Override to
+                          18 for overnight holds, 72 for weekend, or longer for
+                          multi-day theses you've thought through. Off-hours
+                          expirations are no-ops (market_hours risk check blocks
+                          SELLs outside RTH).
+        momentum_confirmed: For direction='long' on a verified inverse ETF, asserts
+                            whether the underlying is already showing the bearish move
+                            (True) vs. an early entry ahead of confirmation (False).
+                            None on non-inverse symbols. None on an inverse-ETF buy is
+                            treated as False (safe default — needs human approval).
+        stop_pct: Optional defensive auto-flat trigger. If the desk's unrealized
+                  return on this symbol falls below -stop_pct (e.g., 8 ⇒ -8%), the
+                  allocator treats this conviction as flat regardless of whether
+                  you re-publish — the position closes. STRONGLY recommended for
+                  inverse-ETF longs where decay compounds: 8 on 1× inverses,
+                  4 on ≥2× inverses. NULL ⇒ no stop (default).
     """
     await _ensure_init_light()
     ok, reason = _validate_symbol(symbol)
@@ -1551,6 +1793,16 @@ async def submit_conviction_view(
         return json.dumps({"error": reason})
     if symbol.upper() == "CASH" and direction != "long":
         return json.dumps({"error": "CASH conviction must be direction='long' (cash reserve, not margin)"})
+    # Non-flat convictions MUST carry a forecast — without (expected_return_pct,
+    # time_to_target_days) the evening forecast panel can't draw a line and
+    # Mike's calibration tracker has nothing to score the call against. CASH
+    # is exempt: it's a cash-reserve vote, not a price view, so it carries no
+    # forecast metadata.
+    if direction != "flat" and symbol.upper() != "CASH":
+        if expected_return_pct is None:
+            return json.dumps({"error": "validation: expected_return_pct is required for direction != 'flat' (your forecast — % move you expect on this name)"})
+        if time_to_target_days is None or int(time_to_target_days) <= 0:
+            return json.dumps({"error": "validation: time_to_target_days is required and must be > 0 for direction != 'flat' (your horizon in days)"})
     allowed, reason = _agent_owns_symbol(agent_name, symbol)
     if not allowed:
         return json.dumps({"error": f"sector_map: {reason}"})
@@ -1566,6 +1818,8 @@ async def submit_conviction_view(
             rationale=rationale,
             model_inputs=model_inputs,
             expires_in_hours=expires_in_hours,
+            momentum_confirmed=momentum_confirmed,
+            stop_pct=stop_pct,
         )
         return json.dumps({"view_id": view_id, "symbol": symbol.upper(), "direction": direction})
     except (ValueError, AssertionError) as e:
@@ -1585,6 +1839,370 @@ async def clear_my_views(agent_name: str) -> str:
     from db import store
     deleted = await store.clear_agent_convictions(agent_name)
     return json.dumps({"deleted": deleted})
+
+
+@mcp.tool()
+async def read_my_workspace(agent_name: str) -> str:
+    """
+    Read the agent's workspace folder — `agents/<agent>/`. Returns a single
+    payload with three sections every hourly/evening review should consume
+    as context:
+
+      - notes:     list of {filename, size, mtime, content} for every file
+                   under agents/<agent>/notes/ (markdown freeform).
+      - watchlist: full text of agents/<agent>/watchlist.md — names the
+                   user or the agent has flagged as must-research this
+                   hour. Both can edit this file.
+      - data:      list of {filename, size, mtime} for every file under
+                   agents/<agent>/data/ (saved snapshots / CSV exports).
+                   Bodies omitted; agent reads specific data files via
+                   the standard filesystem if needed.
+
+    Call this at the start of every review so prior context (notes,
+    user-added watchlist entries, saved analyses) flows into your
+    analysis.
+    """
+    await _ensure_init_light()
+    base = Path("agents") / agent_name
+    if not base.is_dir():
+        return json.dumps({"error": f"agents/{agent_name}/ does not exist"})
+
+    notes_dir = base / "notes"
+    data_dir = base / "data"
+    wl = base / "watchlist.md"
+
+    out: dict = {"agent_name": agent_name, "notes": [], "watchlist": "",
+                 "data": []}
+    if notes_dir.is_dir():
+        for f in sorted(notes_dir.iterdir()):
+            if not f.is_file() or f.suffix not in {".md", ".txt"}:
+                continue
+            try:
+                body = f.read_text(encoding="utf-8")
+            except Exception as e:
+                body = f"(failed to read: {type(e).__name__}: {e})"
+            out["notes"].append({
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "mtime": f.stat().st_mtime,
+                "content": body[:8000],   # cap each file to 8KB so the
+                                          # combined payload stays reasonable
+            })
+    if wl.is_file():
+        try:
+            out["watchlist"] = wl.read_text(encoding="utf-8")[:20000]
+        except Exception as e:
+            out["watchlist"] = f"(failed to read watchlist.md: {type(e).__name__}: {e})"
+    if data_dir.is_dir():
+        for f in sorted(data_dir.iterdir()):
+            if not f.is_file():
+                continue
+            out["data"].append({
+                "filename": f.name,
+                "size": f.stat().st_size,
+                "mtime": f.stat().st_mtime,
+            })
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+async def write_my_note(
+    agent_name: str,
+    filename: str,
+    content: str,
+    mode: str = "write",
+) -> str:
+    """
+    Write or append content to a note file under agents/<agent>/notes/.
+
+    Args:
+        agent_name: Your agent name. Must match the folder under agents/.
+        filename: e.g. "avgo_thesis_draft.md" or "ai_capex_calendar.txt".
+                  Must end in .md or .txt. No path separators allowed.
+        content: Markdown / plain text body.
+        mode: "write" (replace) or "append" (add at end with a separator).
+
+    Returns: {"path": "agents/<agent>/notes/<filename>", "bytes": N}.
+    """
+    await _ensure_init_light()
+    if "/" in filename or ".." in filename:
+        return json.dumps({"error": "filename must be a bare name; no path separators"})
+    if not filename.endswith((".md", ".txt")):
+        return json.dumps({"error": "filename must end in .md or .txt"})
+    base = Path("agents") / agent_name / "notes"
+    if not base.is_dir():
+        return json.dumps({"error": f"agents/{agent_name}/notes/ does not exist"})
+    path = base / filename
+    if mode == "append" and path.exists():
+        prior = path.read_text(encoding="utf-8")
+        new_body = prior.rstrip() + "\n\n---\n\n" + content
+        path.write_text(new_body, encoding="utf-8")
+    else:
+        path.write_text(content, encoding="utf-8")
+    return json.dumps({"path": str(path), "bytes": path.stat().st_size})
+
+
+@mcp.tool()
+async def add_to_watchlist(agent_name: str, symbol: str, reason: str) -> str:
+    """
+    Append a ticker to agents/<agent>/watchlist.md under the "Active"
+    heading with a short reason and today's date.
+
+    Removing tickers from the watchlist requires user approval via Telegram
+    — call `propose_watchlist_removal` instead of editing the file
+    directly.
+
+    Args:
+        agent_name: Your agent name.
+        symbol: Ticker to add (will be uppercased; ownership is NOT
+                validated against sector_map — the watchlist can include
+                anything you want to research).
+        reason: One short sentence on why this name needs attention.
+    """
+    await _ensure_init_light()
+    sym = symbol.strip().upper()
+    if not sym:
+        return json.dumps({"error": "symbol is required"})
+    if not (reason or "").strip():
+        return json.dumps({"error": "reason is required (≥1 sentence)"})
+    base = Path("agents") / agent_name
+    wl = base / "watchlist.md"
+    if not wl.is_file():
+        return json.dumps({"error": f"agents/{agent_name}/watchlist.md missing"})
+    text = wl.read_text(encoding="utf-8")
+    from datetime import datetime as _dt
+    today = _dt.now().date().isoformat()
+    new_line = f"- {sym} — {reason.strip()} | added {today}"
+    # Idempotent: don't add if a line for this symbol already exists in Active.
+    active_marker = "## Active"
+    if active_marker in text:
+        # Check if the symbol is already on the watchlist (any heading).
+        if any(line.lstrip("-").strip().startswith(sym + " ") or
+               line.lstrip("-").strip().startswith(sym + "—") or
+               line.lstrip("-").strip().startswith(sym + " —")
+               for line in text.splitlines()):
+            return json.dumps({
+                "skipped": True,
+                "reason": f"{sym} is already on the watchlist",
+            })
+        idx = text.index(active_marker) + len(active_marker)
+        # Insert the new line right after the heading + the blank line below
+        head = text[:idx]
+        rest = text[idx:]
+        # Find the first newline pair to insert after, otherwise just append
+        if "\n\n" in rest:
+            split_at = rest.index("\n\n") + 2
+            new_text = head + rest[:split_at] + new_line + "\n" + rest[split_at:]
+        else:
+            new_text = head + "\n" + new_line + rest
+    else:
+        # No "## Active" heading — append at end of file.
+        new_text = text.rstrip() + "\n\n" + new_line + "\n"
+    wl.write_text(new_text, encoding="utf-8")
+    return json.dumps({"added": True, "symbol": sym, "line": new_line})
+
+
+@mcp.tool()
+async def propose_watchlist_removal(
+    agent_name: str,
+    symbol: str,
+    reasoning: str,
+) -> str:
+    """
+    Propose removing a ticker from agents/<agent>/watchlist.md. Removal
+    requires user approval via Telegram — this tool creates a pending
+    proposal in the existing approval queue (kind="watchlist_removal").
+
+    The user sees a Telegram message with the ticker + your reasoning;
+    they reply `/y` to approve or `/n` to reject. On approval, the line
+    is moved from "## Active" to "## Removed (audit trail)" with the
+    approval timestamp on the next hourly/evening review.
+
+    Args:
+        agent_name: Your agent name.
+        symbol: Ticker to remove (will be uppercased).
+        reasoning: WHY this name should drop off the watchlist. The user
+                   reads this reasoning to decide; be concrete.
+    """
+    await _ensure_init_light()
+    sym = symbol.strip().upper()
+    if not sym:
+        return json.dumps({"error": "symbol is required"})
+    if not (reasoning or "").strip() or len((reasoning or "").strip()) < 30:
+        return json.dumps({
+            "error": "reasoning must be ≥30 chars — explain why this name "
+                     "should drop off the watchlist",
+        })
+    base = Path("agents") / agent_name
+    wl = base / "watchlist.md"
+    if not wl.is_file():
+        return json.dumps({"error": f"agents/{agent_name}/watchlist.md missing"})
+    text = wl.read_text(encoding="utf-8")
+    if sym not in text:
+        return json.dumps({
+            "error": f"{sym} not found in watchlist; nothing to remove",
+        })
+
+    from approval import proposals
+    proposal = await proposals.create(
+        title=f"Watchlist removal: {agent_name} → drop {sym}",
+        details=(
+            f"*Agent:* {agent_name}\n"
+            f"*Symbol:* {sym}\n\n"
+            f"*Reasoning:*\n{reasoning.strip()}"
+        ),
+        kind="watchlist_removal",
+        payload={
+            "agent_name": agent_name,
+            "symbol": sym,
+            "reasoning": reasoning.strip(),
+        },
+    )
+    return json.dumps({
+        "proposal_id": proposal["id"][:8],
+        "status": proposal.get("status", "pending"),
+        "agent_name": agent_name,
+        "symbol": sym,
+    })
+
+
+@mcp.tool()
+async def submit_forecast_batch(
+    agent_name: str,
+    forecasts: list,
+    expires_in_hours: int = 2,
+) -> str:
+    """
+    Publish a batch of forecast rows on names from your sector universe.
+    Forecasts are PROOF-OF-WORK — show your thinking across ≥20 names per
+    hour, regardless of whether you take a conviction. Allocator does NOT
+    read this table; convictions remain the trade signal.
+
+    MULTI-HORIZON: Each symbol should appear up to 4 times with different
+    time_to_target_days — one row per horizon. The horizon is auto-derived:
+      intraday: time_to_target_days = 1      (≤ 1 trading day)
+      near:     time_to_target_days = 3–5    (2–5 days)
+      far:      time_to_target_days = 10–30  (6–30 days)
+      cycle:    time_to_target_days = 60–90  (31+ days)
+    The same symbol at different time horizons becomes 4 independent DB rows,
+    allowing you to express "bullish next hour, neutral next week, bearish
+    next quarter" cleanly without conflict.
+
+    Args:
+        agent_name: Your agent name.
+        forecasts: list of dicts, each carrying:
+            symbol               (required) — must be in your sector universe.
+            expected_return_pct  (required) — signed % move you forecast at
+                                  this specific horizon (e.g. +2.5 for intraday,
+                                  +8.0 for far). May differ across horizons.
+            likelihood           (required) — probability of hitting target, 0..1.
+            time_to_target_days  (required) — horizon in days, > 0. Drives
+                                  automatic horizon bucket assignment.
+            method               (required) — free-text source, e.g.
+                                  "BBG consensus PT", "RSI 68 + EUV TAM cut",
+                                  "sentiment + macro". May differ per horizon.
+            rationale            (optional) — one-line note.
+            horizon              (optional) — override auto-derived bucket;
+                                  one of: intraday, near, far, cycle.
+        expires_in_hours: Auto-expire after N hours (default 2). Re-submit
+            each hourly review with `clear_my_forecasts` (or
+            `clear_my_forecasts(horizon='intraday')` to preserve slower-
+            moving far/cycle views).
+
+    Returns: {inserted, skipped_validation, ownership_errors, soft_warning}.
+    Soft-warns when unique_symbols < 20 — submission still succeeds.
+    """
+    await _ensure_init_light()
+    ok, reason = _rate_check("submit_forecast_batch")
+    if not ok:
+        return json.dumps({"error": reason})
+    if not isinstance(forecasts, list) or not forecasts:
+        return json.dumps({"error": "forecasts must be a non-empty list of dicts"})
+
+    # Universe enforcement up front so the agent gets a clean rejection list
+    # rather than partial inserts followed by surprise drops.
+    ownership_errors: list[dict] = []
+    cleaned: list[dict] = []
+    for r in forecasts:
+        sym = (r or {}).get("symbol")
+        if not sym:
+            ownership_errors.append({"row": r, "error": "missing symbol"})
+            continue
+        ok_sym, reason = _validate_symbol(str(sym))
+        if not ok_sym:
+            ownership_errors.append({"row": r, "error": f"validation: {reason}"})
+            continue
+        allowed, reason = _agent_owns_symbol(agent_name, str(sym))
+        if not allowed:
+            ownership_errors.append({"row": r, "error": f"sector_map: {reason}"})
+            continue
+        cleaned.append(r)
+
+    from db import store
+    try:
+        result = await store.upsert_forecasts_batch(
+            agent_name=agent_name,
+            rows=cleaned,
+            expires_in_hours=expires_in_hours,
+        )
+    except Exception as e:
+        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+
+    unique_symbols = len({(r.get("symbol") or "").upper() for r in cleaned})
+    payload = {
+        "inserted": result["inserted"],
+        "skipped_validation": result["errors"],
+        "ownership_errors": ownership_errors,
+    }
+    if unique_symbols < 20:
+        payload["soft_warning"] = (
+            f"only {unique_symbols} distinct symbols; the desk policy is ≥20 per hour"
+        )
+    return json.dumps(payload, default=str)
+
+
+@mcp.tool()
+async def clear_my_forecasts(agent_name: str, horizon: str = "") -> str:
+    """
+    Drop this agent's forecast rows. Call at the start of each hourly review
+    (before submit_forecast_batch) so the new batch fully replaces the prior
+    hour's slate.
+
+    Args:
+        agent_name: Your agent name.
+        horizon: Optional — clear only this horizon ('intraday', 'near', 'far',
+                 'cycle'). Leave empty to clear all horizons. Use
+                 horizon='intraday' when you want to preserve your weekly
+                 cycle forecasts while refreshing short-term views.
+    """
+    await _ensure_init_light()
+    from db import store
+    h = horizon.strip() or None
+    deleted = await store.clear_agent_forecasts(agent_name, horizon=h)
+    payload = {"deleted": deleted}
+    if h:
+        payload["horizon"] = h
+    return json.dumps(payload)
+
+
+@mcp.tool()
+async def get_my_active_forecasts(agent_name: str, horizon: str = "") -> str:
+    """
+    Read this agent's currently active (non-expired) forecast rows, ordered by
+    horizon bucket (intraday → near → far → cycle) then abs(forecast_score).
+    Useful for hour-over-hour continuity — see what you said last hour before
+    forming this hour's view.
+
+    Args:
+        agent_name: Your agent name.
+        horizon: Optional filter — return only this horizon ('intraday',
+                 'near', 'far', 'cycle'). Leave empty for all horizons.
+    """
+    await _ensure_init_light()
+    from db import store
+    h = horizon.strip() or None
+    rows = await store.get_agent_active_forecasts(agent_name, horizon=h)
+    return json.dumps({"forecasts": rows}, default=str)
 
 
 @mcp.tool()
@@ -1657,9 +2275,53 @@ async def rebalance_desk(
     from db import store
     from meta_agent.allocator import (
         ConvictionView, compute_target_weights, diff_to_orders, net_inverse_pairs,
+        classify_inverse_order_gate, apply_safety_brakes,
     )
     from data.massive_client import get_quote as _get_quote
     from ibkr.account import get_account_summary
+    from approval import proposals as _approval_proposals
+
+    # ── Step 1: execute previously-approved trade proposals ───────────────────
+    # Approved early-inverse-ETF entries from earlier runs land here. Placing
+    # them BEFORE the rebalance lets the in-flight reconciliation below fold
+    # them into current_positions so diff_to_orders doesn't re-issue them.
+    # In dry_run we only report; we don't execute.
+    approved_trades_placed: list[dict] = []
+    just_placed_symbols: set[str] = set()
+    if not dry_run:
+        for prop in _approval_proposals.list_by("trade_approval", ("approved",)):
+            pay = prop.get("payload") or {}
+            sym = (pay.get("vehicle") or "").upper()
+            qty = int(pay.get("qty") or 0)
+            if not sym or qty <= 0:
+                continue
+            rationales = "; ".join(
+                f"{(c.get('agent') or '?')}: {(c.get('rationale') or '').strip()}"
+                for c in (pay.get("contributions") or [])
+            )[:200]
+            try:
+                res_json = await place_order(
+                    agent_name="mike",
+                    symbol=sym,
+                    action="BUY",
+                    quantity=float(qty),
+                    order_type="MKT",
+                    reasoning=f"[allocator+approved id={prop['id'][:8]}] {rationales}",
+                )
+                try:
+                    res = json.loads(res_json)
+                except (TypeError, ValueError):
+                    res = {"raw": str(res_json)}
+                _approval_proposals.mark_placed(prop["id"])
+                approved_trades_placed.append({
+                    "id": prop["id"][:8], "symbol": sym, "qty": qty, "result": res,
+                })
+                just_placed_symbols.add(sym)
+            except Exception as e:
+                approved_trades_placed.append({
+                    "id": prop["id"][:8], "symbol": sym, "qty": qty,
+                    "error": f"{type(e).__name__}: {e}",
+                })
 
     # Load views
     rows = await store.get_active_convictions()
@@ -1670,6 +2332,8 @@ async def rebalance_desk(
             expected_return_pct=(float(r["expected_return_pct"]) if r.get("expected_return_pct") is not None else None),
             time_to_target_days=r.get("time_to_target_days"),
             rationale=r.get("rationale"),
+            momentum_confirmed=r.get("momentum_confirmed"),
+            stop_pct=(float(r["stop_pct"]) if r.get("stop_pct") is not None else None),
         )
         for r in rows
     ]
@@ -1799,6 +2463,28 @@ async def rebalance_desk(
         unpriced_val = unpriced_qty * last_px
         cur["market_value"] = held_value + limit_val + unpriced_val
 
+    # Defensive auto-flat brakes. With market_value now populated we can check
+    # each view's stop_pct against the position's unrealized return; any view
+    # that fires its stop is downgraded to flat and we re-run the target-weight
+    # pipeline so its weight drops out cleanly (without re-normalizing the
+    # remaining contributors incorrectly). The first compute above is kept as
+    # the seed used to build needed_symbols + fetch quotes; this re-run is the
+    # authoritative tw passed to diff_to_orders.
+    views_braked, brake_log = apply_safety_brakes(views, current_positions)
+    if brake_log:
+        tw = compute_target_weights(
+            views_braked,
+            influence_weights=influence_weights or {},
+            gross_leverage=gross_leverage,
+            max_per_symbol=max_per_symbol,
+            min_trade_threshold=min_trade_threshold,
+        )
+        netted_weights, netted_contributors, netting_log = net_inverse_pairs(
+            tw.weights, tw.contributors, inverse_map,
+        )
+        tw.weights = netted_weights
+        tw.contributors = netted_contributors
+
     proposed = diff_to_orders(
         tw.weights,
         current_positions,
@@ -1809,14 +2495,22 @@ async def rebalance_desk(
     )
 
     # Per-run notional cap (M6). Stop placing once the cumulative |delta_value|
-    # of remaining orders would exceed risk.max_run_notional. Larger orders
-    # placed first (by abs delta_value) so the highest-conviction trades land
-    # before the cap clamps.
+    # of remaining orders would exceed risk.max_run_notional.
+    #
+    # Order priority: SELLs (closes) first, then BUYs (opens). Within each
+    # group, largest |delta| first. This guarantees that hour-to-hour
+    # reconciliation closes lapsed-conviction positions before consuming
+    # budget on new opens — orphan inverse-ETF decay was the dominant loss
+    # vector in early-May, where the prior "largest first" sort kept burying
+    # close orders behind larger opens.
     risk_cfg = (_cfg or {}).get("risk", {})
     max_run_notional = float(risk_cfg.get("max_run_notional", 0) or 0)
     cap_dropped: list[dict] = []
     if max_run_notional > 0:
-        proposed.sort(key=lambda o: abs(o.delta_value), reverse=True)
+        proposed.sort(key=lambda o: (
+            0 if (o.side or "").upper() == "SELL" else 1,
+            -abs(float(o.delta_value or 0.0)),
+        ))
         kept: list = []
         running = 0.0
         for o in proposed:
@@ -1855,6 +2549,58 @@ async def rebalance_desk(
                 "reason": reason,
             })
     proposed = filtered
+
+    # ── Momentum-confirmed gate: partition orders by approval requirement ─────
+    # BUY on a verified inverse-ETF symbol whose long-inverse contributors did
+    # not ALL self-assert momentum_confirmed=True is queued for human approval
+    # via Telegram instead of placed this run. Reductions and non-inverse
+    # symbols pass through unconditionally. Symbols just placed from a
+    # previously-approved proposal are also dropped to avoid duplicate orders
+    # before IBKR's open_orders view catches up.
+    pending_inverse_approvals: list[dict] = []
+    quote_for_notional = lambda s: float(quotes.get(s) or quotes.get(s.lower()) or 0.0)
+
+    def _build_payload(o, contribs) -> dict:
+        inv_meta = (inverse_map.get("inverses") or {}).get(o.symbol.upper()) or {}
+        last_px = quote_for_notional(o.symbol)
+        return {
+            "decision_id": None,  # filled in below once decision_id exists
+            "vehicle": o.symbol.upper(),
+            "underlying": (inv_meta.get("underlying") or "").upper(),
+            "leverage": float(inv_meta.get("leverage") or 0.0),
+            "qty": int(o.qty),
+            "side": o.side,
+            "est_notional": last_px * float(o.qty),
+            "contributions": [
+                {
+                    "agent": v.agent_name,
+                    "conviction": float(v.conviction),
+                    "rationale": v.rationale or "",
+                    "momentum_confirmed": v.momentum_confirmed,
+                    "expected_return_pct": v.expected_return_pct,
+                    "time_to_target_days": v.time_to_target_days,
+                }
+                for v in (contribs or [])
+            ],
+        }
+
+    auto_orders: list = []
+    for o in proposed:
+        if o.symbol.upper() in just_placed_symbols:
+            # Approved trade just placed at the top of this run; drop to avoid
+            # double-buying before IBKR's open_orders feed catches up.
+            continue
+        decision, contribs = classify_inverse_order_gate(
+            o.symbol, o.side, views, inverse_map,
+        )
+        if decision == "auto":
+            auto_orders.append(o)
+        else:  # "gated"
+            pending_inverse_approvals.append({
+                "order": o,
+                "payload": _build_payload(o, contribs),
+            })
+    proposed = auto_orders
 
     contributing_views_json = {
         sym: [{"agent": a, "weight": w} for (a, w) in tw.contributors.get(sym, [])]
@@ -1899,6 +2645,59 @@ async def rebalance_desk(
         for o in proposed
     ]
 
+    # ── Queue early-inverse-ETF entries as Telegram approval proposals ────────
+    # Stamp decision_id, send the Telegram ping, and record one shared
+    # proposal per gated order. In dry_run we surface the would-be queue but
+    # don't actually send Telegram or write to the proposal store.
+    pending_inverse_approvals_dump: list[dict] = []
+    for entry in pending_inverse_approvals:
+        o = entry["order"]
+        pay = entry["payload"]
+        pay["decision_id"] = decision_id
+        contribs = pay.get("contributions") or []
+        agent_summary = ", ".join(
+            f"{c.get('agent','?')}({float(c.get('conviction') or 0):.2f})"
+            for c in contribs
+        ) or "no-named-contributors"
+        title = (
+            f"Early inverse-ETF entry: {pay['vehicle']} BUY {pay['qty']}"
+            f" (~${pay['est_notional']:,.0f}) — {agent_summary}"
+        )
+        rationale_block = "\n".join(
+            f"- {c.get('agent','?')} (conv {float(c.get('conviction') or 0):.2f}): "
+            f"{(c.get('rationale') or '').strip()}"
+            for c in contribs
+        ) or "(no rationale provided)"
+        details = (
+            f"Vehicle: {pay['vehicle']} ({pay['leverage']:+.1f}x {pay['underlying']})\n"
+            f"BUY qty: {pay['qty']}  Est notional: ${pay['est_notional']:,.0f}\n\n"
+            f"Contributing convictions:\n{rationale_block}"
+        )
+        if not dry_run:
+            try:
+                created = await _approval_proposals.create(
+                    title=title,
+                    details=details,
+                    kind="trade_approval",
+                    payload=pay,
+                )
+                pending_inverse_approvals_dump.append({
+                    "id": created["id"][:8], "vehicle": pay["vehicle"],
+                    "qty": pay["qty"], "est_notional": pay["est_notional"],
+                    "status": created.get("status", "pending"),
+                })
+            except Exception as e:
+                pending_inverse_approvals_dump.append({
+                    "vehicle": pay["vehicle"], "qty": pay["qty"],
+                    "error": f"{type(e).__name__}: {e}",
+                })
+        else:
+            pending_inverse_approvals_dump.append({
+                "would_queue": True, "vehicle": pay["vehicle"],
+                "qty": pay["qty"], "est_notional": pay["est_notional"],
+                "title": title,
+            })
+
     netted_pairs_dump = [
         {
             "underlying": p.underlying, "inverse": p.inverse, "leverage": p.leverage,
@@ -1921,7 +2720,10 @@ async def rebalance_desk(
             "cap_dropped": cap_dropped,
             "min_qty_dropped": min_qty_dropped,
             "pending_user_review": pending_user_review,
+            "approved_trades_placed": approved_trades_placed,
+            "pending_inverse_approvals": pending_inverse_approvals_dump,
             "netted_pairs": netted_pairs_dump,
+            "stop_pct_brakes_fired": brake_log,
         })
 
     # Live mode: place orders. The IBKR daemon's _on_fill callback writes
@@ -1974,7 +2776,10 @@ async def rebalance_desk(
         "cap_dropped": cap_dropped,
         "min_qty_dropped": min_qty_dropped,
         "pending_user_review": pending_user_review,
+        "approved_trades_placed": approved_trades_placed,
+        "pending_inverse_approvals": pending_inverse_approvals_dump,
         "netted_pairs": netted_pairs_dump,
+        "stop_pct_brakes_fired": brake_log,
         "agent_state": agent_state_summary,
     }, default=str)
 

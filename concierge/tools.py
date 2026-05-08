@@ -35,7 +35,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "period": {"type": "string", "enum": ["today", "week", "month"], "default": "today"},
-                "agent_name": {"type": "string", "description": "Optional: filter to one agent (rex/maya/atlas/titan/vera)."},
+                "agent_name": {"type": "string", "description": "Optional: filter to one of the 11 sector agents (atlas, fab, fabless, iron, maya, rex, trump, vera, volt, energy, commodity)."},
             },
         },
     },
@@ -55,7 +55,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "get_agent_list",
-        "description": "List configured agents (rex/maya/atlas/titan/vera/mike/cassidy) with allocation and enabled status.",
+        "description": "List configured agents (11 sector agents — atlas, fab, fabless, iron, maya, rex, trump, vera, volt, energy, commodity — plus mike, cassidy) with allocation and enabled status.",
         "input_schema": {
             "type": "object",
             "properties": {

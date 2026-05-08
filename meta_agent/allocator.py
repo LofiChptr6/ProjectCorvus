@@ -25,6 +25,78 @@ class ConvictionView:
     expected_return_pct: Optional[float] = None
     time_to_target_days: Optional[int] = None
     rationale: Optional[str] = None
+    # For direction='long' on a verified inverse-ETF symbol, the agent's self-
+    # assertion: True ⇒ underlying already showing the bearish move (allocator
+    # auto-places). False / None ⇒ early entry (allocator queues for Telegram
+    # approval). Ignored on non-inverse symbols.
+    momentum_confirmed: Optional[bool] = None
+    # Defensive auto-flat trigger: if the position's unrealized return falls
+    # below -stop_pct, apply_safety_brakes() will downgrade the view to flat.
+    # Per-symbol; agents set this on inverse-ETF longs especially. None ⇒ no stop.
+    stop_pct: Optional[float] = None
+
+
+def apply_safety_brakes(
+    views: Iterable["ConvictionView"],
+    current_positions: dict[str, dict],
+) -> tuple[list["ConvictionView"], list[dict]]:
+    """Downgrade views to flat where defensive triggers fire.
+
+    Currently checks only `stop_pct`: for each view with stop_pct set, look up
+    the symbol's avg_cost and current market_value-implied price in
+    current_positions; if the unrealized return is worse than -stop_pct, the
+    view is replaced with a direction='flat' / conviction=0 row so the
+    allocator closes the position rather than continuing to express it.
+
+    Returns (filtered_views, brake_log). brake_log records each fired trigger
+    so allocator output can attribute the close to the safety brake rather
+    than to the agent voluntarily flatting.
+    """
+    out: list[ConvictionView] = []
+    log: list[dict] = []
+
+    for v in views:
+        sym = (v.symbol or "").upper()
+        stop = v.stop_pct
+        if stop is None or stop <= 0 or v.direction == "flat" or v.conviction <= 0:
+            out.append(v)
+            continue
+
+        cur = current_positions.get(sym) or current_positions.get(sym.lower()) or {}
+        avg_cost = float(cur.get("avg_cost") or 0.0)
+        qty = float(cur.get("position") or 0.0)
+        mkt_val = float(cur.get("market_value") or 0.0)
+        if avg_cost <= 0 or qty <= 0:
+            # No position yet (or shorts not handled here) — nothing to brake.
+            out.append(v)
+            continue
+
+        # Implied current price from market_value / qty. We compute return on
+        # cost basis directly so this works whether market_value was filled in
+        # by quotes or read off positions.
+        cost_basis = avg_cost * qty
+        if cost_basis <= 0:
+            out.append(v)
+            continue
+        unrealized_pct = ((mkt_val - cost_basis) / cost_basis) * 100.0
+
+        if unrealized_pct < -float(stop):
+            log.append({
+                "agent": v.agent_name, "symbol": sym, "direction": v.direction,
+                "stop_pct": float(stop), "unrealized_pct": unrealized_pct,
+                "trigger": "stop_pct",
+            })
+            out.append(ConvictionView(
+                agent_name=v.agent_name, symbol=v.symbol, direction="flat",
+                conviction=0.0, expected_return_pct=None,
+                time_to_target_days=None, rationale=v.rationale,
+                momentum_confirmed=None, stop_pct=v.stop_pct,
+            ))
+            continue
+
+        out.append(v)
+
+    return out, log
 
 
 @dataclass
@@ -258,6 +330,56 @@ def net_inverse_pairs(
     return out_w, out_c, log
 
 
+# ── Inverse-ETF detection + momentum gate ─────────────────────────────────────
+
+def is_inverse_etf_symbol(symbol: str, inverse_map: dict) -> bool:
+    """True iff `symbol` is a verified key under inverses: in
+    agents/inverse_etf_map.yaml. Used by the allocator to decide which BUY
+    orders need to flow through the momentum-confirmed approval gate."""
+    if not symbol:
+        return False
+    inverses = (inverse_map or {}).get("inverses") or {}
+    entry = inverses.get(symbol.upper())
+    return bool(entry and entry.get("verified") is True)
+
+
+def classify_inverse_order_gate(
+    order_symbol: str,
+    order_side: str,
+    views: Iterable[ConvictionView],
+    inverse_map: dict,
+) -> tuple[str, list[ConvictionView]]:
+    """Decide whether a proposed order needs human approval.
+
+    Returns (decision, contributing_views) where decision is one of:
+      - "auto"   — place this run without approval. Used for non-inverse
+                   symbols, SELL orders (closes/reductions), and BUY orders on
+                   inverse ETFs where every agent who took the bearish-via-
+                   inverse position asserted momentum_confirmed=True.
+      - "gated"  — queue for Telegram approval. Triggered when ANY contributing
+                   long-inverse view has momentum_confirmed=False or None, or
+                   when no long-inverse view exists (position arose purely from
+                   netting and we can't audit the bearish call directly).
+
+    contributing_views is the subset of views that took a long position on the
+    order symbol — what the user reads on the Telegram approval prompt."""
+    side = (order_side or "").upper()
+    if side != "BUY" or not is_inverse_etf_symbol(order_symbol, inverse_map):
+        return ("auto", [])
+    sym = order_symbol.upper()
+    contribs = [
+        v for v in views
+        if v.symbol.upper() == sym and v.direction == "long" and v.conviction > 0
+    ]
+    if not contribs:
+        # No agent explicitly went long the inverse — position came purely from
+        # the netting layer or other indirect path. Conservative: gate it.
+        return ("gated", [])
+    if all(v.momentum_confirmed is True for v in contribs):
+        return ("auto", contribs)
+    return ("gated", contribs)
+
+
 # ── Bearish vehicle resolution ────────────────────────────────────────────────
 
 def resolve_bearish_vehicle(
@@ -353,7 +475,13 @@ def diff_to_orders(
         current_value = float(cur.get("market_value", 0.0))
         delta = target_value - current_value
 
-        if abs(delta) / max(nav, 1.0) < min_trade_threshold:
+        # Asymmetric threshold: opens respect min_trade_threshold (commission floor),
+        # but full closes (target=0, current>0) bypass it. Hour-to-hour reconciliation
+        # must be able to flatten sub-threshold orphan positions when no agent is
+        # currently expressing a view; otherwise tiny inverse-ETF leftovers compound
+        # decay losses indefinitely.
+        is_full_close = target_value == 0.0 and current_value > 0.0
+        if not is_full_close and abs(delta) / max(nav, 1.0) < min_trade_threshold:
             continue
 
         last = quotes.get(sym) or quotes.get(sym.lower())

@@ -186,12 +186,66 @@ SCHEMA_STATEMENTS = [
         time_to_target_days   INTEGER,
         rationale             TEXT,
         model_inputs          JSONB,
+        momentum_confirmed    BOOLEAN,
         submitted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         expires_at            TIMESTAMPTZ NOT NULL,
         UNIQUE(agent_name, symbol)
     )""",
+    "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS momentum_confirmed BOOLEAN",
+    # Defensive auto-flat trigger: if the position's unrealized return falls
+    # below -stop_pct, the allocator treats this conviction as flat regardless
+    # of whether the agent re-publishes. Optional; NULL means "no stop." Useful
+    # for inverse-ETF longs where decay compounds against late agent reactions.
+    "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS stop_pct NUMERIC",
     "CREATE INDEX IF NOT EXISTS idx_conv_active ON agent_conviction (expires_at) WHERE conviction > 0",
     "CREATE INDEX IF NOT EXISTS idx_conv_symbol ON agent_conviction (symbol, expires_at)",
+    # Forecast rows — proof-of-work research. Each agent publishes ≥20 rows per
+    # hour from their sector universe regardless of whether they take action.
+    # Allocator does NOT read this table; convictions remain the trade signal.
+    # Each symbol can have up to 4 horizon rows: intraday (≤1d), near (2-5d),
+    # far (6-30d), cycle (31+d). UNIQUE key is (agent_name, symbol, horizon).
+    """CREATE TABLE IF NOT EXISTS agent_forecast (
+        id                    BIGSERIAL PRIMARY KEY,
+        agent_name            TEXT NOT NULL,
+        symbol                TEXT NOT NULL,
+        horizon               TEXT NOT NULL DEFAULT 'intraday',
+        expected_return_pct   NUMERIC NOT NULL,
+        likelihood            NUMERIC NOT NULL,
+        time_to_target_days   INTEGER NOT NULL,
+        forecast_score        NUMERIC NOT NULL,
+        method                TEXT NOT NULL,
+        rationale             TEXT,
+        submitted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at            TIMESTAMPTZ NOT NULL,
+        UNIQUE(agent_name, symbol, horizon)
+    )""",
+    # Backfill horizon column for pre-existing tables created without it.
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS horizon TEXT NOT NULL DEFAULT 'intraday'",
+    # Re-derive horizon from time_to_target_days for any row still at 'intraday'
+    # default that was actually a longer-horizon forecast (one-time backfill;
+    # idempotent — rows already on the correct non-'intraday' horizon are skipped).
+    """UPDATE agent_forecast SET horizon = CASE
+        WHEN time_to_target_days <= 1 THEN 'intraday'
+        WHEN time_to_target_days <= 5 THEN 'near'
+        WHEN time_to_target_days <= 30 THEN 'far'
+        ELSE 'cycle'
+    END WHERE horizon = 'intraday'""",
+    # Drop old per-(agent,symbol) uniqueness; replace with per-(agent,symbol,horizon).
+    "ALTER TABLE agent_forecast DROP CONSTRAINT IF EXISTS agent_forecast_agent_name_symbol_key",
+    """DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'agent_forecast_agent_name_symbol_horizon_key'
+    ) THEN
+        ALTER TABLE agent_forecast
+            ADD CONSTRAINT agent_forecast_agent_name_symbol_horizon_key
+            UNIQUE (agent_name, symbol, horizon);
+    END IF;
+END $$""",
+    "CREATE INDEX IF NOT EXISTS idx_forecast_active ON agent_forecast (agent_name, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_forecast_symbol ON agent_forecast (symbol, expires_at)",
+    "CREATE INDEX IF NOT EXISTS idx_forecast_horizon ON agent_forecast (agent_name, symbol, horizon)",
     # Mike's allocator decisions — one row per rebalance run.
     """CREATE TABLE IF NOT EXISTS allocation_decision (
         id                       BIGSERIAL PRIMARY KEY,

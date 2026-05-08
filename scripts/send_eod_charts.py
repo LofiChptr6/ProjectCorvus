@@ -35,7 +35,8 @@ log = logging.getLogger("send_eod_charts")
 
 SECTORS = (
     "atlas", "fab", "fabless", "iron", "maya",
-    "rex", "titan", "trump", "vera", "volt",
+    "rex", "trump", "vera", "volt",
+    "energy", "commodity",
 )
 
 

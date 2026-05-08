@@ -470,6 +470,31 @@ async def get_open_theses(agent_name: str, limit: int = 10) -> list[dict]:
         return [dict(r) for r in rows]
 
 
+async def get_recent_theses(
+    agent_name: str,
+    hours: int = 24,
+    kinds: tuple[str, ...] = ("thesis", "observation"),
+    limit: int = 8,
+) -> list[dict]:
+    """Most-recent agent_thesis rows for the day. Used by the evening slide
+    composer to auto-aggregate fundamental thesis bullets at the top of the
+    page. Filters by `kinds` (default excludes 'prediction' since those
+    feed the open-questions panel, not the macro-thesis panel)."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, created_at, kind, title, body, status
+               FROM agent_thesis
+               WHERE agent_name=$1
+                 AND created_at >= NOW() - ($2 || ' hours')::interval
+                 AND kind = ANY($3::text[])
+               ORDER BY created_at DESC
+               LIMIT $4""",
+            agent_name, str(int(hours)), list(kinds), int(limit),
+        )
+        return [dict(r) for r in rows]
+
+
 async def get_theses_due(agent_name: str, on_or_before: str) -> list[dict]:
     on_or_before_dt = date.fromisoformat(on_or_before) if isinstance(on_or_before, str) else on_or_before
     pool = await get_pool()
@@ -827,10 +852,30 @@ async def upsert_conviction(
     time_to_target_days: Optional[int] = None,
     rationale: Optional[str] = None,
     model_inputs: Optional[dict] = None,
-    expires_in_hours: int = 4,
+    expires_in_hours: int = 1,
+    momentum_confirmed: Optional[bool] = None,
+    stop_pct: Optional[float] = None,
 ) -> int:
     """Upsert one conviction row keyed on (agent_name, symbol). Most recent wins.
-    direction='flat' with conviction=0 is the canonical 'I have no view' submission."""
+    direction='flat' with conviction=0 is the canonical 'I have no view' submission.
+
+    Default TTL is 1 hour: hour-to-hour reconciliation. If the agent doesn't
+    re-publish in the next review cycle, the conviction expires and the
+    allocator closes the position. Agents wanting multi-session holds (overnight,
+    weekend) must override with a larger expires_in_hours (e.g., 18 for overnight,
+    72 for weekend). The market_hours risk check blocks SELLs outside RTH so
+    premature off-hours expirations don't execute as actual trades.
+
+    momentum_confirmed: agent's self-assertion for inverse-ETF buys. True ⇒ the
+    underlying is already trending bearish (allocator auto-places). False ⇒ early
+    entry ahead of confirmation (allocator queues for Telegram approval). None
+    otherwise.
+
+    stop_pct: optional defensive auto-flat trigger. If the position's unrealized
+    return on this symbol falls below -stop_pct (e.g., 8 ⇒ -8%), the allocator
+    treats this conviction as flat regardless of whether the agent re-publishes.
+    Recommended for inverse-ETF longs (where decay compounds): 8% on 1× inverses,
+    4% on ≥2× inverses. NULL ⇒ no stop."""
     if direction not in _VALID_CONVICTION_DIRECTIONS:
         raise ValueError(f"direction must be one of {_VALID_CONVICTION_DIRECTIONS}, got {direction!r}")
     if conviction < 0:
@@ -843,9 +888,11 @@ async def upsert_conviction(
             """INSERT INTO agent_conviction
                  (agent_name, symbol, direction, conviction,
                   expected_return_pct, time_to_target_days,
-                  rationale, model_inputs, expires_at)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,
-                       NOW() + ($9 || ' hours')::interval)
+                  rationale, model_inputs, momentum_confirmed, expires_at,
+                  stop_pct)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,
+                       NOW() + ($10 || ' hours')::interval,
+                       $11)
                ON CONFLICT (agent_name, symbol) DO UPDATE SET
                  direction           = EXCLUDED.direction,
                  conviction          = EXCLUDED.conviction,
@@ -853,13 +900,17 @@ async def upsert_conviction(
                  time_to_target_days = EXCLUDED.time_to_target_days,
                  rationale           = EXCLUDED.rationale,
                  model_inputs        = EXCLUDED.model_inputs,
+                 momentum_confirmed  = EXCLUDED.momentum_confirmed,
+                 stop_pct            = EXCLUDED.stop_pct,
                  submitted_at        = NOW(),
-                 expires_at          = NOW() + ($9 || ' hours')::interval
+                 expires_at          = NOW() + ($10 || ' hours')::interval
                RETURNING id""",
             agent_name, symbol.upper(), direction, conviction,
             expected_return_pct, time_to_target_days, rationale,
             json.dumps(model_inputs) if model_inputs is not None else None,
+            momentum_confirmed,
             str(expires_in_hours),
+            stop_pct,
         )
         return int(row["id"])
 
@@ -885,7 +936,8 @@ async def get_agent_active_convictions(agent_name: str) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT id, symbol, direction, conviction, expected_return_pct,
-                      time_to_target_days, rationale, submitted_at, expires_at
+                      time_to_target_days, rationale, momentum_confirmed,
+                      stop_pct, submitted_at, expires_at
                FROM agent_conviction
                WHERE agent_name=$1 AND expires_at > NOW() AND conviction > 0
                ORDER BY conviction DESC""",
@@ -902,10 +954,188 @@ async def get_active_convictions() -> list[dict]:
         rows = await conn.fetch(
             """SELECT id, agent_name, symbol, direction, conviction,
                       expected_return_pct, time_to_target_days, rationale,
-                      submitted_at, expires_at
+                      momentum_confirmed, stop_pct, submitted_at, expires_at
                FROM agent_conviction
                WHERE expires_at > NOW() AND conviction > 0
                ORDER BY symbol, conviction DESC"""
+        )
+        return [dict(r) for r in rows]
+
+
+# ── Agent forecasts (proof-of-work research) ─────────────────────────────────
+
+def _derive_horizon(time_to_target_days: int) -> str:
+    """Map time_to_target_days to one of the four canonical horizon buckets.
+    Agents may also supply an explicit horizon in their forecast row to override
+    this derivation."""
+    if time_to_target_days <= 1:
+        return "intraday"
+    if time_to_target_days <= 5:
+        return "near"
+    if time_to_target_days <= 30:
+        return "far"
+    return "cycle"
+
+
+async def upsert_forecasts_batch(
+    agent_name: str,
+    rows: list[dict],
+    expires_in_hours: int = 2,
+) -> dict:
+    """Bulk-upsert forecasts per (agent_name, symbol, horizon). Each row dict
+    carries `symbol`, `expected_return_pct`, `likelihood`, `time_to_target_days`,
+    `method`, and optional `rationale` and `horizon`. `forecast_score` is
+    computed server-side as expected_return_pct * likelihood / time_to_target_days.
+
+    Multi-horizon: the same symbol may appear up to 4 times with different
+    `time_to_target_days` (≤1d → 'intraday', 2-5d → 'near', 6-30d → 'far',
+    31+d → 'cycle'). Each (agent, symbol, horizon) triple is an independent row.
+    Pass `horizon` explicitly to override the auto-derived bucket.
+
+    Default expires_in_hours is 2 — intraday forecasts should be refreshed
+    every hourly review cycle; longer-horizon rows auto-expire if not re-submitted.
+
+    Returns {inserted, errors[]}. Per-row failures (validation, type errors)
+    are collected and returned alongside the success count rather than aborting
+    the whole batch — partial inserts are fine since each upsert is atomic."""
+    if not rows:
+        return {"inserted": 0, "errors": []}
+
+    prepared: list[tuple] = []
+    errors: list[dict] = []
+    for r in rows:
+        try:
+            sym = str(r["symbol"]).upper()
+            er = float(r["expected_return_pct"])
+            lk = float(r["likelihood"])
+            ttd = int(r["time_to_target_days"])
+            method = str(r.get("method") or "").strip()
+            rationale = r.get("rationale")
+            if not (0.0 <= lk <= 1.0):
+                raise ValueError(f"likelihood must be in [0,1], got {lk}")
+            if ttd <= 0:
+                raise ValueError(f"time_to_target_days must be > 0, got {ttd}")
+            if not method:
+                raise ValueError("method is required (free-text describing source)")
+            score = (er * lk) / ttd
+            horizon = str(r.get("horizon") or _derive_horizon(ttd))
+            if horizon not in {"intraday", "near", "far", "cycle"}:
+                raise ValueError(f"horizon must be one of intraday/near/far/cycle, got {horizon!r}")
+            prepared.append((agent_name, sym, horizon, er, lk, ttd, score, method, rationale))
+        except (KeyError, ValueError, TypeError) as exc:
+            errors.append({"row": r, "error": f"{type(exc).__name__}: {exc}"})
+
+    if not prepared:
+        return {"inserted": 0, "errors": errors}
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.executemany(
+                """INSERT INTO agent_forecast
+                     (agent_name, symbol, horizon, expected_return_pct, likelihood,
+                      time_to_target_days, forecast_score, method, rationale,
+                      expires_at)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
+                           NOW() + ($10 || ' hours')::interval)
+                   ON CONFLICT (agent_name, symbol, horizon) DO UPDATE SET
+                     expected_return_pct = EXCLUDED.expected_return_pct,
+                     likelihood          = EXCLUDED.likelihood,
+                     time_to_target_days = EXCLUDED.time_to_target_days,
+                     forecast_score      = EXCLUDED.forecast_score,
+                     method              = EXCLUDED.method,
+                     rationale           = EXCLUDED.rationale,
+                     submitted_at        = NOW(),
+                     expires_at          = NOW() + ($10 || ' hours')::interval""",
+                [(*t, str(expires_in_hours)) for t in prepared],
+            )
+    return {"inserted": len(prepared), "errors": errors}
+
+
+async def clear_agent_forecasts(agent_name: str, horizon: str | None = None) -> int:
+    """Delete forecast rows for this agent. Called at start of every
+    hourly review so the new batch fully replaces the prior hour's slate.
+
+    Args:
+        agent_name: The agent whose forecasts to clear.
+        horizon: Optional — clear only this horizon ('intraday', 'near', 'far',
+                 'cycle'). If None (default), clears all horizons. Useful when
+                 an agent refreshes only their intraday forecasts each hour but
+                 wants to preserve weekly cycle forecasts.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if horizon:
+            result = await conn.execute(
+                "DELETE FROM agent_forecast WHERE agent_name=$1 AND horizon=$2",
+                agent_name, horizon,
+            )
+        else:
+            result = await conn.execute(
+                "DELETE FROM agent_forecast WHERE agent_name=$1",
+                agent_name,
+            )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
+
+async def get_agent_active_forecasts(agent_name: str, horizon: str | None = None) -> list[dict]:
+    """Active (non-expired) forecast rows for one agent, sorted by
+    horizon bucket then abs(forecast_score) descending.
+
+    Args:
+        agent_name: The agent to query.
+        horizon: Optional filter — return only this horizon slice.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if horizon:
+            rows = await conn.fetch(
+                """SELECT id, symbol, horizon, expected_return_pct, likelihood,
+                          time_to_target_days, forecast_score, method, rationale,
+                          submitted_at, expires_at
+                   FROM agent_forecast
+                   WHERE agent_name=$1 AND horizon=$2 AND expires_at > NOW()
+                   ORDER BY abs(forecast_score) DESC""",
+                agent_name, horizon,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT id, symbol, horizon, expected_return_pct, likelihood,
+                          time_to_target_days, forecast_score, method, rationale,
+                          submitted_at, expires_at
+                   FROM agent_forecast
+                   WHERE agent_name=$1 AND expires_at > NOW()
+                   ORDER BY
+                       CASE horizon WHEN 'intraday' THEN 0
+                                    WHEN 'near'     THEN 1
+                                    WHEN 'far'      THEN 2
+                                    ELSE                 3 END,
+                       abs(forecast_score) DESC""",
+                agent_name,
+            )
+        return [dict(r) for r in rows]
+
+
+async def get_active_forecasts() -> list[dict]:
+    """All non-expired forecast rows across all agents, grouped by symbol then
+    horizon bucket."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, agent_name, symbol, horizon, expected_return_pct,
+                      likelihood, time_to_target_days, forecast_score,
+                      method, rationale, submitted_at, expires_at
+               FROM agent_forecast
+               WHERE expires_at > NOW()
+               ORDER BY symbol,
+                   CASE horizon WHEN 'intraday' THEN 0
+                                WHEN 'near'     THEN 1
+                                WHEN 'far'      THEN 2
+                                ELSE                 3 END,
+                   abs(forecast_score) DESC"""
         )
         return [dict(r) for r in rows]
 

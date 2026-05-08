@@ -35,6 +35,7 @@ Sector reviews are **read-only** on the board. Posting (daily/weekly reports, ne
 
 
 
+- `read_my_workspace(agent_name="iron")` — **NEW**: read your notes/, watchlist.md, and data/ folder. Anything in there is context for this hour. The user may have dropped a name into watchlist; research every active entry.
 - `get_agent_context("iron")` — your context (allocation_usd is informational only now)
 - `get_balances()` — desk-wide NAV
 - `get_positions()` — desk-wide current positions (what Mike actually holds)
@@ -57,7 +58,21 @@ For each symbol:
 - `get_bars(symbol, "5 mins", "1 D")` and `get_bars(symbol, "1 day", "60 D")` — intraday + multi-week structure
 - `compute_technicals(symbol, indicators=["SMA_20","SMA_50","SMA_200","RSI_14","VWAP","ATR_14","BBANDS_20"])` — full technical snapshot for trend / momentum / volatility / band-touch detection
 - `get_news(symbol)` if price moved >3% on the day or >5% on the week — confirm catalyst
-- `compute_custom_indicator(model="cycle_momentum", symbol=...)` — your bootstrap quant signal as a starting point (override with judgment)
+- `compute_all_models(agent_name="iron", symbol=...)` — auto-discovers and runs every model in `agents/iron/models/`. Returns top-level `error_count`, `errored_models`, `flat_count`, plus per-model `{version, result, error}` dict.
+
+## STEP 2.5 — Quant sanity check & triage (MANDATORY before STEP 3)
+
+Apply `[DESK POLICY: QUANT ENGAGEMENT DOCTRINE]` (in your system prompt) to every `compute_all_models` response:
+  1. **error_count >= 1** — STOP. Apply `[DESK POLICY: BROKEN MODEL DECISION RULE]`. Fix-now-or-escalate, NEVER silently skip.
+  2. **flat_count == len(models)** on this symbol — name what's wrong with this read or the models before quoting them in a conviction.
+  3. **Sweep flatness** — if ≥70% of symbols you call return all-flat, that's a broken portfolio. Cite the count and act.
+  4. **Sign / magnitude / dispersion** — sanity-check each model's direction vs technicals, |expected_return_pct| vs ATR, and cross-model correlation.
+
+**Inline fix path (default):** error_count >= 1 AND fix is <30 lines AND you can describe the bug in one sentence → Read the file, Edit, bump MODEL_VERSION, re-run on one symbol, continue review with the model back online. The 30-line ceiling covers virtually all TypeError/KeyError/IndexError/NameError/ImportError/ZeroDivisionError cases. Most are 1-3 lines.
+
+**Defer-to-tune path (rare):** look-ahead leakage, NaN propagation, schema rethink, new external dependency. THEN: `record_thesis(agent_name="iron", kind="observation", title="model:<filename>:<bug-class>", body="<diagnosis + why deferred>")` + `raise_tool_gap(...)` if root cause is missing tooling. Then in STEP 3, every conviction rationale on a name where the broken model would have spoken MUST say "<model> disabled this run; reasoning from technicals + fundamentals only."
+
+**Forbidden:** publishing convictions while a model is broken without naming it in the rationale. Cassidy reads evening slides for compliance.
 
 ## STEP 3 — ULTRATHINK per symbol (multi-framework)
 
@@ -71,9 +86,9 @@ For EACH symbol in your universe, **think in all three frameworks before decidin
 
 **Don't miss the obvious.** Specifically scan for:
 - **Buy-the-dip / oversold bounce**: RSI<30 + price below lower BBAND + sector still in uptrend → high-conviction long even if you weren't watching the name.
-- **Sell-the-rip / overbought exhaustion**: RSI>70 + price above upper BBAND + bearish divergence → express via long-on-inverse (see Bearish handling below).
-- **Mean reversion vs breakdown**: distinguish "first-touch oversold in an uptrend" (buy) from "RSI<30 in a confirmed downtrend" (don't catch the falling knife — long-on-inverse or stand aside).
-- **Inverse ETF opportunity**: if the whole sector looks toppy, go long the sector inverse (SOXS/SQQQ/etc.) directly with the appropriate leverage-adjusted conviction.
+- **Fade-the-rip requires fundamentals**: RSI>70 + price above upper BBAND is a SETUP, not a thesis. Inverse-ETF entry requires (a) a named business / macro mechanic + (b) a named dated catalyst + (c) technical confirmation — see [FUNDAMENTAL THESIS REQUIRED] in your system prompt. Pure "overbought" is rejected: the desk burned ~$490 on this pattern in early May 2026.
+- **Mean reversion vs breakdown**: "first-touch oversold in an uptrend" (buy with named business support) vs "RSI<30 in a confirmed downtrend" (don't catch the falling knife). On the bearish side, "looks toppy" is not a thesis — name the catalyst that breaks the trend or stand aside (paper-trail via direction='flat').
+- **Inverse-ETF sector view**: warranted only when you have a fundamental / macro case against the sector AND a dated catalyst (Fed event, earnings cluster, regulatory ruling). Sized for leverage and capped by the [EXIT RULE] in your system prompt (≥3 sessions against you and catalyst not fired → flat).
 
 Then for EACH symbol, decide:
 
@@ -121,6 +136,47 @@ Sizing: only positive (`direction='long'`) cash convictions are accepted — no 
 **Cross-desk awareness.** Glancing at other agents' active views via `get_consolidated_view` is **mike-only** — you can't peek. That's by design: think independently, then let Mike aggregate.
 
 **Standing flat is valid.** If a name has no edge today, either submit `direction="flat", conviction=0` (explicitly says "no view") or simply omit it. Mike treats both the same way. But "I didn't look hard" is NOT a valid reason to be flat — sweep all three frameworks first.
+
+## STEP 3.5 — Publish forecasts (≥20 names, multi-horizon) — proof-of-work
+
+Forecasts are separate from convictions. Publish ≥20 distinct symbols per hour.
+For high-conviction names submit up to 4 rows with different `time_to_target_days`
+— each row lands in a separate horizon bucket (intraday ≤1d, near 2-5d, far
+6-30d, cycle 31+d). Allocator reads convictions; forecasts are your visible
+thinking and calibration record.
+
+```
+# Refresh intraday every hour; far/cycle rows persist until replaced.
+clear_my_forecasts(agent_name="iron", horizon="intraday")
+
+submit_forecast_batch(
+    agent_name="iron",
+    forecasts=[
+        # High-conviction name — all 4 horizons (same symbol, 4 rows):
+        {"symbol": "<TICKER>", "expected_return_pct": <intraday %>, "likelihood": <0..1>,
+          "time_to_target_days": 1,  "method": "<intraday catalyst / momentum driver>"},
+        {"symbol": "<TICKER>", "expected_return_pct": <near %>,     "likelihood": <0..1>,
+          "time_to_target_days": 4,  "method": "<catalyst in next 1-5 days>"},
+        {"symbol": "<TICKER>", "expected_return_pct": <far %>,      "likelihood": <0..1>,
+          "time_to_target_days": 20, "method": "<sector cycle / multi-week setup>"},
+        {"symbol": "<TICKER>", "expected_return_pct": <cycle %>,    "likelihood": <0..1>,
+          "time_to_target_days": 90, "method": "<secular thesis / capex cycle>"},
+        # Lower-priority names — at minimum the intraday row:
+        {"symbol": "<TICKER2>", "expected_return_pct": <pct>, "likelihood": <0..1>,
+          "time_to_target_days": 1, "method": "<source>",
+          "rationale": "<optional one-liner>"},
+        ... ≥20 distinct symbols, intraday row for each ...
+    ],
+)
+```
+
+Conviction sizing from multi-horizon signals:
+  All 4 horizons bullish + sector cohort confirms → upper-quartile conviction
+  3 of 4 bullish, cycle neutral           → normal conviction
+  Horizon conflict (intraday ↑, far ↓)   → no conviction or small intraday-only
+Forecasts auto-expire after 2 hours. Score = return × likelihood / ttd, server-side.
+
+Convictions in STEP 4 are independent — submit only the names you'd put money on.
 
 ## STEP 4 — Publish
 

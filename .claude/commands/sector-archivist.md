@@ -38,7 +38,7 @@ For each agent, the chapter covers `[last_period_end+1, before]` (or `[earliest_
 
 ## STEP 3 — Per-agent loop
 
-The 10 sector agents: `atlas, fab, fabless, rex, maya, titan, vera, trump, iron, volt`.
+The 11 sector agents: `atlas, fab, fabless, rex, maya, vera, trump, iron, volt, energy, commodity`.
 
 For each `agent_name`:
 

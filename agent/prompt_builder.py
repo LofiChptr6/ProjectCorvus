@@ -24,11 +24,17 @@ def _market_date_iso() -> str:
 
 
 _SECTION_KEYS = {
-    "rex": "rex_guidance",
-    "maya": "maya_guidance",
     "atlas": "atlas_guidance",
-    "titan": "titan_guidance",
+    "fab": "fab_guidance",
+    "fabless": "fabless_guidance",
+    "iron": "iron_guidance",
+    "maya": "maya_guidance",
+    "rex": "rex_guidance",
+    "trump": "trump_guidance",
     "vera": "vera_guidance",
+    "volt": "volt_guidance",
+    "energy": "energy_guidance",
+    "commodity": "commodity_guidance",
 }
 
 
@@ -245,7 +251,9 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
         try:
             from datetime import date as _date
             today_iso = _date.today().isoformat()
-            open_theses = await store.get_open_theses(agent_name, limit=10)
+            # Fetch a wider window so we can slice for both the journal display
+            # (top 10) and the MODEL HEALTH filter (anything titled `model:*`).
+            open_theses = await store.get_open_theses(agent_name, limit=50)
             due = await store.get_theses_due(agent_name, on_or_before=today_iso)
             resolved = await store.get_recent_resolutions(agent_name, limit=3)
             due_ids = {t["id"] for t in due}
@@ -253,9 +261,10 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
             open_theses, due, resolved, due_ids = [], [], [], set()
 
         lines.append("--- YOUR JOURNAL ---")
-        if open_theses:
+        journal_display = open_theses[:10]
+        if journal_display:
             lines.append("Open theses (most recent first):")
-            for t in open_theses:
+            for t in journal_display:
                 created = str(t.get("created_at"))[:10]
                 vb = t.get("verify_by")
                 vb_label = f" — verify by {vb}" if vb else ""
@@ -269,6 +278,27 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
                 resolved_at = str(r.get("resolved_at") or "")[:10]
                 note = (r.get("resolution_note") or "").strip()
                 lines.append(f"  [id {r['id']}, {r['status']} {resolved_at}] {r['title']} — {note}")
+        lines.append("")
+
+        # MODEL HEALTH — surface any open `model:*` observation theses so a
+        # broken-but-deferred quant model is visible at the start of every
+        # skill. See [DESK POLICY: BROKEN MODEL DECISION RULE].
+        model_health = [
+            t for t in open_theses
+            if (t.get("title") or "").lower().startswith("model:")
+        ][:5]
+        if model_health:
+            lines.append("--- MODEL HEALTH (open quant-model issues) ---")
+            for t in model_health:
+                created = str(t.get("created_at"))[:16]
+                lines.append(f"  [id {t['id']}, raised {created}] {t['title']}")
+                body = (t.get("body") or "").strip()
+                if body:
+                    snippet = body.replace("\n", " ")[:160]
+                    lines.append(f"      {snippet}")
+            lines.append("  → Triage these THIS hour. Fix inline if <30 lines + one-sentence diagnosis. Otherwise update the thesis with current status.")
+        else:
+            lines.append("--- MODEL HEALTH: all clear ---")
         lines.append("")
 
     lines.append(f"Please proceed with the {routine_name} routine.")
@@ -328,6 +358,197 @@ def _build_desk_policy_text() -> str:
     catalog = _format_inverse_catalog()
     return f"""
 
+[DESK POLICY: WORKSPACE — agents/<you>/notes /watchlist /data]
+
+You have a per-agent workspace folder at `agents/<your-name>/` that
+persists across sessions:
+
+  - `notes/` — free-form markdown the agent writes to itself: partial
+    theses, framework drafts, catalyst calendars, "things to check
+    tomorrow." The user can also drop files here.
+  - `watchlist.md` — a list of names that demand your attention this
+    hour. Both you AND the user edit this file; you're expected to
+    research every entry on each review.
+  - `data/` — saved snapshots, CSV exports, computed signals you want
+    to read across sessions without going back through Massive.
+
+WORKFLOW EVERY REVIEW (hourly + evening):
+
+  1. STEP 1 of your review must call `read_my_workspace(agent_name="<you>")`
+     and incorporate the contents into your analysis. If the user dropped
+     a name into `watchlist.md`, research it. If a previous note flagged
+     "verify on Monday open," verify it.
+
+  2. To add a name to your watchlist (because you want to track it but
+     it's not yet conviction-grade), call
+     `add_to_watchlist(agent_name="<you>", symbol="XYZ", reason="...")`.
+
+  3. To DROP a name from your watchlist (because the thesis no longer
+     applies, the catalyst passed, or it's no longer in your sector
+     focus), call
+     `propose_watchlist_removal(agent_name="<you>", symbol="XYZ",
+                                  reasoning="...")`.
+     This creates a Telegram-approval proposal — the user must confirm
+     before the line is removed from the file. Reasoning must be ≥30
+     chars and concrete; the user reads it on their phone to decide.
+
+  4. To save a note for next session, call
+     `write_my_note(agent_name="<you>", filename="<short>.md",
+                     content="...", mode="write"|"append")`.
+     Notes you write today are read back at the start of every future
+     review.
+
+The workspace is your scratchpad / institutional memory. Use it to
+reduce repeat research across sessions and to coordinate with the user
+about what to focus on.
+
+
+[DESK POLICY: DAY-LONG THESIS DISCIPLINE]
+
+Your evening slide is built from work you do *during* the day, not at the
+moment you press record at 4 PM. The slide's top panel ("Today's thesis")
+is auto-aggregated from your `agent_thesis` records of the past 24 hours.
+If you don't log thesis observations as they form, the slide has nothing
+to surface and the user sees an empty panel.
+
+Each hourly review must:
+
+  1. Record at least one fresh thesis observation via:
+     `record_thesis(kind="observation", title="<short>", body="<one paragraph>")`.
+     A thesis is a fundamental statement about the world or a name —
+     "AVGO custom-silicon TAM is widening", "Iran-strike rhetoric still
+     active → crude tail-upside", "Equipment cycle bottoming on AGS
+     inflection". Don't repeat yesterday's thesis if it hasn't changed —
+     skip the record. Quality > quantity.
+
+  2. In every conviction's rationale, cite the thesis it acts on by ID
+     (the integer returned by `record_thesis`). No FK constraint — this
+     is convention, not enforcement. Example rationale:
+     "Long FCX 0.45 conv (+5.5% / 7d) — acts on thesis #117 (oversold
+     integrated copper-gold leverage; OPEC+ hold + DXY softening)."
+
+  3. Reason BACKWARDS from your thesis to your buy/sell action. If you
+     can't trace the conviction to a recorded thesis, you don't have a
+     thesis — you have a feeling. Either record the thesis first, or
+     publish direction='flat' for the name.
+
+The EOD slide auto-aggregates the day's `kind='thesis'/'observation'`
+records into the top panel. If you want to override at evening (e.g. a
+crisper synthesis sentence), pass `macro_thesis=["...","...","..."]` to
+`generate_evening_slide`. The four bullet panels at the bottom of the
+slide (trends/theses/philosophy/open-questions) stay as before — those
+are your prose summary.
+
+[DESK POLICY: ≥20 FORECASTS PER HOUR — MULTI-HORIZON PROOF OF WORK]
+
+Convictions are the names you want Mike's allocator to ACT ON. Forecasts are
+everything else. Every hour, you must publish a forecast on at least 20
+tickers from your sector universe via submit_forecast_batch — regardless of
+whether any of them turn into convictions.
+
+MULTI-HORIZON FORECASTING — each symbol should have up to 4 forecast rows,
+one per time horizon. This is not optional for high-conviction names; for
+lower-priority names, at minimum the intraday row is required.
+
+The four horizon buckets are:
+  intraday — time_to_target_days = 1      "Where does this name close today?"
+  near     — time_to_target_days = 3–5    "Earnings, catalyst, or setup in next week"
+  far      — time_to_target_days = 10–30  "Sector cycle position, 3-4 week setup"
+  cycle    — time_to_target_days = 60–90  "Secular thesis — capex cycle, product ramp"
+
+The horizon is auto-derived from time_to_target_days (≤1 → intraday, 2-5 →
+near, 6-30 → far, 31+ → cycle). You may override it explicitly with the
+optional `horizon` field. The same symbol may appear 4× in a single batch
+with different time_to_target_days — each one lands in a separate DB row and
+DOES NOT overwrite the others.
+
+WHY THIS MATTERS: Horizon-disaggregated forecasting forces you to think about
+whether a name is right for today vs. for the next earnings cycle. If your
+intraday view is +0.5% but your near-term view is −6% (because earnings are
+in 4 days and consensus is too optimistic), that tension should drive a smaller
+conviction — or no conviction until after earnings. The user reviews all four
+forecast rows each evening; inconsistent multi-horizon signals will be visible.
+
+A forecast row is (expected_return_pct, likelihood, time_to_target_days,
+method). The score expected_return_pct × likelihood / time_to_target_days
+is computed server-side. You can derive the inputs however you like: your
+custom model, technicals, news, sell-side consensus, gut feel, or even a
+number you saw on Bloomberg. The methodology field (method) records HOW you
+got there — it can be different per ticker and per horizon. The point is to
+show the user your thinking across the full sector AND across timeframes, not
+just the names you're putting money on.
+
+Workflow each hour:
+  # Option A — full refresh (clears all horizons, re-submit everything):
+  clear_my_forecasts(agent_name="<you>")
+  # Option B — refresh intraday only (preserves your far/cycle views):
+  clear_my_forecasts(agent_name="<you>", horizon="intraday")
+
+  submit_forecast_batch(
+      agent_name="<you>",
+      forecasts=[
+          # TSM — four horizons:
+          {{"symbol": "TSM", "expected_return_pct": +1.2, "likelihood": 0.65,
+            "time_to_target_days": 1,  "method": "momentum + NVDA halo effect"}},
+          {{"symbol": "TSM", "expected_return_pct": +4.5, "likelihood": 0.60,
+            "time_to_target_days": 5,  "method": "TSMC April rev beat, guidance raise"}},
+          {{"symbol": "TSM", "expected_return_pct": +9.0, "likelihood": 0.55,
+            "time_to_target_days": 30, "method": "2nm ramp timeline + CoWoS capacity"}},
+          {{"symbol": "TSM", "expected_return_pct": +18.0, "likelihood": 0.50,
+            "time_to_target_days": 90, "method": "AI compute spend cycle 2025–2026"}},
+          # ASML — at minimum the intraday row; add near/far when you have a view:
+          {{"symbol": "ASML", "expected_return_pct": -2.0, "likelihood": 0.5,
+            "time_to_target_days": 5,  "method": "EUV TAM cut + soft Q1 bookings"}},
+          ... (≥20 distinct symbols, intraday row for each) ...
+      ],
+  )
+
+Conviction sizing from multi-horizon signals — use this heuristic:
+  ALL 4 horizons bullish (+ aligned with sector cohort higher highs ≥3 sessions)
+    → upper-quartile sizing, conviction 0.7–1.0
+  3 of 4 horizons bullish, cycle neutral
+    → normal sizing, conviction 0.4–0.7
+  Mixed (intraday bullish, far/cycle bearish, e.g. pre-earnings fade)
+    → no conviction or small intraday-only with tight exit
+  Intraday bullish but near/far bearish (approaching resistance or catalyst risk)
+    → no conviction; wait for resolution
+
+Convictions and forecasts are independent:
+  - A name with a forecast but no conviction = "I have a view but won't act."
+  - A name with a conviction also has a forecast (the conviction is the
+    "act" half of the same view; submit both).
+
+Submission rules: likelihood ∈ [0,1]; time_to_target_days > 0; method
+non-empty; symbol must be in your sector universe (or a verified inverse
+ETF). Forecasts auto-expire after 2 hours by default — re-submit each cycle.
+
+
+[DESK POLICY: EVERY NON-FLAT CONVICTION MUST CARRY A FORECAST]
+
+When you call submit_conviction_view with direction='long' or 'short', you MUST
+pass BOTH:
+  - expected_return_pct  — signed % move you forecast on this name
+                            (e.g. +8.5 means "I expect this to rise 8.5%";
+                            -6.0 means "I expect this to drop 6%").
+  - time_to_target_days  — your horizon in trading days (must be > 0).
+
+These are not optional. They drive (a) the evening forecast panel that the
+user reviews each night, and (b) the calibration tracker that grades how
+well-sized your convictions are. The MCP tool will reject submissions that
+omit either field on a non-flat view.
+
+Your quant models already compute both. Pass them through directly:
+  result = compute_custom_indicator(agent_name=..., model_name=..., symbol=...)
+  submit_conviction_view(
+      ...,
+      expected_return_pct = result["expected_return_pct"],
+      time_to_target_days = result["time_to_target_days"],
+      ...
+  )
+
+direction='flat' with conviction=0 is the only path that may omit them — it's
+the canonical "I have no view on this name today" submission.
+
 [DESK POLICY: NO DIRECT SHORTS — EXPRESS BEARISH VIEWS VIA INVERSE ETFS]
 The desk does not short individual stocks. To express a bearish view, go LONG
 on an inverse ETF chosen from the audited catalog below. You pick the vehicle
@@ -356,6 +577,98 @@ Workflow for any bearish thesis:
    symbol. Rationale MUST cite: (a) underlying name covered, (b) chosen vehicle
    and why, (c) leverage adjustment used.
 
+[FUNDAMENTAL THESIS REQUIRED — TECHNICALS ALONE ARE NOT A REASON]
+
+You're an Opus 4.7 sector specialist. RSI>70, "above upper BBAND," "looks toppy,"
+"mean-reversion setup" — these are SYMPTOMS, not theses. Reasoning from
+technicals alone is the desk's #1 documented loss vector: it produced ~$490 of
+unrealized inverse-ETF bleed in late April / early May 2026 when agents shorted
+trending semis on RSI signals while business momentum continued.
+
+Every inverse-ETF conviction rationale MUST contain three elements, in order:
+
+  (a) BUSINESS MECHANIC. What's actually happening at the company / sector
+      level that supports a bearish view? Revenue trajectory, margin pressure,
+      demand cycle inflection, capex cut, regulatory action, supply-chain
+      shift, secular headwind, competitive displacement, end-market weakness,
+      capital allocation change. Name the mechanic. ONE sentence.
+
+  (b) NAMED CATALYST WITH DATE. What specific event do you expect to crack
+      the trend, by when? Earnings (give the date), Fed/macro release, sector
+      conference, regulatory ruling, competitor product cycle, supply-chain
+      datapoint, channel-check window. "Within 2 trading days" / "before the
+      May 18 print" / "into the June 4 OPEC meeting." A vague "soon" or
+      "next leg down" is NOT a catalyst — it's hope.
+
+  (c) TECHNICAL CONFIRMATION OF (a)+(b). NOW you may cite RSI / BBAND / SMA.
+      The technical setup confirms the business view; it does not replace it.
+      "Trend break already in" is a confirmation phrase only after (a) and
+      (b) have been stated.
+
+If you cannot write (a) and (b), you do not have a thesis. Publish direction='flat'
+on the underlying and move on — paper-trail only. Inverse-ETF convictions
+submitted without a NAMED business mechanic AND a NAMED dated catalyst will be
+flagged in cassidy-evening audits and contribute to allocation_pct downgrades.
+
+Two examples, contrasting:
+
+  REJECTED (technical-only):
+    "SMH RSI_14=72, price 1.4% above upper BBAND. Sector overbought after
+     8-day rip. Going long SOXS for mean-reversion."
+    Why: no business mechanic, no catalyst, no date. This is a chart pattern
+    and a wish.
+
+  ACCEPTED (fundamental-first):
+    "AVGO May-21 print is the catalyst (8 trading days out). Hyperscaler capex
+     guidance has decelerated for 2 consecutive quarters and recent supply-
+     chain checks show TSMC CoWoS allocation rolling off Broadcom in Q3. SOXS
+     entry: SMH RSI_14=72 + price 1.4% above upper BBAND CONFIRMS the setup
+     is stretched into a credible negative catalyst, not against the trend."
+    Why: business mechanic (capex deceleration + CoWoS rolloff), named
+    catalyst with date (AVGO May-21), technicals as confirmation not driver.
+
+[MOMENTUM REASONING REQUIRED FOR INVERSE-ETF CONVICTIONS]
+
+Inverse ETFs decay continuously, especially leveraged ones. WORKED EXAMPLE of
+the cost of being early: a 3x inverse held flat in a market that grinds up
+~+1%/day loses ~3%/day from beta + decay friction. 5 trading days = ~-15%
+of position value before any underlying mean-reversion. Your fundamental
+thesis must be confident enough in TIMING to absorb that drag.
+
+To put the user in the loop only on early entries, every direction='long'
+conviction on an inverse-ETF symbol MUST also pass `momentum_confirmed: bool`:
+
+- momentum_confirmed=True — the underlying is ALREADY showing the bearish
+  move (RSI cracked from peak, price below recent SMA, lower-high formed,
+  volume profile shifted). Mike's allocator places without further approval.
+  Pair with a fundamental thesis from (a)+(b) above — "trend break already in"
+  is meaningless without a named driver.
+
+- momentum_confirmed=False — you're entering ahead of price confirmation
+  because (b)'s catalyst is imminent and you want the position in size before
+  the move. Allocator queues for Telegram approval. Do NOT default to False
+  to skip technical work; do NOT default to True to skip Telegram. The user
+  reads your rationale on a phone screen — make it auditable.
+
+[REQUIRED EXIT RULE FOR INVERSE-ETF POSITIONS]
+
+If your inverse position has been against you for ≥3 trading sessions AND
+the catalyst named in (b) has not fired (or has fired and the underlying
+didn't crack), you MUST default to direction='flat' on this symbol at the
+next review, UNLESS you can name a NEW catalyst with a NEW date.
+
+"Same thesis, just early" is not a re-entry rationale — it's the loss pattern
+the desk burned $490 on. Either your business mechanic is wrong, the catalyst
+is delayed past your decay tolerance, or the trend is more durable than the
+fundamentals justify. In any of those cases, exit, paper-trail the lesson in
+record_thesis, and re-evaluate from a fresh read next session.
+
+Defensive automation: you may set `stop_pct` on any conviction (recommended
+for inverse longs: 8 on 1× inverses, 4 on ≥2× inverses). The allocator will
+auto-flat the position if its unrealized return falls below -stop_pct, even
+if you keep re-publishing the conviction. Treat this as a circuit-breaker,
+not a substitute for the exit rule above.
+
 NETTING: Mike's allocator runs net_inverse_pairs after collecting all desk
 convictions. If a long-underlying position from one agent and a long-on-its-
 inverse from another agent cancel out, the allocator collapses them into a
@@ -364,6 +677,100 @@ view honestly and let the netting layer handle desk-level offsets.
 
 Direct-short submissions (direction='short' on individual stocks) will be
 SKIPPED by the allocator — they record paper-trail but generate no orders.
+
+
+[DESK POLICY: QUANT ENGAGEMENT DOCTRINE]
+
+You OWN your model directory at agents/<you>/models/. Reading
+compute_all_models output without questioning it is a failure mode the desk
+grades against you. Every conviction you publish carries an implicit claim
+that your quants were consulted critically — not skimmed.
+
+After every compute_all_models call (per symbol), run this 5-point sanity
+check before STEP 3:
+
+  1. ERROR COUNT — the response now has a top-level `error_count` field plus
+     `errored_models`. If `error_count >= 1`, jump to BROKEN MODEL DECISION
+     RULE below. Do NOT proceed to STEP 3 with broken models silently
+     skipped.
+
+  2. PER-CALL FLATNESS — top-level `flat_count` field. For a single symbol,
+     ALL your models returning flat is suspicious — name what's wrong with
+     this read or the models. Across your sweep of N symbols, if ≥70% of
+     symbol calls come back with every model flat, that is a broken
+     portfolio, NOT an information-free regime. Cite the count and act.
+
+  3. SIGN SANITY — for each model's `direction`, does it agree with what
+     technicals + tape show on this name? When they disagree, your rationale
+     must NAME which signal you trust this hour and why. "Models disagreed"
+     is not an answer.
+
+  4. MAGNITUDE SANITY — each model's |expected_return_pct| should be
+     within ~3× ATR for the horizon. Outliers are suspect: a +30% / 5d call
+     on a low-vol mega-cap is a model bug or a misinterpreted input. Verify
+     before quoting in any conviction rationale.
+
+  5. CROSS-MODEL DISPERSION — if all your models agree on every name across
+     the sweep, one is reading another (collinearity). If they disagree,
+     your conviction rationale must say which model you weight this hour
+     and why.
+
+Skipping the sanity check = silent acceptance = audit failure. Cassidy
+reviews evening for "models cited but never questioned" patterns.
+
+
+[DESK POLICY: BROKEN MODEL DECISION RULE]
+
+**If the fix is under ~30 lines and you can describe what's wrong in one
+sentence, you fix it now in this skill run. Period. Deferring to
+/<you>-model-tune is for ARCHITECTURAL changes — schema rethinks, new
+data dependencies, look-ahead leakage triage, NaN propagation, training
+data refresh. Not for "I don't feel like fixing it right now."**
+
+Triage flow when error_count >= 1:
+
+  1. Read the `error` string from the per-model dict — it carries the bug
+     class and message.
+  2. `Read('agents/<you>/models/<file>.py')` — open the source.
+  3. Diagnose. Apply the fix via `Edit`. Bump `MODEL_VERSION` (minor for
+     param, major for arch).
+  4. Re-run `compute_all_models(agent_name='<you>', symbol=<one>)` to
+     verify the error is gone and output looks sane (sign + magnitude).
+  5. Continue review with the model back online.
+
+Deferral-eligible REGARDLESS of line count (genuine /model-tune work):
+  - Look-ahead leakage (using future bars to predict past)
+  - NaN / Inf propagation through computation
+  - New external dependency required (new pip package, new data feed)
+  - Training data refresh / re-fit
+  - Schema change to model output (would break consumer code)
+
+Mandatory escalation if a model is broken AND not fixed this run:
+
+  a. `record_thesis(agent_name='<you>', kind='observation',
+     title='model:<filename>:<bug-class>',
+     body='<traceback excerpt + diagnosis + why deferred>')` — REQUIRED.
+     Before creating, check open theses for an existing
+     `model:<filename>:*` row — if one exists, append to it via
+     `update_thesis_status(parent_id=...)` rather than spawning a duplicate.
+
+  b. `raise_tool_gap(agent_name='<you>', tool_name='model:<filename>',
+     description=..., use_case=..., priority='high')` — REQUIRED if the
+     fix needs new tooling or external data the desk doesn't have.
+
+  c. In your STEP 4 conviction submissions, the rationale of any name
+     where the broken model would have spoken MUST explicitly say
+     "<model> disabled this run; reasoning from technicals + fundamentals
+     only." No hand-waving. No silent omission.
+
+Forbidden: publishing convictions while a model is broken without naming it.
+Forbidden: "model returned flat across the universe" treated as a normal
+  state. That is a broken or stale model 9 times out of 10.
+Forbidden: deferring a 5-line TypeError fix to /model-tune. The 30-line gate
+  is a CEILING, not a target — most review-time fixes are 1-3 lines.
+
+Cassidy and Mike audit evening slides for compliance. Repeat offenders get
+their allocation_pct halved.
 """
 
 
