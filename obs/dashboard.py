@@ -209,8 +209,9 @@ def render_live_grid() -> None:
                     if preview:
                         st.code(preview[-180:], language="text")
                     if st.button("Open live session", key=f"open_{agent}"):
+                        st.query_params.clear()
+                        st.query_params["view"] = "detail"
                         st.query_params["session"] = info["session_id"]
-                        st.query_params["tab"] = "detail"
                         st.rerun()
 
                 if recent:
@@ -228,8 +229,9 @@ def render_live_grid() -> None:
                             line = "⚠ " + line
                         if st.button(line, key=f"recent_{agent}_{sid}_{r.get('request_index',0)}",
                                      use_container_width=True):
+                            st.query_params.clear()
+                            st.query_params["view"] = "detail"
                             st.query_params["session"] = sid
-                            st.query_params["tab"] = "detail"
                             st.rerun()
                 else:
                     st.caption("(no recorded runs yet)")
@@ -478,23 +480,42 @@ def render_diff() -> None:
 
 
 def main() -> None:
-    tab_choice = st.query_params.get("tab", "grid")
+    # URL-driven routing — Streamlit's st.tabs() doesn't sync with query_params,
+    # so we use ?view=grid|detail|diff and render exactly one view per page.
+    view = st.query_params.get("view", "grid")
+    if "session" in st.query_params and view == "grid":
+        view = "detail"  # auto-jump when a session is selected from a card click
 
     st.title("📡 Trading desk · live agents")
 
-    tab1, tab2, tab3 = st.tabs(["🔴 Live grid", "🔍 Skill detail", "↔ Diff"])
-    with tab1:
-        if tab_choice == "grid":
-            render_live_grid()
-        else:
-            if st.button("← back to live grid"):
-                st.query_params.clear()
-                st.rerun()
-            render_live_grid()
-    with tab2:
+    nav_cols = st.columns([1, 1, 1, 4])
+    with nav_cols[0]:
+        if st.button("🔴 Live grid", use_container_width=True,
+                     type="primary" if view == "grid" else "secondary"):
+            st.query_params.clear()
+            st.rerun()
+    with nav_cols[1]:
+        if st.button("🔍 Skill detail", use_container_width=True,
+                     type="primary" if view == "detail" else "secondary"):
+            st.query_params.clear()
+            st.query_params["view"] = "detail"
+            st.rerun()
+    with nav_cols[2]:
+        if st.button("↔ Diff", use_container_width=True,
+                     type="primary" if view == "diff" else "secondary"):
+            st.query_params.clear()
+            st.query_params["view"] = "diff"
+            st.rerun()
+    st.divider()
+
+    if view == "grid":
+        render_live_grid()
+    elif view == "detail":
         render_skill_detail()
-    with tab3:
+    elif view == "diff":
         render_diff()
+    else:
+        render_live_grid()
 
 
 if __name__ == "__main__":
