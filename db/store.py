@@ -372,7 +372,19 @@ async def write_news(
     published_at: Optional[str] = None,
     db_path: str = DB_PATH,
 ) -> None:
-    """Insert a news item; ON CONFLICT (article_id) DO NOTHING so reruns are safe."""
+    """Insert a news item; ON CONFLICT (article_id) DO NOTHING so reruns are safe.
+
+    `published_at` accepts an ISO-8601 string ('2026-05-08T20:39:04Z' style) and
+    is parsed to datetime here — asyncpg won't auto-cast strings to TIMESTAMPTZ.
+    """
+    pub_dt = None
+    if published_at:
+        try:
+            # fromisoformat handles +00:00 but trips on a literal 'Z' suffix until 3.11+;
+            # normalize defensively.
+            pub_dt = datetime.fromisoformat(str(published_at).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            pub_dt = None
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -385,7 +397,7 @@ async def write_news(
             """,
             _now(), symbol, headline, article_id, provider,
             url, body, sentiment, channels or None,
-            published_at,
+            pub_dt,
         )
 
 
