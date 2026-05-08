@@ -21,16 +21,18 @@ TimeoutStartSec=600
 ## get routed to the local Qwen backend without a separate proxy. vLLM 0.20+
 ## also natively supports the Anthropic /v1/messages shape, so no LiteLLM
 ## proxy needed.
-## Atlas-review and other hourly skills routinely build ~45-50K token prompts
-## (system prompt + skill markdown + journal history + tool result interpolations).
-## Qwen3-32B's native context is 40,960 tokens; YARN extends it to 131,072.
-## We cap at 80K so KV-cache stays under ~25GB even with 4 concurrent sector agents.
+## Atlas-review and other hourly skills build ~45-50K token prompts AND the
+## Claude Code CLI requests max_tokens=32000 for output, so total budget per
+## request is ~80-82K tokens. Qwen3-32B's native context is 40,960; YARN at
+## factor=4 extends to 163,840 — leaves comfortable headroom for the largest
+## skill prompts (mike-allocator, sector-archivist) without OOM under the
+## orchestrator's 4-concurrent-agent fan-out.
 ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv-vllm/bin/vllm serve "${LOCAL_MODEL}" \
     --served-model-name "${LOCAL_MODEL}" claude-opus-4-7 claude-sonnet-4-5-20250929 claude-sonnet-4-6 claude-haiku-4-5-20251001 claude-3-5-sonnet-20241022 \
     --quantization fp8 \
     --gpu-memory-utilization 0.92 \
-    --max-model-len 81920 \
-    --hf-overrides '"'"'{"rope_scaling":{"rope_type":"yarn","factor":2.0,"original_max_position_embeddings":40960}}'"'"' \
+    --max-model-len 163840 \
+    --hf-overrides '"'"'{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":40960}}'"'"' \
     --enable-auto-tool-choice \
     --tool-call-parser hermes \
     --host 127.0.0.1 \
