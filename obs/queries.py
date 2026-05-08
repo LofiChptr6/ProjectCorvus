@@ -1,8 +1,12 @@
 """Read-side queries for the obs dashboard.
 
 The proxy writes audit_log + tool_calls; this module shapes that data for the
-Streamlit views. asyncpg is the underlying driver, but Streamlit runs sync
-code, so each entry point wraps an asyncio.run().
+Streamlit views. We do NOT keep a long-lived asyncpg pool here — Streamlit
+reruns the script top-to-bottom on every interaction and creates a fresh
+asyncio loop each time, leaving any cached pool's connections bound to the
+PREVIOUS (now-closed) loop. Cheaper to spin up a connection per query;
+Streamlit's @st.cache_data wrapper around each query already deduplicates
+across short windows.
 """
 
 from __future__ import annotations
@@ -11,17 +15,14 @@ import asyncio
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, Callable, Awaitable
 
 import asyncpg
 
 log = logging.getLogger(__name__)
 
-_pool: asyncpg.Pool | None = None
-
 
 def _pg_dsn() -> str:
-    # Prefer env vars, fall back to config.yaml defaults the rest of the codebase uses.
     host = os.environ.get("PG_HOST", "localhost")
     port = os.environ.get("PG_PORT", "5432")
     db = os.environ.get("PG_DATABASE", "trading")
@@ -30,16 +31,19 @@ def _pg_dsn() -> str:
     return f"postgresql://{user}:{pw}@{host}:{port}/{db}"
 
 
-async def _get_pool() -> asyncpg.Pool:
-    global _pool
-    if _pool is None:
-        _pool = await asyncpg.create_pool(_pg_dsn(), min_size=1, max_size=4, command_timeout=10)
-    return _pool
+async def _with_conn(fn: Callable[[asyncpg.Connection], Awaitable[Any]]) -> Any:
+    conn = await asyncpg.connect(_pg_dsn(), command_timeout=10)
+    try:
+        return await fn(conn)
+    finally:
+        await conn.close()
+
+
+# ── Recent runs by agent ─────────────────────────────────────────────────────
 
 
 async def _list_recent_for_agent(agent: str, limit: int = 10) -> list[dict[str, Any]]:
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
+    async def q(conn: asyncpg.Connection) -> list[dict[str, Any]]:
         rows = await conn.fetch(
             """
             SELECT session_id, agent_name, routine, skill_name, created_at,
@@ -50,20 +54,21 @@ async def _list_recent_for_agent(agent: str, limit: int = 10) -> list[dict[str, 
             ORDER BY created_at DESC
             LIMIT $2
             """,
-            agent,
-            limit,
+            agent, limit,
         )
         return [dict(r) for r in rows]
+    return await _with_conn(q)
 
 
 def list_recent_for_agent(agent: str, limit: int = 10) -> list[dict[str, Any]]:
     return asyncio.run(_list_recent_for_agent(agent, limit))
 
 
+# ── Recent skill invocations (one row per session_id) ────────────────────────
+
+
 async def _list_recent_skill_invocations(limit: int = 50) -> list[dict[str, Any]]:
-    """Latest skill invocations grouped by session_id (one row per session)."""
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
+    async def q(conn: asyncpg.Connection) -> list[dict[str, Any]]:
         rows = await conn.fetch(
             """
             SELECT
@@ -89,15 +94,18 @@ async def _list_recent_skill_invocations(limit: int = 50) -> list[dict[str, Any]
             limit,
         )
         return [dict(r) for r in rows]
+    return await _with_conn(q)
 
 
 def list_recent_skill_invocations(limit: int = 50) -> list[dict[str, Any]]:
     return asyncio.run(_list_recent_skill_invocations(limit))
 
 
+# ── Per-session detail ───────────────────────────────────────────────────────
+
+
 async def _get_session_exchanges(session_id: str) -> list[dict[str, Any]]:
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
+    async def q(conn: asyncpg.Connection) -> list[dict[str, Any]]:
         rows = await conn.fetch(
             """
             SELECT id, session_id, agent_name, routine, skill_name, request_index,
@@ -119,6 +127,7 @@ async def _get_session_exchanges(session_id: str) -> list[dict[str, Any]]:
                 d["messages_parsed"] = []
             out.append(d)
         return out
+    return await _with_conn(q)
 
 
 def get_session_exchanges(session_id: str) -> list[dict[str, Any]]:
@@ -126,11 +135,11 @@ def get_session_exchanges(session_id: str) -> list[dict[str, Any]]:
 
 
 async def _get_session_tool_calls(session_id: str) -> list[dict[str, Any]]:
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
+    async def q(conn: asyncpg.Connection) -> list[dict[str, Any]]:
         rows = await conn.fetch(
             """
-            SELECT session_id, created_at, tool_round, tool_name, tool_input, tool_output, duration_ms, error
+            SELECT session_id, created_at, tool_round, tool_name, tool_input,
+                   tool_output, duration_ms, error
             FROM tool_calls
             WHERE session_id = $1
             ORDER BY tool_round ASC, created_at ASC
@@ -146,15 +155,18 @@ async def _get_session_tool_calls(session_id: str) -> list[dict[str, Any]]:
                 d["tool_input_parsed"] = {}
             out.append(d)
         return out
+    return await _with_conn(q)
 
 
 def get_session_tool_calls(session_id: str) -> list[dict[str, Any]]:
     return asyncio.run(_get_session_tool_calls(session_id))
 
 
+# ── Diff-tab helpers ─────────────────────────────────────────────────────────
+
+
 async def _list_skills_for_agent(agent: str) -> list[str]:
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
+    async def q(conn: asyncpg.Connection) -> list[str]:
         rows = await conn.fetch(
             """
             SELECT DISTINCT COALESCE(skill_name, routine) AS skill
@@ -165,6 +177,7 @@ async def _list_skills_for_agent(agent: str) -> list[str]:
             agent,
         )
         return [r["skill"] for r in rows]
+    return await _with_conn(q)
 
 
 def list_skills_for_agent(agent: str) -> list[str]:
@@ -172,8 +185,7 @@ def list_skills_for_agent(agent: str) -> list[str]:
 
 
 async def _list_sessions_for_skill(agent: str, skill: str, limit: int = 20) -> list[dict[str, Any]]:
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
+    async def q(conn: asyncpg.Connection) -> list[dict[str, Any]]:
         rows = await conn.fetch(
             """
             SELECT
@@ -190,11 +202,10 @@ async def _list_sessions_for_skill(agent: str, skill: str, limit: int = 20) -> l
             ORDER BY MIN(created_at) DESC
             LIMIT $3
             """,
-            agent,
-            skill,
-            limit,
+            agent, skill, limit,
         )
         return [dict(r) for r in rows]
+    return await _with_conn(q)
 
 
 def list_sessions_for_skill(agent: str, skill: str, limit: int = 20) -> list[dict[str, Any]]:
@@ -202,12 +213,10 @@ def list_sessions_for_skill(agent: str, skill: str, limit: int = 20) -> list[dic
 
 
 async def _list_known_agents() -> list[str]:
-    pool = await _get_pool()
-    async with pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT DISTINCT agent_name FROM audit_log ORDER BY 1"
-        )
+    async def q(conn: asyncpg.Connection) -> list[str]:
+        rows = await conn.fetch("SELECT DISTINCT agent_name FROM audit_log ORDER BY 1")
         return [r["agent_name"] for r in rows]
+    return await _with_conn(q)
 
 
 def list_known_agents() -> list[str]:
