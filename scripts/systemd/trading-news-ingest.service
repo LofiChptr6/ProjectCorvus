@@ -1,6 +1,5 @@
 [Unit]
 Description=Trading news ingestor — Massive (Benzinga) → Postgres news_items
-Documentation=file:///home/tianyizhang/opus%20trading/scripts/ingest_news.py
 After=network-online.target postgresql.service
 Wants=network-online.target
 

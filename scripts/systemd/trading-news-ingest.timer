@@ -1,13 +1,11 @@
 [Unit]
-Description=Trading news ingest timer — every 15 min during RTH (Mon-Fri 09:30-16:15 ET)
-Documentation=file:///home/tianyizhang/opus%20trading/scripts/ingest_news.py
+Description=Trading news ingest timer — every 15 min on weekdays (script no-ops cheaply outside RTH)
 
 [Timer]
-# Local time = America/Phoenix (MST, no DST). RTH in MST during EDT = 06:30–13:00,
-# during EST = 07:30–14:00. We bracket loosely to cover both seasons (~05:30–13:30
-# AZ window) and let the script no-op cheaply if there's nothing to fetch.
-# Every 15 min on the quarter-hour.
-OnCalendar=Mon..Fri *-*-* 05:30..13:30/0:15:00
+# Every 15 min on the quarter-hour, weekdays only. systemd's calendar specifier
+# rejects step ranges across hour boundaries (`HH..HH/0:15:00` is a bad-setting),
+# so we keep it simple and let the script handle market-hours filtering itself.
+OnCalendar=Mon..Fri *-*-* *:00,15,30,45:00
 Persistent=true
 AccuracySec=30s
 Unit=trading-news-ingest.service
