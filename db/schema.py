@@ -423,6 +423,13 @@ END $$""",
     "CREATE INDEX IF NOT EXISTS idx_audit_log_session ON audit_log (session_id)",
     "CREATE INDEX IF NOT EXISTS idx_audit_log_agent_created ON audit_log (agent_name, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_tool_calls_session ON tool_calls (session_id)",
+    # Observability (obs/proxy.py) writes every /v1/messages exchange to audit_log.
+    # Multiple exchanges share one session_id (tool-use loop), distinguished by request_index.
+    # thinking_block holds Qwen's <think>…</think> content split out from the final text.
+    "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS skill_name TEXT",
+    "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS request_index INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS thinking_block TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_audit_log_skill_recent ON audit_log (skill_name, created_at DESC) WHERE skill_name IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_orders_agent_status ON orders (agent_name, status)",
     "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_fills_agent_filled ON fills (agent_name, filled_at DESC)",

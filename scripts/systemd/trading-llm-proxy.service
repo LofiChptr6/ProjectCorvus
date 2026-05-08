@@ -1,0 +1,19 @@
+[Unit]
+Description=Trading observability proxy — captures /v1/messages traffic into Postgres + fans out live SSE
+After=trading-vllm.service postgresql.service
+Wants=trading-vllm.service
+
+[Service]
+Type=exec
+WorkingDirectory=/home/tianyizhang/opus trading
+EnvironmentFile=/home/tianyizhang/opus trading/.env
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/uvicorn obs.proxy:app --host 127.0.0.1 --port 8001 --workers 1 --log-level info'
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=append:/home/tianyizhang/opus trading/logs/llm-proxy.log
+StandardError=append:/home/tianyizhang/opus trading/logs/llm-proxy.log
+
+[Install]
+WantedBy=default.target

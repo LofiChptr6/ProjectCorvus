@@ -29,11 +29,13 @@ UNIT_SRC="${REPO_ROOT}/scripts/systemd"
 UNIT_DST="${HOME}/.config/systemd/user"
 
 # Long-running services (no timer pair).
-# trading-vllm exposes BOTH OpenAI /v1/chat/completions (for concierge) AND
-# Anthropic /v1/messages (for the `claude` CLI). No separate proxy needed —
-# vLLM 0.20+ handles both natively + aliases claude-* model names.
+# trading-vllm        — vLLM serving Qwen3-32B-FP8 (Anthropic + OpenAI shapes natively)
+# trading-llm-proxy   — obs/proxy.py: captures /v1/messages into Postgres + live SSE
+# trading-dashboard   — obs/dashboard.py: Streamlit multi-agent dashboard
 LONG_RUNNING=(
     trading-vllm
+    trading-llm-proxy
+    trading-dashboard
 )
 
 # Timer-driven units (each has a .service + matching .timer).

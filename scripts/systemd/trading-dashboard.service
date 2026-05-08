@@ -1,0 +1,19 @@
+[Unit]
+Description=Trading observability dashboard — Streamlit live agent monitor (Tier 2)
+After=trading-llm-proxy.service postgresql.service
+Wants=trading-llm-proxy.service
+
+[Service]
+Type=exec
+WorkingDirectory=/home/tianyizhang/opus trading
+EnvironmentFile=/home/tianyizhang/opus trading/.env
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/streamlit run obs/dashboard.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false --client.showSidebarNavigation false'
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=append:/home/tianyizhang/opus trading/logs/dashboard.log
+StandardError=append:/home/tianyizhang/opus trading/logs/dashboard.log
+
+[Install]
+WantedBy=default.target

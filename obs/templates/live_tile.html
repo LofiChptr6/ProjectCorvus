@@ -1,0 +1,126 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { margin: 0; font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0e1117; color: #e0e0e0; }
+  .header { padding: 6px 10px; border-bottom: 1px solid #333; display: flex; gap: 12px; align-items: center; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #34d399; box-shadow: 0 0 8px #34d39988; animation: pulse 1.2s infinite; }
+  .dot.done { background: #6b7280; box-shadow: none; animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.45; } }
+  .stats { color: #9ca3af; font-size: 11px; margin-left: auto; }
+  pre { margin: 0; padding: 10px; white-space: pre-wrap; word-break: break-word;
+        font: 12px/1.55 ui-monospace, "SF Mono", Menlo, monospace;
+        max-height: 460px; overflow-y: auto; background: #0e1117; }
+  .tool { color: #f59e0b; font-style: italic; }
+  .think { color: #6b7280; font-style: italic; }
+</style>
+</head>
+<body>
+<div class="header">
+  <span class="dot" id="dot"></span>
+  <span id="title">live · {AGENT} · {SKILL}</span>
+  <span class="stats" id="stats">connecting…</span>
+</div>
+<pre id="out"></pre>
+
+<script>
+(function () {
+  const SESSION = "{SESSION_ID}";
+  const PROXY   = "{PROXY_URL}";
+  const out = document.getElementById("out");
+  const dot = document.getElementById("dot");
+  const stats = document.getElementById("stats");
+
+  let totalChars = 0;
+  let inThink = false;
+  let toolBuffer = "";
+  let lastPing = Date.now();
+  const startedAt = Date.now();
+
+  function appendText(text, klass) {
+    const span = document.createElement("span");
+    if (klass) span.className = klass;
+    span.textContent = text;
+    out.appendChild(span);
+    out.scrollTop = out.scrollHeight;
+    totalChars += text.length;
+  }
+
+  function handleEvent(eventName, data) {
+    try {
+      const obj = JSON.parse(data);
+      if (eventName === "content_block_start") {
+        const cb = obj.content_block || {};
+        if (cb.type === "tool_use") {
+          appendText(`\n→ tool_use: ${cb.name}\n`, "tool");
+        }
+      } else if (eventName === "content_block_delta") {
+        const d = obj.delta || {};
+        if (d.type === "text_delta") {
+          let t = d.text || "";
+          // crude <think> tag tracking for color
+          while (t.length) {
+            if (!inThink) {
+              const i = t.indexOf("<think>");
+              if (i === -1) { appendText(t); break; }
+              if (i > 0) appendText(t.slice(0, i));
+              t = t.slice(i + "<think>".length);
+              inThink = true;
+            } else {
+              const i = t.indexOf("</think>");
+              if (i === -1) { appendText(t, "think"); break; }
+              if (i > 0) appendText(t.slice(0, i), "think");
+              t = t.slice(i + "</think>".length);
+              inThink = false;
+            }
+          }
+        } else if (d.type === "input_json_delta") {
+          toolBuffer += d.partial_json || "";
+        }
+      } else if (eventName === "content_block_stop") {
+        if (toolBuffer) {
+          appendText(`  input: ${toolBuffer}\n`, "tool");
+          toolBuffer = "";
+        }
+      } else if (eventName === "message_delta") {
+        const u = obj.usage || {};
+        const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+        stats.textContent = `${u.output_tokens || 0} tok · ${elapsed}s · stop=${(obj.delta || {}).stop_reason || "…"}`;
+      }
+    } catch (e) { /* ignore parse errors on partial events */ }
+  }
+
+  function done() {
+    dot.classList.add("done");
+    const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+    stats.textContent = `done · ${totalChars} chars · ${elapsed}s`;
+  }
+
+  const es = new EventSource(`${PROXY}/stream/${SESSION}`);
+
+  // The proxy emits one custom event per upstream SSE chunk. The "raw" event
+  // payload is the full chunk (event:… data:… newlines preserved).
+  es.addEventListener("raw", function (ev) {
+    lastPing = Date.now();
+    const lines = ev.data.split("\n");
+    let curEvent = null;
+    let curData = null;
+    for (const line of lines) {
+      if (line.startsWith("event:")) curEvent = line.slice(6).trim();
+      else if (line.startsWith("data:")) curData = line.slice(5).trim();
+    }
+    if (curEvent && curData) handleEvent(curEvent, curData);
+  });
+  es.addEventListener("ping", function () { lastPing = Date.now(); });
+  es.addEventListener("error", function () { /* EventSource auto-reconnects */ });
+  es.onopen = function () { stats.textContent = "streaming…"; };
+
+  // Watchdog: if no chunks for 30 s assume done and close.
+  setInterval(function () {
+    if (Date.now() - lastPing > 30000) { es.close(); done(); }
+  }, 5000);
+})();
+</script>
+</body>
+</html>
