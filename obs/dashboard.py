@@ -18,9 +18,17 @@ import datetime as dt
 import difflib
 import json
 import os
+import sys
 import time
 from pathlib import Path
 from typing import Any
+
+# Streamlit runs this file as `streamlit run obs/dashboard.py`, which puts
+# obs/ on sys.path[0] but NOT the repo root — so `from obs import queries`
+# fails out of the box. Resolve repo root and prepend.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 import httpx
 import streamlit as st
