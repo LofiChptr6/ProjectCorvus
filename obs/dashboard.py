@@ -172,6 +172,112 @@ def _fmt_tokens(n: Any) -> str:
     return f"{n / 1_000_000:.1f}M"
 
 
+# ── Per-agent inbox (chat) ────────────────────────────────────────────────────
+# Each card has an "Ask <agent>" form. Submit posts a row to agent_inbox and
+# fires `python scripts/run_skill.py <agent> respond` as a fire-and-forget
+# subprocess; the autorefresh polls until response_body lands.
+
+
+async def _post_question_async(agent: str, body: str, sender: str = "user") -> int:
+    """Open a fresh asyncpg connection, INSERT, return id. The dashboard
+    runs in synchronous Streamlit code — `post_question` wraps this."""
+    import asyncpg
+    conn = await asyncpg.connect(queries._pg_dsn(), command_timeout=10)
+    try:
+        row = await conn.fetchrow(
+            """INSERT INTO agent_inbox (agent_name, body, sender)
+               VALUES ($1,$2,$3) RETURNING id""",
+            agent, body, sender,
+        )
+        return int(row["id"])
+    finally:
+        await conn.close()
+
+
+def post_question(agent: str, body: str, sender: str = "user") -> int:
+    """Sync wrapper for Streamlit. Per-call connection — see queries module
+    for the why-not-pool rationale."""
+    import asyncio
+    return asyncio.run(_post_question_async(agent, body, sender))
+
+
+def fire_respond_subprocess(agent: str) -> int:
+    """Fire-and-forget; returns the subprocess pid."""
+    import os as _os
+    import subprocess
+    p = subprocess.Popen(
+        [sys.executable, str(_REPO_ROOT / "scripts/run_skill.py"), agent, "respond"],
+        cwd=str(_REPO_ROOT),
+        env=dict(_os.environ),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+    return p.pid
+
+
+async def _recent_qa_async(agent: str, limit: int = 3) -> list[dict[str, Any]]:
+    import asyncpg
+    conn = await asyncpg.connect(queries._pg_dsn(), command_timeout=10)
+    try:
+        rows = await conn.fetch(
+            """SELECT id, body, sender, created_at, responded_at, response_body
+               FROM agent_inbox WHERE agent_name=$1
+               ORDER BY created_at DESC LIMIT $2""",
+            agent, limit,
+        )
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+@st.cache_data(ttl=2)
+def _recent_qa(agent: str, limit: int = 3) -> list[dict[str, Any]]:
+    import asyncio
+    try:
+        return asyncio.run(_recent_qa_async(agent, limit))
+    except Exception:
+        return []
+
+
+def _render_chat_form(agent: str) -> None:
+    with st.form(key=f"ask_form_{agent}", clear_on_submit=True, border=False):
+        cols = st.columns([4, 1])
+        with cols[0]:
+            q = st.text_input(
+                "Ask", key=f"ask_input_{agent}",
+                label_visibility="collapsed",
+                placeholder=f"Ask {agent} a question…",
+            )
+        with cols[1]:
+            submitted = st.form_submit_button("Send", use_container_width=True)
+        if submitted and q.strip():
+            try:
+                inbox_id = post_question(agent, q.strip())
+                fire_respond_subprocess(agent)
+                st.toast(f"Sent to {agent} (inbox_id={inbox_id})", icon="📤")
+            except Exception as e:
+                st.error(f"Failed to send: {type(e).__name__}: {e}")
+            st.rerun()
+
+
+def _render_recent_qa(agent: str) -> None:
+    qa = _recent_qa(agent, limit=3)
+    if not qa:
+        return
+    with st.expander(f"Recent Q&A ({len(qa)})"):
+        for row in qa:
+            q_body = (row.get("body") or "")[:240]
+            a_body = (row.get("response_body") or "").strip()
+            sent_at = _fmt_time(row.get("created_at"))
+            st.markdown(f"**Q** ({sent_at}): {q_body}")
+            if a_body:
+                st.markdown(f"**A:** {a_body[:600]}")
+            else:
+                st.caption("(pending — autorefresh will pull the response)")
+            st.divider()
+
+
 # ── Tab 1: Live grid ──────────────────────────────────────────────────────────
 
 
@@ -235,6 +341,11 @@ def render_live_grid() -> None:
                             st.rerun()
                 else:
                     st.caption("(no recorded runs yet)")
+
+                # Per-agent inbox: ask + recent Q&A (omit for `desk` — heartbeat-only).
+                if agent != "desk":
+                    _render_chat_form(agent)
+                    _render_recent_qa(agent)
 
 
 # ── Tab 2: Skill detail ───────────────────────────────────────────────────────
