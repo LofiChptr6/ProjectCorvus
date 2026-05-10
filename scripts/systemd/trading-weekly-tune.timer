@@ -1,0 +1,12 @@
+[Unit]
+Description=Weekly model-tune timer — fires Sundays 09:00 ET (off-market)
+Requires=trading-weekly-tune.service
+
+[Timer]
+# Sundays 09:00 ET / 13:00 UTC (covers DST drift either way; no live trading on Sunday).
+OnCalendar=Sun *-*-* 13:00:00 UTC
+Persistent=true
+Unit=trading-weekly-tune.service
+
+[Install]
+WantedBy=timers.target

@@ -456,6 +456,173 @@ async def relay_count_tokens_adhoc(request: Request):
     return await _relay(request, skill="adhoc", session_id=str(uuid.uuid4()), suffix="/v1/messages/count_tokens", passthrough_only=True)
 
 
+# ── OpenAI-shape passthrough (Python pipelines path) ─────────────────────────
+# `pipelines.runner` POSTs OpenAI-format chat completions through this proxy.
+# For now we only forward (no audit logging) — the structured-output / tool
+# loop trace can be lifted from vLLM's raw response in a later pass.
+
+@app.post("/skill/{skill}/session/{session_id}/v1/chat/completions")
+async def relay_chat_completions(skill: str, session_id: str, request: Request):
+    return await _relay_openai(request, skill=skill, session_id=session_id)
+
+
+@app.post("/v1/chat/completions")
+async def relay_chat_completions_adhoc(request: Request):
+    return await _relay_openai(request, skill="adhoc", session_id=str(uuid.uuid4()))
+
+
+async def _relay_openai(request: Request, *, skill: str, session_id: str):
+    """OpenAI-shape passthrough with audit logging.
+
+    Streaming requests are forwarded as SSE bytes verbatim (audit logging is
+    skipped for streaming since the pipeline doesn't use streaming). Non-
+    streaming requests are forwarded and the JSON body is returned, plus a
+    full audit_log row + per-tool-call rows are written for the dashboard.
+    """
+    body = await request.body()
+    target = f"{VLLM_ROOT}/v1/chat/completions"
+    try:
+        body_dict = json.loads(body) if body else {}
+    except json.JSONDecodeError:
+        body_dict = {}
+    is_streaming = bool(body_dict.get("stream"))
+    started_at = time.time()
+    agent = derive_agent(skill)
+
+    LIVE_SESSIONS[session_id] = {
+        "session_id": session_id,
+        "skill": skill,
+        "agent": agent,
+        "started_at": started_at,
+        "last_chunk_at": started_at,
+        "preview": "",
+        "output_tokens": 0,
+        "format": "openai",
+    }
+
+    client: httpx.AsyncClient = request.app.state.client
+
+    if is_streaming:
+        async def _gen():
+            try:
+                async with client.stream(
+                    "POST", target, content=body,
+                    headers={"content-type": "application/json", "accept": "text/event-stream"},
+                ) as resp:
+                    if resp.status_code != 200:
+                        msg = await _read_text(resp)
+                        yield f"data: {json.dumps({'error': msg})}\n\n".encode()
+                        return
+                    async for chunk in resp.aiter_bytes():
+                        LIVE_SESSIONS[session_id]["last_chunk_at"] = time.time()
+                        yield chunk
+            finally:
+                LIVE_SESSIONS.pop(session_id, None)
+
+        return StreamingResponse(_gen(), media_type="text/event-stream", headers={"cache-control": "no-cache"})
+
+    error: str | None = None
+    resp_json: dict[str, Any] = {}
+    status_code = 502
+    try:
+        resp = await client.post(target, content=body, headers={"content-type": "application/json"})
+        status_code = resp.status_code
+        try:
+            resp_json = resp.json() if resp.content else {}
+        except Exception:
+            resp_json = {"raw": (await resp.aread()).decode("utf-8", errors="replace")}
+        if status_code != 200:
+            error = f"vllm {status_code}: {json.dumps(resp_json)[:400]}"
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        log.exception("_relay_openai failed for session %s", session_id)
+        resp_json = {"error": error}
+    finally:
+        await _persist_openai_exchange(
+            session_id=session_id, skill=skill, agent=agent,
+            body_dict=body_dict, resp_data=resp_json,
+            started_at=started_at, error=error,
+        )
+        LIVE_SESSIONS.pop(session_id, None)
+
+    return JSONResponse(content=resp_json, status_code=status_code)
+
+
+async def _persist_openai_exchange(
+    *,
+    session_id: str,
+    skill: str,
+    agent: str,
+    body_dict: dict[str, Any],
+    resp_data: dict[str, Any],
+    started_at: float,
+    error: str | None,
+) -> None:
+    """Write one audit_log row + N tool_calls rows for an OpenAI exchange.
+
+    Mirrors the Anthropic-shape `persist_exchange` but reads OpenAI fields:
+      - request: messages[], optional system in messages[0]
+      - response: choices[0].message.{content, tool_calls}, finish_reason, usage
+    """
+    request_index = SESSION_REQUEST_INDEX[session_id]
+    SESSION_REQUEST_INDEX[session_id] += 1
+
+    request_messages = list(body_dict.get("messages") or [])
+    system_prompt = ""
+    if request_messages and request_messages[0].get("role") == "system":
+        system_prompt = str(request_messages[0].get("content", "") or "")
+
+    choice = (resp_data.get("choices") or [{}])[0] if isinstance(resp_data.get("choices"), list) else {}
+    msg = choice.get("message", {}) or {}
+    final_response = str(msg.get("content", "") or "")
+    tool_calls = msg.get("tool_calls") or []
+    finish_reason = choice.get("finish_reason") or ("error" if error else "unknown")
+
+    usage = resp_data.get("usage") or {}
+    prompt_tokens = int(usage.get("prompt_tokens", 0) or 0)
+    completion_tokens = int(usage.get("completion_tokens", 0) or 0)
+
+    duration_ms = int((time.time() - started_at) * 1000)
+
+    # The full conversation = the request messages + the assistant response
+    # serialized in OpenAI shape. Mirrors the Anthropic-side audit row schema.
+    full_messages = request_messages + [{
+        "role": "assistant",
+        "content": final_response,
+        **({"tool_calls": tool_calls} if tool_calls else {}),
+    }]
+
+    try:
+        await _direct_insert_audit_log(
+            session_id=session_id, agent=agent, skill=skill,
+            system_prompt=system_prompt, messages=full_messages,
+            tool_rounds=len(tool_calls), final_text=final_response,
+            stop_reason=finish_reason, duration_ms=duration_ms,
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens,
+            error=error, request_index=request_index, thinking=None,
+        )
+    except Exception as e:
+        log.warning("audit_log write failed (openai): %s", e)
+        return
+
+    for tc in tool_calls:
+        fn = tc.get("function", {}) or {}
+        tool_name = fn.get("name", "?")
+        raw_args = fn.get("arguments", "{}")
+        try:
+            tool_input = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+        except json.JSONDecodeError:
+            tool_input = {"_raw": raw_args}
+        try:
+            await store.write_tool_call(
+                session_id=session_id, tool_round=request_index,
+                tool_name=tool_name, tool_input=tool_input,
+                tool_output=None, duration_ms=0, error=None,
+            )
+        except Exception as e:
+            log.warning("tool_call write failed (openai): %s", e)
+
+
 # ── Request relay (the meat) ─────────────────────────────────────────────────
 
 

@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading weekly model-tune cycle — Python pipeline; tunes 11 sector model portfolios
+Documentation=file:///home/tianyizhang/opus%20trading/scripts/run_weekly_orchestrator.sh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/tianyizhang/opus trading
+Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash "/home/tianyizhang/opus trading/scripts/run_weekly_orchestrator.sh"
+TimeoutStartSec=10800
+StandardOutput=append:/home/tianyizhang/opus trading/logs/weekly-tune-orchestrator.log
+StandardError=append:/home/tianyizhang/opus trading/logs/weekly-tune-orchestrator.log
+
+[Install]
+WantedBy=multi-user.target
