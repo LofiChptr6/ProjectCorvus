@@ -32,13 +32,25 @@ class ConvictionView(BaseModel):
     rationale: Optional[str] = None
     model_inputs: Optional[dict[str, Any]] = None
     momentum_confirmed: Optional[bool] = None
-    stop_pct: Optional[float] = Field(None, ge=0.0)
+    stop_pct: Optional[float] = None  # see _coerce_stop_pct: must be POSITIVE magnitude
     expires_in_hours: int = Field(default=1, ge=1, le=336)  # 14d max
 
     @field_validator("symbol")
     @classmethod
     def _upper_symbol(cls, v: str) -> str:
         return v.upper().strip()
+
+    @field_validator("stop_pct")
+    @classmethod
+    def _coerce_stop_pct(cls, v: Optional[float]) -> Optional[float]:
+        """stop_pct is a positive drawdown magnitude per DESK_POLICY:
+        the allocator flats the position when unrealized_return < -stop_pct.
+        Models routinely emit it as a signed number (-0.05 for "5% loss limit");
+        we take abs() rather than reject so the pipeline absorbs the convention
+        mismatch. None passes through unchanged."""
+        if v is None:
+            return None
+        return abs(float(v))
 
 
 class ForecastRow(BaseModel):

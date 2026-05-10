@@ -146,6 +146,31 @@ def test_conviction_view_rejects_short_direction():
         })
 
 
+def test_conviction_view_coerces_negative_stop_pct():
+    """LLMs emit stop_pct as a signed number (-0.05 = 5% loss limit). Our
+    convention is positive magnitude. Take abs() rather than reject."""
+    parsed = schemas.ConvictionView.model_validate({
+        "symbol": "SPY", "direction": "long", "conviction": 0.5,
+        "stop_pct": -0.05,
+    })
+    assert parsed.stop_pct == 0.05
+
+
+def test_conviction_view_preserves_positive_stop_pct():
+    parsed = schemas.ConvictionView.model_validate({
+        "symbol": "SPY", "direction": "long", "conviction": 0.5,
+        "stop_pct": 0.07,
+    })
+    assert parsed.stop_pct == 0.07
+
+
+def test_conviction_view_stop_pct_none_passes_through():
+    parsed = schemas.ConvictionView.model_validate({
+        "symbol": "SPY", "direction": "long", "conviction": 0.5,
+    })
+    assert parsed.stop_pct is None
+
+
 def test_conviction_view_rejects_out_of_range_conviction():
     with pytest.raises(Exception):
         schemas.ConvictionView.model_validate({

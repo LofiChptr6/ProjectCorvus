@@ -87,7 +87,7 @@ When you've gathered enough evidence, **emit a single final assistant message co
       "rationale": "<1-3 sentences>",
       "model_inputs": { "<key>": <value>, ... },
       "momentum_confirmed": true | false | null,
-      "stop_pct": <number, optional>,
+      "stop_pct": <positive number, optional — drawdown magnitude e.g. 0.05 for 5%; allocator auto-flats when unrealized_return < -stop_pct>,
       "expires_in_hours": <int, default 1>
     },
     ...

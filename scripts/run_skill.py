@@ -28,6 +28,19 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+# Load .env so TELEGRAM_BOT_TOKEN, MASSIVE_API_KEY, PG_*, etc. match what
+# mcp_server.py / run_scheduled_skill.sh see. The harness path loads via
+# mcp_server.py -> dotenv; the pipeline path needs it explicit. Use
+# find_dotenv() so worktree runs find the parent repo's .env (which is
+# .gitignored and therefore absent from worktrees).
+try:
+    from dotenv import find_dotenv, load_dotenv
+    found = find_dotenv(usecwd=True)
+    if found:
+        load_dotenv(found)
+except Exception:
+    pass
+
 
 def _setup_logging(skill_name: str) -> Path:
     log_dir = _REPO_ROOT / "logs"
