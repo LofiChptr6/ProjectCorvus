@@ -201,7 +201,9 @@ async def _apply_review_output(
         )
         summary["forecasts_inserted"] = result["inserted"]
         summary["forecast_errors"] = result["errors"]
-        # Theses are intentionally skipped in shadow mode (kept lite).
+        # Theses + Telegram intentionally skipped in shadow mode (zero side
+        # effects beyond shadow-table writes — that's the contract of dry-run).
+        summary["telegram_sent"] = False
         return summary
 
     # Live path.
@@ -244,6 +246,14 @@ async def _apply_review_output(
             resolution_note=g.resolution_note, agent_name=agent_name,
         )
         summary["theses_graded"] += 1
+
+    # Mirror titan-review.md (harness path): one short Telegram per sector
+    # per hourly review so the user can SEE the sector thinking, not just
+    # the allocator's NAV ping. Skipped in dry-run.
+    from pipelines import notify
+    summary["telegram_sent"] = await notify.send_summary_safe(
+        agent_name, parsed.telegram_summary,
+    )
 
     return summary
 

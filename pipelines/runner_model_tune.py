@@ -124,4 +124,15 @@ async def apply_model_tune_output(
     except Exception as e:
         log.warning("record_thesis failed: %s", e)
 
+    # Telegram: one short tune-cycle summary so the user sees what changed
+    # in their model portfolio. Skipped in dry-run for the same reason as
+    # review — dry-run is contract-bound to zero real-world side effects.
+    if dry_run:
+        summary["telegram_sent"] = False
+    else:
+        from pipelines import notify
+        summary["telegram_sent"] = await notify.send_summary_safe(
+            agent_name, parsed.telegram_summary,
+        )
+
     return summary
