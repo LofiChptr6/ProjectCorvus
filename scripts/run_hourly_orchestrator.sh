@@ -1,23 +1,21 @@
 #!/usr/bin/env bash
-# Hourly orchestrator — fans out the 10 sector reviews + mike-allocator,
-# then runs the desk heartbeat. Called once per hour by
-# trading-hourly-review.timer.
+# Hourly orchestrator — fans out 11 sector reviews + mike-allocator, then runs
+# the desk heartbeat. Called once per hour by trading-hourly-review.timer.
 #
 # Phases (in order):
-#   1. Sector reviews   — atlas, fab, fabless, rex, maya, titan, vera,
-#                         trump, iron, volt    (parallel, concurrency=$ORCH_CONCURRENCY)
-#   2. Mike-allocator    — reads the consolidated conviction stack and proposes
-#                          (or in Stage 3, places) the rebalance orders
-#   3. Hourly heartbeat — telegram inbox + desk-state ping
+#   1a. Migrated sector reviews — atlas, commodity, energy, fab, fabless, iron,
+#       maya, rex, trump, vera, volt — via the Python pipeline (scripts/run_skill.py).
+#       This is the new path: bundler → template → vLLM → structured-output writes.
+#   1b. Legacy harness skills (currently empty — titan was decommissioned in
+#       favor of energy + commodity, which together cover its scope).
+#   2.  Mike-allocator — harness path (writes live orders; sensitive).
+#   3.  Hourly-review heartbeat — harness path.
 #
-# Skip-fast: during the AZ quiet window (22:00–05:00) or on weekends we skip
-# phases 1 and 2 entirely and only run the heartbeat. Each per-agent review
-# self-skips when the market is closed, so the rest of the off-hours envelope
-# (e.g. weekday 14:00–22:00 AZ) is handled cheaply by the agents themselves.
+# Skip-fast: during the AZ quiet window (22:00–05:00) or weekends we skip
+# phases 1 and 2 and only run the heartbeat.
 #
-# Each sub-skill is launched via run_scheduled_skill.sh, which assigns a
-# unique IBKR client id and tee's per-skill logs into logs/<skill>.log.
-# This script's own coordination log is logs/hourly-orchestrator.log.
+# Per-sub-skill logs land in logs/<skill>.log; the orchestrator's own
+# coordination log is logs/hourly-orchestrator.log.
 
 set -u
 
@@ -25,20 +23,20 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_ROOT"
 
+PYTHON="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
+
 mkdir -p logs
 ORCH_LOG="logs/hourly-orchestrator.log"
 
 log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$ORCH_LOG"; }
 
-log "orchestrator start (pid=$$)"
+log "orchestrator start (pid=$$ python=$PYTHON)"
 
-# Phoenix: no DST. Quiet window = 22:00–05:00 local.
 AZ_HOUR=$(TZ='America/Phoenix' date +%-H)
-AZ_DOW=$(TZ='America/Phoenix' date +%u)   # 1=Mon … 7=Sun
+AZ_DOW=$(TZ='America/Phoenix' date +%u)
 
 is_quiet=false
 if [[ $AZ_HOUR -ge 22 || $AZ_HOUR -lt 5 ]]; then is_quiet=true; fi
-
 is_weekend=false
 if [[ $AZ_DOW -ge 6 ]]; then is_weekend=true; fi
 
@@ -49,34 +47,47 @@ if $is_quiet || $is_weekend; then
     exit 0
 fi
 
-# Concurrency cap for sector fan-out. 4 keeps RAM/CPU + Anthropic API
-# concurrency reasonable while finishing well inside the hour even when each
-# review takes ~10 min. Override with ORCH_CONCURRENCY env if needed.
 CONCURRENCY="${ORCH_CONCURRENCY:-4}"
-
-SECTORS=(atlas fab fabless rex maya titan vera trump iron volt)
-
-log "phase 1: fanning out ${#SECTORS[@]} sector reviews (concurrency=$CONCURRENCY)"
-
-# Per-skill timeout. A hung sector review otherwise holds an xargs slot for the
-# whole 2700s systemd envelope; with concurrency=4 a few hangs would stall the
-# entire hour. Override per-call via SKILL_TIMEOUT_SEC.
 SKILL_TIMEOUT_SEC="${SKILL_TIMEOUT_SEC:-900}"
 
-# xargs -P bounds parallelism. Each sub-launcher writes its own log; we don't
-# capture per-skill stdout here. Failures in one agent must not abort the rest,
-# so we ignore the xargs exit code (its non-zero exit is logged below).
-printf '%s\n' "${SECTORS[@]}" \
-    | xargs -n1 -P "$CONCURRENCY" -I {} \
-        timeout --foreground "$SKILL_TIMEOUT_SEC" bash "$SCRIPT_DIR/run_scheduled_skill.sh" "{}-review" \
-    || log "phase 1: one or more sector reviews exited non-zero or timed out (continuing)"
+# 11 migrated sectors → Python pipeline.
+PIPELINE_SECTORS=(atlas commodity energy fab fabless iron maya rex trump vera volt)
+# Legacy harness skills decommissioned (titan superseded by energy + commodity).
+# Keep .md files in .claude/commands/ for audit; orchestrator no longer fires.
+HARNESS_SKILLS=()
 
-log "phase 2: running mike-allocator"
+log "phase 1a: ${#PIPELINE_SECTORS[@]} sectors via Python pipeline (concurrency=$CONCURRENCY)"
+
+# Per-sector launcher wrapper so xargs can carry the timeout.
+run_pipeline_sector() {
+    local sector="$1"
+    timeout --foreground "$SKILL_TIMEOUT_SEC" \
+        "$PYTHON" "$SCRIPT_DIR/run_skill.py" "$sector" review \
+        >> "logs/${sector}-review.log" 2>&1
+}
+export -f run_pipeline_sector
+export PYTHON SCRIPT_DIR SKILL_TIMEOUT_SEC
+
+printf '%s\n' "${PIPELINE_SECTORS[@]}" \
+    | xargs -n1 -P "$CONCURRENCY" -I {} \
+        bash -c 'run_pipeline_sector "$@"' _ {} \
+    || log "phase 1a: one or more sector reviews exited non-zero or timed out (continuing)"
+
+if [[ ${#HARNESS_SKILLS[@]} -gt 0 ]]; then
+    log "phase 1b: legacy harness skills: ${HARNESS_SKILLS[*]}"
+    for skill in "${HARNESS_SKILLS[@]}"; do
+        timeout --foreground "$SKILL_TIMEOUT_SEC" \
+            bash "$SCRIPT_DIR/run_scheduled_skill.sh" "$skill" \
+            || log "phase 1b: $skill exited non-zero"
+    done
+fi
+
+log "phase 2: running mike-allocator (harness)"
 timeout --foreground "$SKILL_TIMEOUT_SEC" bash "$SCRIPT_DIR/run_scheduled_skill.sh" mike-allocator
 ec=$?
 if [[ $ec -ne 0 ]]; then log "phase 2: mike-allocator exited non-zero (exit=$ec, may be timeout 124)"; fi
 
-log "phase 3: running hourly-review heartbeat"
+log "phase 3: running hourly-review heartbeat (harness)"
 timeout --foreground "$SKILL_TIMEOUT_SEC" bash "$SCRIPT_DIR/run_scheduled_skill.sh" hourly-review
 ec=$?
 if [[ $ec -ne 0 ]]; then log "phase 3: heartbeat exited non-zero (exit=$ec, may be timeout 124)"; fi

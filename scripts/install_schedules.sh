@@ -1,23 +1,20 @@
 #!/usr/bin/env bash
 # Install the systemd USER timers that drive the desk:
 #   trading-hourly-review     (every hour — orchestrator fans out 11 sector
-#                              reviews + mike-allocator + heartbeat;
-#                              self-gates on quiet window + weekend)
+#                              reviews via Python pipeline + mike-allocator
+#                              on harness + heartbeat)
 #   trading-mike-morning      (weekdays 9:06 ET)
 #   trading-mike-midday       (weekdays 11:00 ET)
 #   trading-cassidy-evening   (weekdays 23:00 Phoenix)
 #   trading-sector-evenings   (weekdays 20:00 Phoenix — orchestrator fans
 #                              out 11 sector-evening attribution reviews)
+#   trading-weekly-tune       (Sundays 13:00 UTC — weekly model-tune
+#                              cycle across 11 sector model portfolios)
 #
-# Each timer fires its matching .service. The director timers (mike-morning,
-# mike-midday, cassidy-evening) run a single Claude Code skill. The orchestrator
-# timers (hourly-review, sector-evenings) run a bash fan-out via xargs that
-# launches multiple skills in parallel.
-#
-# Skill prompts are in .claude/commands/*.md and use the ibkr-trading MCP
-# server (.mcp.json). Each .service ultimately calls:
-#   claude -p "/<command-name>" --dangerously-skip-permissions
-# via scripts/run_scheduled_skill.sh.
+# Sector review/evening/model_tune skills run via the Python pipeline
+# (scripts/run_skill.py). Director skills (mike-{morning,midday,allocator},
+# cassidy-evening, hourly-review heartbeat, titan legacy) still go through
+# the Claude Code harness via scripts/run_scheduled_skill.sh.
 #
 # Idempotent: re-running this script just refreshes the unit files, then
 # re-enables the timers. Safe to run on every deploy / config change.
@@ -46,6 +43,7 @@ UNITS=(
     trading-cassidy-evening
     trading-sector-evenings
     trading-news-ingest
+    trading-weekly-tune
 )
 
 # Sanity: claude CLI present?
