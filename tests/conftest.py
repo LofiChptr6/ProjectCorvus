@@ -35,6 +35,17 @@ async def _init_schema():
     await close_pool()
 
 
+@pytest.fixture(autouse=True)
+def _no_real_telegram(monkeypatch):
+    """Default-deny real Telegram sends from any test. Tests that want to
+    verify the call install their own recorder over this."""
+    async def _noop_message(*a, **kw): return {"ok": True}
+    async def _noop_photo(*a, **kw): return {"ok": True}
+    import approval.telegram
+    monkeypatch.setattr(approval.telegram, "send_message", _noop_message, raising=False)
+    monkeypatch.setattr(approval.telegram, "send_photo", _noop_photo, raising=False)
+
+
 @pytest_asyncio.fixture
 async def test_agent():
     """Return a unique test-agent name; clean up rows after the test."""

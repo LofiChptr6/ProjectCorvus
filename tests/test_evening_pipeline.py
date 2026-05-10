@@ -146,12 +146,12 @@ async def test_evening_full_pipeline_writes_digest(test_agent, monkeypatch):
         lambda *a, **kw: _stub_client(scripted),
     )
 
-    # Stub out slide / telegram so we don't try to render real images.
-    from pipelines import runner_evening
+    # Stub slide + telegram so we don't render real images / hit user's chat.
+    from pipelines import notify, runner_evening
     async def _no_slide(*a, **kw): return None
-    async def _no_tg(*a, **kw): return False
+    async def _no_chart(*a, **kw): return False
     monkeypatch.setattr(runner_evening, "_generate_slide_safe", _no_slide)
-    monkeypatch.setattr(runner_evening, "_send_telegram_safe", _no_tg)
+    monkeypatch.setattr(notify, "send_chart_safe", _no_chart)
 
     result = await runner.run_skill(test_agent, "evening", dry_run=False)
 
@@ -170,24 +170,33 @@ async def test_evening_full_pipeline_writes_digest(test_agent, monkeypatch):
     assert float(row["pnl_today"]) == 120.0
 
 
-async def test_evening_dry_run_records_digest_skips_thesis_writes(test_agent, monkeypatch):
+async def test_evening_dry_run_does_everything_live_does(test_agent, monkeypatch):
+    """New contract: dry-run is full live pipeline. Slide generation, telegram,
+    digest, theses ALL fire — caption gets `[DRY-RUN] ` prepended so the user
+    can tell at a glance."""
     scripted = [_final(_evening_json(test_agent))]
     monkeypatch.setattr(
         runner.llm_client, "make_client",
         lambda *a, **kw: _stub_client(scripted),
     )
-    from pipelines import runner_evening
-    async def _no_slide(*a, **kw): return None
-    async def _no_tg(*a, **kw): return False
-    monkeypatch.setattr(runner_evening, "_generate_slide_safe", _no_slide)
-    monkeypatch.setattr(runner_evening, "_send_telegram_safe", _no_tg)
+    slide_calls: list[dict] = []
+    chart_calls: list[dict] = []
+    from pipelines import notify, runner_evening
+    async def _stub_slide(agent_name, output): slide_calls.append({"agent": agent_name}); return "/tmp/fake.png"
+    async def _stub_chart(image_path, caption, *, dry_run=False):
+        chart_calls.append({"caption": caption, "dry_run": dry_run})
+        return True
+    monkeypatch.setattr(runner_evening, "_generate_slide_safe", _stub_slide)
+    monkeypatch.setattr(notify, "send_chart_safe", _stub_chart)
 
     result = await runner.run_skill(test_agent, "evening", dry_run=True)
     assert result.write_summary["dry_run"] is True
-    # Theses skipped in dry-run.
-    assert result.write_summary["theses_recorded"] == 0
-    # Digest still recorded (it's audit-grade, not signal).
+    assert result.write_summary["theses_recorded"] == 1  # NOT skipped any more
     assert result.write_summary["digest_id"] is not None
+    assert len(slide_calls) == 1
+    assert len(chart_calls) == 1 and chart_calls[0]["dry_run"] is True
+    assert result.write_summary["telegram_sent"] is True
+    assert result.write_summary["chart_path"] == "/tmp/fake.png"
 
 
 async def test_evening_invalid_json_triggers_retry(test_agent, monkeypatch):
@@ -199,11 +208,11 @@ async def test_evening_invalid_json_triggers_retry(test_agent, monkeypatch):
         runner.llm_client, "make_client",
         lambda *a, **kw: _stub_client(scripted),
     )
-    from pipelines import runner_evening
+    from pipelines import notify, runner_evening
     async def _no_slide(*a, **kw): return None
-    async def _no_tg(*a, **kw): return False
+    async def _no_chart(*a, **kw): return False
     monkeypatch.setattr(runner_evening, "_generate_slide_safe", _no_slide)
-    monkeypatch.setattr(runner_evening, "_send_telegram_safe", _no_tg)
+    monkeypatch.setattr(notify, "send_chart_safe", _no_chart)
 
     result = await runner.run_skill(test_agent, "evening", dry_run=False)
     assert len(result.validation_errors) == 1

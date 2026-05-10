@@ -63,6 +63,36 @@ async def test_send_summary_safe_swallows_exceptions(monkeypatch):
     assert await notify.send_summary_safe("atlas", "hi") is False
 
 
+async def test_send_summary_safe_dry_run_prepends_prefix(telegram_recorder):
+    ok = await notify.send_summary_safe("atlas", "regime stable", dry_run=True)
+    assert ok is True
+    assert telegram_recorder.calls[0]["text"] == "[DRY-RUN] *atlas*: regime stable"
+
+
+async def test_send_chart_safe_dry_run_prepends_prefix(monkeypatch):
+    captured: list[dict] = []
+    async def fake_chart(image_path, caption):
+        captured.append({"image_path": image_path, "caption": caption})
+        return {"ok": True}
+    import approval.telegram
+    monkeypatch.setattr(approval.telegram, "send_photo", fake_chart)
+    ok = await notify.send_chart_safe("/tmp/x.png", "ATLAS | EOD", dry_run=True)
+    assert ok is True
+    assert captured[0]["caption"] == "[DRY-RUN] ATLAS | EOD"
+
+
+async def test_send_chart_safe_live_no_prefix(monkeypatch):
+    captured: list[dict] = []
+    async def fake_chart(image_path, caption):
+        captured.append({"image_path": image_path, "caption": caption})
+        return {"ok": True}
+    import approval.telegram
+    monkeypatch.setattr(approval.telegram, "send_photo", fake_chart)
+    ok = await notify.send_chart_safe("/tmp/x.png", "ATLAS | EOD", dry_run=False)
+    assert ok is True
+    assert captured[0]["caption"] == "ATLAS | EOD"
+
+
 # ── Fake OpenAI (mirrored from other test files) ─────────────────────────────
 
 
@@ -137,15 +167,18 @@ async def test_review_live_fires_telegram(test_agent, monkeypatch, telegram_reco
     assert telegram_recorder.calls[0]["text"] == f"*{test_agent}*: alpha"
 
 
-async def test_review_dry_run_does_not_fire_telegram(test_agent, monkeypatch, telegram_recorder):
+async def test_review_dry_run_fires_telegram_with_dry_run_prefix(test_agent, monkeypatch, telegram_recorder):
+    """New contract: dry-run is full live pipeline. Telegram fires with
+    `[DRY-RUN] ` prepended so the user knows it's not real signal."""
     scripted = [_final(_review_json_with_summary("beta"))]
     monkeypatch.setattr(
         runner.llm_client, "make_client",
         lambda *a, **kw: _stub_client(scripted),
     )
     result = await runner.run_skill(test_agent, "review", dry_run=True)
-    assert result.write_summary["telegram_sent"] is False
-    assert telegram_recorder.calls == []
+    assert result.write_summary["telegram_sent"] is True
+    assert len(telegram_recorder.calls) == 1
+    assert telegram_recorder.calls[0]["text"] == f"[DRY-RUN] *{test_agent}*: beta"
 
 
 async def test_review_live_with_empty_summary_does_not_fire(test_agent, monkeypatch, telegram_recorder):
@@ -200,17 +233,18 @@ async def test_model_tune_live_fires_telegram(tmp_path, telegram_recorder):
         )
 
 
-async def test_model_tune_dry_run_does_not_fire_telegram(tmp_path, telegram_recorder):
+async def test_model_tune_dry_run_fires_telegram_with_prefix(tmp_path, telegram_recorder):
+    """Dry-run fires the same Telegram as live, just `[DRY-RUN] `-prefixed."""
     test_agent_name = f"__tgtune_{uuid.uuid4().hex[:6]}__"
     parsed = _model_tune_payload("shadow run")
     res = await runner_model_tune.apply_model_tune_output(
         parsed, agent_name=test_agent_name, dry_run=True,
         repo_root=tmp_path,
     )
-    assert res["telegram_sent"] is False
-    assert telegram_recorder.calls == []
+    assert res["telegram_sent"] is True
+    assert len(telegram_recorder.calls) == 1
+    assert telegram_recorder.calls[0]["text"] == f"[DRY-RUN] *{test_agent_name}*: shadow run"
 
-    # Cleanup the recorded thesis (record_thesis always fires, even in dry-run).
     from db.schema import get_pool
     pool = await get_pool()
     async with pool.acquire() as conn:

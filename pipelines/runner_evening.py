@@ -40,24 +40,20 @@ async def _generate_slide_safe(
     return None
 
 
-async def _send_telegram_safe(chart_path: Optional[str], caption: Optional[str]) -> bool:
-    if not chart_path or not caption:
-        return False
-    try:
-        from approval.telegram import send_chart
-        await send_chart(image_path=chart_path, caption=caption)
-        return True
-    except Exception as e:
-        log.warning("send_telegram_chart skipped: %s", e)
-        return False
-
-
 async def apply_evening_output(
     parsed: EveningOutput,
     *,
     agent_name: str,
     dry_run: bool = False,
 ) -> dict[str, Any]:
+    """Dry-run = live in everything except `dry_run` flag on the digest row.
+
+    Slide generation, Telegram chart send, thesis write/grade, digest write all
+    fire in both modes. The Telegram caption is `[DRY-RUN]`-prefixed in dry-run
+    so the user can distinguish at a glance.
+    """
+    from pipelines import notify
+
     summary: dict[str, Any] = {
         "dry_run": dry_run,
         "digest_id": None,
@@ -67,13 +63,18 @@ async def apply_evening_output(
         "theses_graded": 0,
     }
 
-    chart_path = None
-    if not dry_run:
-        chart_path = await _generate_slide_safe(agent_name, parsed)
-        summary["chart_path"] = chart_path
-        summary["telegram_sent"] = await _send_telegram_safe(chart_path, parsed.telegram_caption)
+    # Always generate the slide. Slides are EOD artifacts the user actively
+    # looks for; they don't affect trading. _generate_slide_safe returns None
+    # if the renderer isn't available (e.g. in tests with stubbed deps).
+    chart_path = await _generate_slide_safe(agent_name, parsed)
+    summary["chart_path"] = chart_path
 
-    # Always record the digest — it's the durable record of the LLM's grading.
+    # Telegram with [DRY-RUN] prefix in dry-run.
+    summary["telegram_sent"] = await notify.send_chart_safe(
+        chart_path, parsed.telegram_caption, dry_run=dry_run,
+    )
+
+    # Digest row — durable record of the grading regardless of mode.
     today_iso = _date.today().isoformat()
     digest_id = await store.record_evening_digest(
         agent_name=agent_name,
@@ -87,19 +88,19 @@ async def apply_evening_output(
     )
     summary["digest_id"] = digest_id
 
-    if not dry_run:
-        for t in parsed.theses_to_record:
-            await store.record_thesis(
-                agent_name=agent_name, kind=t.kind,
-                title=t.title, body=t.body, verify_by=t.verify_by,
-                parent_id=t.parent_id, market_snapshot=t.market_snapshot,
-            )
-            summary["theses_recorded"] += 1
-        for g in parsed.theses_to_grade:
-            await store.update_thesis_status(
-                thesis_id=g.thesis_id, status=g.status,
-                resolution_note=g.resolution_note, agent_name=agent_name,
-            )
-            summary["theses_graded"] += 1
+    # Theses + grading — append-only audit, fires in both modes.
+    for t in parsed.theses_to_record:
+        await store.record_thesis(
+            agent_name=agent_name, kind=t.kind,
+            title=t.title, body=t.body, verify_by=t.verify_by,
+            parent_id=t.parent_id, market_snapshot=t.market_snapshot,
+        )
+        summary["theses_recorded"] += 1
+    for g in parsed.theses_to_grade:
+        await store.update_thesis_status(
+            thesis_id=g.thesis_id, status=g.status,
+            resolution_note=g.resolution_note, agent_name=agent_name,
+        )
+        summary["theses_graded"] += 1
 
     return summary

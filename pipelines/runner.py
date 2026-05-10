@@ -174,6 +174,11 @@ async def _apply_review_output(
         "dry_run": dry_run,
     }
 
+    # Trading-impacting writes (convictions/forecasts) — routed to *_shadow
+    # tables in dry-run, live tables otherwise. This is the ONE thing dry-run
+    # actually changes; everything else (theses, Telegram) fires either way
+    # so the pipeline gets exercised end-to-end. Dry-run telegrams are
+    # tagged `[DRY-RUN]` so the user can distinguish at a glance.
     if dry_run:
         await store.clear_agent_convictions_shadow(agent_name)
         for c in parsed.convictions:
@@ -201,36 +206,33 @@ async def _apply_review_output(
         )
         summary["forecasts_inserted"] = result["inserted"]
         summary["forecast_errors"] = result["errors"]
-        # Theses + Telegram intentionally skipped in shadow mode (zero side
-        # effects beyond shadow-table writes — that's the contract of dry-run).
-        summary["telegram_sent"] = False
-        return summary
+    else:
+        await store.clear_agent_convictions(agent_name)
+        for c in parsed.convictions:
+            await store.upsert_conviction(
+                agent_name=agent_name,
+                symbol=c.symbol,
+                direction=c.direction,
+                conviction=c.conviction,
+                expected_return_pct=c.expected_return_pct,
+                time_to_target_days=c.time_to_target_days,
+                rationale=c.rationale,
+                model_inputs=c.model_inputs,
+                expires_in_hours=c.expires_in_hours,
+                momentum_confirmed=c.momentum_confirmed,
+                stop_pct=c.stop_pct,
+            )
+            summary["convictions_inserted"] += 1
 
-    # Live path.
-    await store.clear_agent_convictions(agent_name)
-    for c in parsed.convictions:
-        await store.upsert_conviction(
-            agent_name=agent_name,
-            symbol=c.symbol,
-            direction=c.direction,
-            conviction=c.conviction,
-            expected_return_pct=c.expected_return_pct,
-            time_to_target_days=c.time_to_target_days,
-            rationale=c.rationale,
-            model_inputs=c.model_inputs,
-            expires_in_hours=c.expires_in_hours,
-            momentum_confirmed=c.momentum_confirmed,
-            stop_pct=c.stop_pct,
+        await store.clear_agent_forecasts(agent_name)
+        result = await store.upsert_forecasts_batch(
+            agent_name, [f.model_dump() for f in parsed.forecasts],
         )
-        summary["convictions_inserted"] += 1
+        summary["forecasts_inserted"] = result.get("inserted", 0)
+        summary["forecast_errors"] = result.get("errors", [])
 
-    await store.clear_agent_forecasts(agent_name)
-    result = await store.upsert_forecasts_batch(
-        agent_name, [f.model_dump() for f in parsed.forecasts],
-    )
-    summary["forecasts_inserted"] = result.get("inserted", 0)
-    summary["forecast_errors"] = result.get("errors", [])
-
+    # Theses (journal) — write in BOTH modes. Dry-run validates the full
+    # pipeline; theses are append-only audit, low blast radius.
     for t in parsed.theses_to_record:
         await store.record_thesis(
             agent_name=agent_name,
@@ -247,12 +249,11 @@ async def _apply_review_output(
         )
         summary["theses_graded"] += 1
 
-    # Mirror titan-review.md (harness path): one short Telegram per sector
-    # per hourly review so the user can SEE the sector thinking, not just
-    # the allocator's NAV ping. Skipped in dry-run.
+    # Telegram — fires in BOTH modes. Dry-run prepends `[DRY-RUN] ` so the
+    # user can validate the full per-sector message contract before flipping.
     from pipelines import notify
     summary["telegram_sent"] = await notify.send_summary_safe(
-        agent_name, parsed.telegram_summary,
+        agent_name, parsed.telegram_summary, dry_run=dry_run,
     )
 
     return summary
