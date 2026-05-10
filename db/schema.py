@@ -433,6 +433,62 @@ END $$""",
     "CREATE INDEX IF NOT EXISTS idx_orders_agent_status ON orders (agent_name, status)",
     "CREATE INDEX IF NOT EXISTS idx_orders_created ON orders (created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_fills_agent_filled ON fills (agent_name, filled_at DESC)",
+    # Per-agent inbox — questions the user posts from the dashboard chat.
+    # The matching `*-respond` skill picks up rows where responded_at IS NULL,
+    # writes response_body, and stamps responded_at. The table predates the
+    # schema-managed bootstrap; CREATE TABLE IF NOT EXISTS makes this a no-op
+    # on databases that already have it.
+    """CREATE TABLE IF NOT EXISTS agent_inbox (
+        id                  BIGSERIAL PRIMARY KEY,
+        agent_name          TEXT NOT NULL,
+        sender              TEXT NOT NULL DEFAULT 'user',
+        body                TEXT NOT NULL,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        triggered_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        responded_at        TIMESTAMPTZ,
+        response_body       TEXT,
+        response_session_id TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_inbox_pending ON agent_inbox (agent_name, created_at DESC) WHERE responded_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_inbox_recent ON agent_inbox (agent_name, created_at DESC)",
+    # Shadow tables — mirror agent_conviction / agent_forecast for the new
+    # Python pipeline's dry-run mode. Reviews written in shadow mode go here
+    # so we can diff against the live conviction/forecast tables (harness
+    # output) before flipping the cutover. NO foreign keys, NO uniqueness on
+    # symbol — multiple shadow runs in a row are allowed for the same hour.
+    """CREATE TABLE IF NOT EXISTS agent_conviction_shadow (
+        id                    BIGSERIAL PRIMARY KEY,
+        agent_name            TEXT NOT NULL,
+        symbol                TEXT NOT NULL,
+        direction             TEXT NOT NULL,
+        conviction            NUMERIC NOT NULL,
+        expected_return_pct   NUMERIC,
+        time_to_target_days   INTEGER,
+        rationale             TEXT,
+        model_inputs          JSONB,
+        momentum_confirmed    BOOLEAN,
+        stop_pct              NUMERIC,
+        submitted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at            TIMESTAMPTZ NOT NULL,
+        run_session_id        TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_conv_shadow_agent_run ON agent_conviction_shadow (agent_name, submitted_at DESC)",
+    """CREATE TABLE IF NOT EXISTS agent_forecast_shadow (
+        id                    BIGSERIAL PRIMARY KEY,
+        agent_name            TEXT NOT NULL,
+        symbol                TEXT NOT NULL,
+        horizon               TEXT NOT NULL,
+        expected_return_pct   NUMERIC NOT NULL,
+        likelihood            NUMERIC NOT NULL,
+        time_to_target_days   INTEGER NOT NULL,
+        forecast_score        NUMERIC NOT NULL,
+        method                TEXT NOT NULL,
+        rationale             TEXT,
+        submitted_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        expires_at            TIMESTAMPTZ NOT NULL,
+        run_session_id        TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_forecast_shadow_agent_run ON agent_forecast_shadow (agent_name, submitted_at DESC)",
 ]
 
 

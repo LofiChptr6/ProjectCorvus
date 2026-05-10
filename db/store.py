@@ -582,6 +582,217 @@ async def get_all_open_theses() -> dict[str, list[dict]]:
         return out
 
 
+# ── Agent inbox (dashboard chat → per-agent question routing) ────────────────
+# Pending == responded_at IS NULL. No status column — the timestamp IS the state.
+
+
+async def post_to_inbox(
+    agent_name: str,
+    body: str,
+    sender: str = "user",
+) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO agent_inbox (agent_name, body, sender)
+               VALUES ($1,$2,$3)
+               RETURNING id""",
+            agent_name, body, sender,
+        )
+        return int(row["id"])
+
+
+async def get_pending_inbox(agent_name: str, limit: int = 20) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, agent_name, body, sender, created_at
+               FROM agent_inbox
+               WHERE agent_name=$1 AND responded_at IS NULL
+               ORDER BY created_at ASC
+               LIMIT $2""",
+            agent_name, limit,
+        )
+        return [dict(r) for r in rows]
+
+
+async def mark_inbox_responded(
+    inbox_id: int,
+    response_body: str,
+    agent_name: str,
+    response_session_id: Optional[str] = None,
+) -> bool:
+    """Stamp responded_at + response_body on a pending row. Server enforces
+    ownership: row must belong to `agent_name` and still be pending. Returns
+    True on update, False if row missing / wrong owner / already responded."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE agent_inbox
+               SET response_body=$2, responded_at=NOW(), response_session_id=$4
+               WHERE id=$1 AND agent_name=$3 AND responded_at IS NULL
+               RETURNING id""",
+            inbox_id, response_body, agent_name, response_session_id,
+        )
+        return row is not None
+
+
+async def get_recent_inbox(agent_name: str, limit: int = 10) -> list[dict]:
+    """Recent rows for the dashboard 'Recent Q&A' expander — both pending and responded."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, body, sender, created_at, responded_at, response_body
+               FROM agent_inbox
+               WHERE agent_name=$1
+               ORDER BY created_at DESC
+               LIMIT $2""",
+            agent_name, limit,
+        )
+        return [dict(r) for r in rows]
+
+
+# ── Shadow writes (Python pipeline dry-run) ──────────────────────────────────
+# Mirror upsert_conviction / upsert_forecasts_batch / clear_agent_convictions /
+# clear_agent_forecasts but route to *_shadow tables. Used by pipelines/runner
+# during the review cutover to diff Python-pipeline output vs harness output
+# without polluting live conviction signals.
+
+
+async def clear_agent_convictions_shadow(agent_name: str, run_session_id: Optional[str] = None) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if run_session_id:
+            result = await conn.execute(
+                "DELETE FROM agent_conviction_shadow WHERE agent_name=$1 AND run_session_id=$2",
+                agent_name, run_session_id,
+            )
+        else:
+            result = await conn.execute(
+                "DELETE FROM agent_conviction_shadow WHERE agent_name=$1",
+                agent_name,
+            )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
+
+async def insert_conviction_shadow(
+    agent_name: str,
+    symbol: str,
+    direction: str,
+    conviction: float,
+    expected_return_pct: Optional[float] = None,
+    time_to_target_days: Optional[int] = None,
+    rationale: Optional[str] = None,
+    model_inputs: Optional[dict] = None,
+    expires_in_hours: int = 1,
+    momentum_confirmed: Optional[bool] = None,
+    stop_pct: Optional[float] = None,
+    run_session_id: Optional[str] = None,
+) -> int:
+    from datetime import datetime, timedelta, timezone
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO agent_conviction_shadow
+               (agent_name, symbol, direction, conviction, expected_return_pct,
+                time_to_target_days, rationale, model_inputs, momentum_confirmed,
+                stop_pct, expires_at, run_session_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+               RETURNING id""",
+            agent_name, symbol.upper(), direction, conviction, expected_return_pct,
+            time_to_target_days, rationale,
+            json.dumps(model_inputs) if model_inputs else None,
+            momentum_confirmed, stop_pct, expires_at, run_session_id,
+        )
+        return int(row["id"])
+
+
+async def clear_agent_forecasts_shadow(agent_name: str, run_session_id: Optional[str] = None) -> int:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if run_session_id:
+            result = await conn.execute(
+                "DELETE FROM agent_forecast_shadow WHERE agent_name=$1 AND run_session_id=$2",
+                agent_name, run_session_id,
+            )
+        else:
+            result = await conn.execute(
+                "DELETE FROM agent_forecast_shadow WHERE agent_name=$1",
+                agent_name,
+            )
+        try:
+            return int(result.split()[-1])
+        except (ValueError, IndexError):
+            return 0
+
+
+def _horizon_for_days(days: int) -> str:
+    if days <= 1:
+        return "intraday"
+    if days <= 5:
+        return "near"
+    if days <= 30:
+        return "far"
+    return "cycle"
+
+
+async def insert_forecasts_batch_shadow(
+    agent_name: str,
+    rows: list[dict],
+    expires_in_hours: int = 2,
+    run_session_id: Optional[str] = None,
+) -> dict:
+    if not rows:
+        return {"inserted": 0, "errors": []}
+    from datetime import datetime, timedelta, timezone
+    expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)
+
+    inserted = 0
+    errors: list[dict] = []
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        for r in rows:
+            try:
+                sym = str(r["symbol"]).upper()
+                er = float(r["expected_return_pct"])
+                lk = float(r["likelihood"])
+                td = int(r["time_to_target_days"])
+                method = str(r.get("method", "model"))
+                rationale = r.get("rationale")
+                horizon = r.get("horizon") or _horizon_for_days(td)
+                forecast_score = (er * lk / max(td, 1))
+                await conn.execute(
+                    """INSERT INTO agent_forecast_shadow
+                       (agent_name, symbol, horizon, expected_return_pct, likelihood,
+                        time_to_target_days, forecast_score, method, rationale,
+                        expires_at, run_session_id)
+                       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)""",
+                    agent_name, sym, horizon, er, lk, td, forecast_score, method,
+                    rationale, expires_at, run_session_id,
+                )
+                inserted += 1
+            except Exception as e:
+                errors.append({"row": r, "error": f"{type(e).__name__}: {e}"})
+    return {"inserted": inserted, "errors": errors}
+
+
+async def list_recent_conviction_shadow(
+    agent_name: str, limit: int = 100,
+) -> list[dict]:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT * FROM agent_conviction_shadow
+               WHERE agent_name=$1 ORDER BY submitted_at DESC LIMIT $2""",
+            agent_name, limit,
+        )
+        return [dict(r) for r in rows]
+
+
 # ── Agent tool gaps ──────────────────────────────────────────────────────────
 
 _VALID_GAP_PRIORITIES = {"low", "normal", "high"}

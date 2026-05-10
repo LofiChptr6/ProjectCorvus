@@ -1158,6 +1158,49 @@ async def get_all_journals(caller: str) -> str:
     return json.dumps({"journals": await store.get_all_open_theses()}, default=str)
 
 
+# ── Agent inbox (dashboard chat → per-agent question routing) ────────────────
+
+@mcp.tool()
+async def get_my_inbox(agent_name: str) -> str:
+    """
+    Read pending dashboard questions addressed to your agent. Used by the
+    /<agent>-respond skill: each pending row is a question the user typed into
+    your dashboard cell. After answering, call mark_inbox_responded.
+
+    Args:
+        agent_name: Your agent name (e.g. 'atlas', 'rex').
+    """
+    await _ensure_init_light()
+    from db import store
+    pending = await store.get_pending_inbox(agent_name)
+    return json.dumps({"pending": pending}, default=str)
+
+
+@mcp.tool()
+async def mark_inbox_responded(
+    inbox_id: int,
+    response_body: str,
+    agent_name: str,
+) -> str:
+    """
+    Mark a pending inbox row as responded with the agent's reply text. The
+    dashboard surfaces the reply in the agent's "Recent Q&A" expander on next
+    refresh. Server enforces ownership: only the agent named on the row can
+    respond, and only while the row is still 'pending'.
+
+    Args:
+        inbox_id: ID of the pending row (from get_my_inbox).
+        response_body: Your full reply (1-3 paragraphs).
+        agent_name: Your agent name. Must match the row's agent_name.
+    """
+    await _ensure_init_light()
+    from db import store
+    updated = await store.mark_inbox_responded(
+        inbox_id=inbox_id, response_body=response_body, agent_name=agent_name,
+    )
+    return json.dumps({"updated": updated})
+
+
 # ── Tool-gap requests ─────────────────────────────────────────────────────────
 
 @mcp.tool()
