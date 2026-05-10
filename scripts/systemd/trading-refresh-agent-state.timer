@@ -1,0 +1,14 @@
+[Unit]
+Description=Trading per-agent state hourly snapshot timer — every hour at :05
+
+[Timer]
+# Replaces the cron entry in install_scheduled_tasks.sh, which silently failed
+# because the unquoted path-with-space (`/home/tianyizhang/opus trading/...`)
+# made cron try to exec `/home/tianyizhang/opus`. systemd handles spaces.
+OnCalendar=*-*-* *:05:00
+Persistent=true
+AccuracySec=30s
+Unit=trading-refresh-agent-state.service
+
+[Install]
+WantedBy=timers.target

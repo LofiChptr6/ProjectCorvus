@@ -1,0 +1,18 @@
+[Unit]
+Description=Trading sector-evenings timer — fires at 20:00 Phoenix, weekdays (post market close)
+
+[Timer]
+# Phoenix is MST (UTC-7, no DST). NY observes DST.
+#   EDT (Mar–Nov):  20:00 Phoenix = 23:00 ET (3h after 16:00 ET close)
+#   EST (Nov–Mar):  21:00 Phoenix = 23:00 ET (swap when DST flips)
+# To switch seasons, edit the hour below and `systemctl --user daemon-reload && systemctl --user restart trading-sector-evenings.timer`.
+#
+# Each sector-evening reads its day's attributed P&L, grades predictions, builds
+# the slide, and pings Telegram. Orchestrator self-skips on weekends.
+OnCalendar=Mon..Fri *-*-* 20:00:00
+Persistent=true
+AccuracySec=30s
+Unit=trading-sector-evenings.service
+
+[Install]
+WantedBy=timers.target

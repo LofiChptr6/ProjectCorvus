@@ -43,6 +43,7 @@ UNITS=(
     trading-cassidy-evening
     trading-sector-evenings
     trading-news-ingest
+    trading-refresh-agent-state
     trading-weekly-tune
 )
 

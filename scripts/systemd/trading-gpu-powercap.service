@@ -1,0 +1,16 @@
+[Unit]
+Description=GPU power cap — limit RTX PRO 6000 sustained draw to 540 W (90% of 600 W TDP)
+Documentation=man:nvidia-smi(1)
+After=nvidia-persistenced.service
+Wants=nvidia-persistenced.service
+Before=systemd-user-sessions.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/nvidia-smi -pm 1
+ExecStart=/usr/bin/nvidia-smi -pl 540
+ExecStop=/usr/bin/nvidia-smi -pl 600
+
+[Install]
+WantedBy=multi-user.target

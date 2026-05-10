@@ -1,0 +1,14 @@
+[Unit]
+Description=Trading per-agent state hourly snapshot — deterministic, no LLM
+Documentation=file:///home/tianyizhang/opus%20trading/scripts/refresh_agent_state.sh
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/tianyizhang/opus trading
+Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash "/home/tianyizhang/opus trading/scripts/refresh_agent_state.sh"
+TimeoutStartSec=600
+StandardOutput=append:/home/tianyizhang/opus trading/logs/refresh_agent_state.log
+StandardError=append:/home/tianyizhang/opus trading/logs/refresh_agent_state.log
