@@ -140,6 +140,46 @@ SCHEMA_STATEMENTS = [
     # Dedup on Massive's article_id so the news ingestor can ON CONFLICT DO NOTHING.
     "CREATE UNIQUE INDEX IF NOT EXISTS news_items_article_id_uniq ON news_items (article_id) WHERE article_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS news_items_symbol_published_idx ON news_items (symbol, published_at DESC NULLS LAST)",
+    # Phase A timely-news pipeline: categorize + agent-tag at ingest. category /
+    # importance are derived from Benzinga channels + headline patterns;
+    # agent_tags is snapshotted from sector_map so dashboard + context queries
+    # don't reparse YAML on every render and ownership doesn't retroactively
+    # rewrite if sector_map changes.
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS category   TEXT",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS importance TEXT",
+    "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS agent_tags TEXT[]",
+    "CREATE INDEX IF NOT EXISTS news_items_agent_tags_gin ON news_items USING GIN (agent_tags)",
+    "CREATE INDEX IF NOT EXISTS news_items_importance_published_idx ON news_items (importance, published_at DESC NULLS LAST)",
+    # GIN on post.meta enables agent-tag and article_id lookups via @> / ->>.
+    # Used by find_post_by_article_id (news-headlines dedup).
+    "CREATE INDEX IF NOT EXISTS post_meta_gin ON post USING GIN (meta)",
+    # Phase B semantic recall (pgvector): columns + HNSW index are extension-
+    # gated so this same SCHEMA_STATEMENTS runs cleanly whether pgvector is
+    # installed or not. CREATE EXTENSION must be run separately by superuser:
+    #     sudo -u postgres psql -d trading -c 'CREATE EXTENSION IF NOT EXISTS vector'
+    """DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_extension WHERE extname='vector') THEN
+        ALTER TABLE news_items ADD COLUMN IF NOT EXISTS embedding   vector(1024);
+        ALTER TABLE news_items ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ;
+        ALTER TABLE news_items ADD COLUMN IF NOT EXISTS embed_model TEXT;
+      END IF;
+    END $$""",
+    # Idempotent index creation guarded the same way. CREATE INDEX requires the
+    # `embedding` column to exist, hence the extension check.
+    """DO $$
+    BEGIN
+      IF EXISTS (SELECT 1 FROM pg_extension WHERE extname='vector')
+         AND EXISTS (SELECT 1 FROM information_schema.columns
+                     WHERE table_name='news_items' AND column_name='embedding') THEN
+        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_news_embedding_hnsw
+                   ON news_items USING hnsw (embedding vector_cosine_ops)
+                   WITH (m = 16, ef_construction = 64)
+                   WHERE embedding IS NOT NULL AND published_at > ''2026-01-01''';
+        EXECUTE 'CREATE INDEX IF NOT EXISTS idx_news_embed_pending
+                   ON news_items (published_at DESC) WHERE embedding IS NULL';
+      END IF;
+    END $$""",
     # Per-agent thesis/memory journal (append-only). Status updates on existing
     # rows; new ideas append new rows. parent_id chains supersedes/refinements.
     """CREATE TABLE IF NOT EXISTS agent_thesis (

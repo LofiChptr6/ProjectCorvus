@@ -187,6 +187,41 @@ async def get_bars(
 
 # ── get_news ─────────────────────────────────────────────────────────────────
 
+def _flatten_news_item(n: dict, default_symbol: Optional[str] = None) -> dict:
+    """Common Polygon→our-shape flattener used by get_news + get_market_news."""
+    publisher = n.get("publisher") or {}
+    # Tickers: prefer the explicit `tickers` array Massive emits at the top level;
+    # fall back to insights[].ticker (Benzinga shape). default_symbol is used when
+    # the caller is a per-ticker fetch (so we always tag at least the queried sym).
+    tickers = n.get("tickers") or []
+    insights = n.get("insights") or []
+    if not tickers and isinstance(insights, list):
+        tickers = [i.get("ticker") for i in insights if isinstance(i, dict) and i.get("ticker")]
+    if not tickers and default_symbol:
+        tickers = [default_symbol]
+    primary = (tickers[0] if tickers else default_symbol) or None
+    # Sentiment: top-level first, else from the matching insights entry.
+    sentiment = n.get("sentiment")
+    if sentiment is None and isinstance(insights, list) and insights:
+        match = next(
+            (i for i in insights if (i or {}).get("ticker") == primary),
+            insights[0],
+        )
+        sentiment = (match or {}).get("sentiment")
+    return {
+        "time": n.get("published_utc", ""),
+        "symbol": primary,
+        "tickers": tickers,
+        "headline": n.get("title", ""),
+        "provider": publisher.get("name", ""),
+        "article_id": n.get("id", ""),
+        "url": n.get("article_url") or n.get("url"),
+        "body": n.get("description") or n.get("body"),
+        "sentiment": sentiment,
+        "channels": n.get("keywords") or n.get("channels") or [],
+    }
+
+
 async def get_news(symbol: Optional[str] = None, max_items: int = 10) -> dict:
     """Return shape: {symbol, headlines: [{time, symbol, headline, provider, article_id, ...}]}.
 
@@ -207,31 +242,26 @@ async def get_news(symbol: Optional[str] = None, max_items: int = 10) -> dict:
     }
     data = await _get_json("/v2/reference/news", params=params)
     results = data.get("results") or []
-    headlines = []
-    for n in results:
-        publisher = n.get("publisher") or {}
-        # Sentiment may live under several keys depending on Massive's flattening
-        # of Benzinga insights. Try the obvious ones; surface None if not present.
-        sentiment = n.get("sentiment")
-        if sentiment is None:
-            insights = n.get("insights") or []
-            if isinstance(insights, list) and insights:
-                # Take the entry whose `ticker` matches our symbol if any.
-                match = next((i for i in insights if (i or {}).get("ticker") == sym), insights[0])
-                sentiment = (match or {}).get("sentiment")
-        headlines.append({
-            "time": n.get("published_utc", ""),
-            "symbol": sym,
-            "headline": n.get("title", ""),
-            "provider": publisher.get("name", ""),
-            "article_id": n.get("id", ""),
-            # Benzinga-enriched fields (None / [] when absent)
-            "url": n.get("article_url") or n.get("url"),
-            "body": n.get("description") or n.get("body"),
-            "sentiment": sentiment,
-            "channels": n.get("keywords") or n.get("channels") or [],
-        })
+    headlines = [_flatten_news_item(n, default_symbol=sym) for n in results]
     return {"symbol": sym, "headlines": headlines}
+
+
+async def get_market_news(max_items: int = 50, channels: Optional[list[str]] = None) -> dict:
+    """No-ticker news pull — catches macro headlines (FOMC, jobs, OPEC) that
+    don't show up under any single ticker. Same shape as get_news; `symbol` on
+    each headline is the first ticker Massive associates (may be None).
+    Optionally filter by Benzinga channel (e.g. ['Earnings', 'M&A'])."""
+    params: dict[str, object] = {
+        "limit": max(1, min(int(max_items), 1000)),
+        "order": "descending",
+        "sort": "published_utc",
+    }
+    if channels:
+        params["channels"] = ",".join(channels)
+    data = await _get_json("/v2/reference/news", params=params)
+    results = data.get("results") or []
+    headlines = [_flatten_news_item(n, default_symbol=None) for n in results]
+    return {"symbol": None, "headlines": headlines}
 
 
 async def aclose() -> None:

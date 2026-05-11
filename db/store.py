@@ -370,12 +370,19 @@ async def write_news(
     sentiment: Optional[str] = None,
     channels: Optional[list[str]] = None,
     published_at: Optional[str] = None,
+    category: Optional[str] = None,
+    importance: Optional[str] = None,
+    agent_tags: Optional[list[str]] = None,
     db_path: str = DB_PATH,
 ) -> None:
     """Insert a news item; ON CONFLICT (article_id) DO NOTHING so reruns are safe.
 
     `published_at` accepts an ISO-8601 string ('2026-05-08T20:39:04Z' style) and
     is parsed to datetime here — asyncpg won't auto-cast strings to TIMESTAMPTZ.
+
+    category/importance/agent_tags are Phase A snapshot-at-ingest columns.
+    They're optional so legacy callers continue to work; the Phase A ingest
+    pipeline always passes them.
     """
     pub_dt = None
     if published_at:
@@ -387,18 +394,136 @@ async def write_news(
             pub_dt = None
     pool = await get_pool()
     async with pool.acquire() as conn:
+        # ON CONFLICT DO UPDATE on Phase A metadata only. The body/headline/url
+        # are immutable (article content doesn't change), but category /
+        # importance / agent_tags reflect categorization rules + sector map at
+        # ingest time — re-running after a rules tweak should re-tag existing
+        # rows. Other columns are kept as-is to preserve the original fetch.
         await conn.execute(
             """
             INSERT INTO news_items
                 (fetched_at, symbol, headline, article_id, provider,
-                 url, body, sentiment, channels, published_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-            ON CONFLICT (article_id) WHERE article_id IS NOT NULL DO NOTHING
+                 url, body, sentiment, channels, published_at,
+                 category, importance, agent_tags)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ON CONFLICT (article_id) WHERE article_id IS NOT NULL DO UPDATE SET
+                category   = EXCLUDED.category,
+                importance = EXCLUDED.importance,
+                agent_tags = EXCLUDED.agent_tags
             """,
             _now(), symbol, headline, article_id, provider,
             url, body, sentiment, channels or None,
             pub_dt,
+            category, importance, agent_tags or None,
         )
+
+
+async def get_recent_news_for_agent(
+    agent_name: str,
+    hours: int = 2,
+    limit: int = 20,
+    importance: Optional[str] = None,
+) -> list[dict]:
+    """News tagged for one agent, newest first, with importance='high' rows
+    sorted before normal ones. Phase A context injection + dashboard expander
+    consume this."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        sql_parts = ["agent_tags @> ARRAY[$1]::text[]",
+                     "COALESCE(published_at, fetched_at::timestamptz) > NOW() - ($2 || ' hours')::interval"]
+        params: list = [agent_name, str(int(hours))]
+        if importance:
+            sql_parts.append(f"importance = ${len(params)+1}")
+            params.append(importance)
+        params.append(int(limit))
+        sql = f"""
+            SELECT id, fetched_at, symbol, headline, article_id, provider, url,
+                   body, sentiment, channels, published_at, category, importance,
+                   agent_tags
+            FROM news_items
+            WHERE {' AND '.join(sql_parts)}
+            ORDER BY (importance = 'high') DESC,
+                     COALESCE(published_at, fetched_at::timestamptz) DESC
+            LIMIT ${len(params)}
+        """
+        rows = await conn.fetch(sql, *params)
+        return [dict(r) for r in rows]
+
+
+async def get_recent_high_importance_news(
+    hours: int = 2,
+    limit: int = 20,
+) -> list[dict]:
+    """Desk-wide high-importance news (no agent filter). Used by Mike + Cassidy
+    paths — they get a cross-sector view of earnings + M&A + guidance items
+    rather than a per-sector filtered feed."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT id, fetched_at, symbol, headline, article_id, provider, url,
+                   body, sentiment, channels, published_at, category, importance,
+                   agent_tags
+            FROM news_items
+            WHERE importance = 'high'
+              AND COALESCE(published_at, fetched_at::timestamptz) > NOW() - ($1 || ' hours')::interval
+            ORDER BY COALESCE(published_at, fetched_at::timestamptz) DESC
+            LIMIT $2
+            """,
+            str(int(hours)), int(limit),
+        )
+        return [dict(r) for r in rows]
+
+
+async def find_post_by_article_id(article_id: str) -> Optional[int]:
+    """Return post.id of any existing post in news-headlines thread carrying
+    this article_id in meta. Used by the ingestor to skip thread-side dups.
+    GIN index on post.meta makes this O(few ms)."""
+    if not article_id:
+        return None
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT p.id FROM post p
+               JOIN thread t ON t.id = p.thread_id
+               WHERE t.slug = 'news-headlines'
+                 AND p.meta @> jsonb_build_object('article_id', $1::text)
+               LIMIT 1""",
+            article_id,
+        )
+        return int(row["id"]) if row else None
+
+
+async def set_news_embedding(
+    article_id: str,
+    embedding: list[float],
+    model: str,
+) -> bool:
+    """Update embedding + embedded_at + embed_model for one news row.
+    Returns True if the row was found and updated, False otherwise.
+    Used by Phase B (semantic recall) — both inline at ingest and by the
+    backfill sweeper. No-op when pgvector columns are absent (catches the
+    column-missing exception and returns False)."""
+    if not article_id or not embedding:
+        return False
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        try:
+            # Cast embedding list to vector via ::vector — works without the
+            # asyncpg pgvector codec being registered.
+            vec_str = "[" + ",".join(f"{float(x):.6f}" for x in embedding) + "]"
+            result = await conn.execute(
+                """UPDATE news_items
+                      SET embedding = $1::vector,
+                          embedded_at = NOW(),
+                          embed_model = $2
+                    WHERE article_id = $3""",
+                vec_str, model, article_id,
+            )
+            return result.endswith(" 1")
+        except Exception:
+            # pgvector not installed yet, or column missing — silent no-op.
+            return False
 
 
 async def get_recent_news(

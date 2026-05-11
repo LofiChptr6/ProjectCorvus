@@ -1,0 +1,15 @@
+[Unit]
+Description=Trading embed sweeper timer — backfill NULL-embedding rows every 5 min
+
+[Timer]
+# Every 5 min, 24/7. The sweeper is a fast no-op when nothing's pending
+# (idx_news_embed_pending partial index keeps the count(*) cheap), so the
+# weekend cost is negligible. Catches both backlog and inline-embed failures
+# from the ingest timer.
+OnCalendar=*-*-* *:00/5:00
+Persistent=true
+AccuracySec=30s
+Unit=trading-embed-sweeper.service
+
+[Install]
+WantedBy=timers.target

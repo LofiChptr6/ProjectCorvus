@@ -265,6 +265,57 @@ async def get_news(symbol: Optional[str] = None, max_items: int = 10) -> str:
     return json.dumps(await _get_news(symbol, max_items))
 
 
+@mcp.tool()
+async def semantic_news_recall(
+    query: str,
+    top_k: int = 10,
+    half_life_hours: float = 24.0,
+    agent_name: Optional[str] = None,
+    symbols: Optional[list[str]] = None,
+    max_age_days: int = 30,
+) -> str:
+    """
+    Search recent news by SEMANTIC SIMILARITY to a free-text query, with
+    exponential time-decay weighting. Use this when you need older-but-still-
+    relevant articles that wouldn't appear in get_news() (which only returns
+    the latest headlines per ticker).
+
+    Score formula:
+        score = cosine_similarity(query, article) * exp(-ln(2) * hours_old / half_life_hours)
+
+    A half_life_hours of 24 means an article from 24h ago at sim=1.0 ties
+    one from 30 min ago at sim=0.5. Use 168 (=7d) for weekly themes,
+    720 (=30d) for month-scale narratives.
+
+    Args:
+        query: Free-text describing what you want — e.g.
+               "OPEC production cuts and crude oversupply" or
+               "EV demand softening in China"
+        top_k: How many results to return (default 10).
+        half_life_hours: Time-decay constant. 24=hot, 168=weekly, 720=monthly.
+        agent_name: For logging only; does not filter results.
+        symbols: Optional whitelist of tickers (e.g. ["XLE","XOM","CVX"]).
+        max_age_days: Hard cutoff — older articles excluded (default 30).
+
+    Returns:
+        JSON list of {id, symbol, headline, body, url, published_at, provider,
+        sentiment, sim, hours_old, score} sorted by score desc. Empty list
+        if no semantic provider is configured or pgvector isn't installed —
+        check the logs for the cause.
+    """
+    await _ensure_init()
+    from db.semantic import semantic_news_recall as _recall
+    rows = await _recall(
+        query_text=query,
+        agent_name=agent_name,
+        top_k=top_k,
+        half_life_hours=half_life_hours,
+        symbol_filter=symbols,
+        max_age_days=max_age_days,
+    )
+    return json.dumps(rows, default=str)
+
+
 # ── Account ───────────────────────────────────────────────────────────────────
 
 @mcp.tool()

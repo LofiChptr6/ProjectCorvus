@@ -1,11 +1,11 @@
 [Unit]
-Description=Trading news ingest timer — every 15 min on weekdays (script no-ops cheaply outside RTH)
+Description=Trading news ingest timer — every 10 min on weekdays 24h (covers pre/post-market earnings)
 
 [Timer]
-# Every 15 min on the quarter-hour, weekdays only. systemd's calendar specifier
-# rejects step ranges across hour boundaries (`HH..HH/0:15:00` is a bad-setting),
-# so we keep it simple and let the script handle market-hours filtering itself.
-OnCalendar=Mon..Fri *-*-* *:00,15,30,45:00
+# Every 10 min, weekdays 24h. Pre-market and after-hours news (earnings releases,
+# foreign-market opens, late M&A drops) move next-day positions — cassidy-evening
+# at 23:00 MT and mike-morning at 09:06 ET both want fresh items.
+OnCalendar=Mon..Fri *-*-* *:00/10:00
 Persistent=true
 AccuracySec=30s
 Unit=trading-news-ingest.service

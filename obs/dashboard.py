@@ -278,6 +278,85 @@ def _render_recent_qa(agent: str) -> None:
             st.divider()
 
 
+# ── Per-agent news feed (Phase A) ─────────────────────────────────────────────
+# Reads news_items rows tagged for the given agent (or for mike/cassidy, the
+# desk-wide high-importance feed). Earnings + M&A items get a ⭐ marker.
+
+_DIRECTOR_AGENTS_DASH = {"mike", "cassidy"}
+
+
+async def _recent_news_for_agent_async(agent: str, limit: int = 8) -> list[dict[str, Any]]:
+    import asyncpg
+    conn = await asyncpg.connect(queries._pg_dsn(), command_timeout=10)
+    try:
+        if agent in _DIRECTOR_AGENTS_DASH:
+            # Desk-wide earnings/M&A/guidance view — no agent_tag filter.
+            rows = await conn.fetch(
+                """SELECT id, symbol, headline, url, sentiment, category, importance,
+                          published_at, fetched_at, provider, agent_tags
+                   FROM news_items
+                   WHERE importance = 'high'
+                     AND COALESCE(published_at, fetched_at::timestamptz)
+                         > NOW() - INTERVAL '6 hours'
+                   ORDER BY COALESCE(published_at, fetched_at::timestamptz) DESC
+                   LIMIT $1""",
+                limit,
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT id, symbol, headline, url, sentiment, category, importance,
+                          published_at, fetched_at, provider, agent_tags
+                   FROM news_items
+                   WHERE agent_tags @> ARRAY[$1]::text[]
+                     AND COALESCE(published_at, fetched_at::timestamptz)
+                         > NOW() - INTERVAL '4 hours'
+                   ORDER BY (importance = 'high') DESC,
+                            COALESCE(published_at, fetched_at::timestamptz) DESC
+                   LIMIT $2""",
+                agent, limit,
+            )
+        return [dict(r) for r in rows]
+    finally:
+        await conn.close()
+
+
+@st.cache_data(ttl=10)
+def _recent_news_for_agent(agent: str, limit: int = 8) -> list[dict[str, Any]]:
+    """10-second cache — matches the 10-min ingest cadence (no point hitting PG
+    every 2s from the autorefresh)."""
+    import asyncio
+    try:
+        return asyncio.run(_recent_news_for_agent_async(agent, limit))
+    except Exception:
+        return []
+
+
+def _render_news_expander(agent: str) -> None:
+    rows = _recent_news_for_agent(agent, limit=8)
+    if not rows:
+        return
+    high_count = sum(1 for r in rows if (r.get("importance") or "") == "high")
+    label = f"News ({len(rows)})"
+    if high_count:
+        label = f"News ({len(rows)}, ⭐{high_count} earnings/M&A)"
+    with st.expander(label):
+        for r in rows:
+            sym = r.get("symbol") or "—"
+            head = (r.get("headline") or "")[:180]
+            cat = str(r.get("category") or "general").replace("_", " ")
+            sent = str(r.get("sentiment") or "").lower()
+            pub = _fmt_time(r.get("published_at") or r.get("fetched_at"))
+            url = r.get("url")
+            star = "⭐ " if (r.get("importance") or "") == "high" else ""
+            sent_dot = {"positive": "🟢", "negative": "🔴", "neutral": "⚪"}.get(sent, "")
+            st.markdown(f"{star}**{sym}** · {cat} · {pub} {sent_dot}")
+            if url:
+                st.markdown(f"[{head}]({url})")
+            else:
+                st.markdown(head)
+            st.divider()
+
+
 # ── Tab 1: Live grid ──────────────────────────────────────────────────────────
 
 
@@ -346,6 +425,7 @@ def render_live_grid() -> None:
                 if agent != "desk":
                     _render_chat_form(agent)
                     _render_recent_qa(agent)
+                    _render_news_expander(agent)
 
 
 # ── Tab 2: Skill detail ───────────────────────────────────────────────────────

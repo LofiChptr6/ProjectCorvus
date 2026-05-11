@@ -37,6 +37,43 @@ _SECTION_KEYS = {
     "commodity": "commodity_guidance",
 }
 
+# Phase A flag — flip to False to disable the RECENT NEWS auto-injection block
+# without rolling back code (tier-1 rollback per the implementation plan).
+# Ingest + dashboard keep working; only the per-review context stops carrying
+# news. Useful if the model starts over-anchoring on headlines.
+_ENABLE_NEWS_CONTEXT = True
+
+
+def summarize_news_sentiment(rows: list[dict]) -> str:
+    """Short one-liner like '3 bullish, 1 bearish; flagged: AAPL earnings'.
+    Caller passes the same rows it renders so the summary matches the list."""
+    if not rows:
+        return "no recent items"
+    counts = {"positive": 0, "negative": 0, "neutral": 0, "unknown": 0}
+    for r in rows:
+        s = str(r.get("sentiment") or "").lower()
+        counts[s if s in counts else "unknown"] += 1
+    parts: list[str] = []
+    if counts["positive"]:
+        parts.append(f"{counts['positive']} bullish")
+    if counts["negative"]:
+        parts.append(f"{counts['negative']} bearish")
+    if counts["neutral"]:
+        parts.append(f"{counts['neutral']} neutral")
+    if counts["unknown"]:
+        parts.append(f"{counts['unknown']} unscored")
+    flagged: list[str] = []
+    for r in rows:
+        if (r.get("importance") or "") != "high":
+            continue
+        sym = r.get("symbol") or "?"
+        cat = str(r.get("category") or "?").replace("_", " ")
+        flagged.append(f"{sym} {cat}")
+        if len(flagged) >= 5:
+            break
+    tail = f"; flagged: {', '.join(flagged)}" if flagged else ""
+    return ", ".join(parts) + tail
+
 
 def _render_mike_section(analysis_dir: Path, agent_name: str) -> str | None:
     """Return Mike's guidance formatted for the given agent, or None if nothing available.
@@ -244,6 +281,43 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
             lines.append("")
         except Exception:
             lines.append("--- MIKE'S ANALYSIS: Error reading. Proceed without director guidance. ---")
+            lines.append("")
+
+    # ── RECENT NEWS (Phase A timely-news pipeline) ───────────────────────────
+    # Auto-injected from news_items (10-min Benzinga ingest with category +
+    # agent_tags snapshot). Sector agents get items tagged to them; mike +
+    # cassidy get a desk-wide high-importance feed (earnings/M&A/guidance).
+    # Silently skipped when nothing matches — no "no news" filler in context.
+    if _ENABLE_NEWS_CONTEXT:
+        try:
+            if agent_name in _DIRECTOR_AGENTS:
+                news_rows = await store.get_recent_high_importance_news(hours=2, limit=8)
+                section_header = "--- HIGH-IMPORTANCE NEWS DESK-WIDE (last 2h)"
+            else:
+                news_rows = await store.get_recent_news_for_agent(
+                    agent_name, hours=2, limit=8,
+                )
+                section_header = "--- RECENT NEWS FOR YOUR SECTOR (last 2h)"
+        except Exception as exc:
+            log.warning("recent news fetch failed for %s: %s", agent_name, exc)
+            news_rows = []
+            section_header = ""
+        if news_rows:
+            summary = summarize_news_sentiment(news_rows)
+            lines.append(f"{section_header} — {summary} ---")
+            for r in news_rows:
+                pub_raw = r.get("published_at") or r.get("fetched_at")
+                pub = str(pub_raw)[:16] if pub_raw else "—"
+                sym = (r.get("symbol") or "—")[:8]
+                cat = (r.get("category") or "general").replace("_", " ")
+                star = " ⭐" if (r.get("importance") or "") == "high" else ""
+                head = (r.get("headline") or "")[:160]
+                lines.append(f"  [{pub} {sym} {cat}{star}] {head}")
+            if agent_name not in _DIRECTOR_AGENTS:
+                lines.append(
+                    "  (Need older articles? Call semantic_news_recall(query='…', symbols=[...]) "
+                    "for time-decayed semantic recall.)"
+                )
             lines.append("")
 
     # Inject the agent's private journal (skip director/risk personas)
