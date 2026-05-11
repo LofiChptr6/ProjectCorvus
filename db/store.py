@@ -1233,6 +1233,7 @@ async def upsert_conviction(
     expires_in_hours: int = 1,
     momentum_confirmed: Optional[bool] = None,
     stop_pct: Optional[float] = None,
+    first_held_since: Optional[datetime] = None,
 ) -> int:
     """Upsert one conviction row keyed on (agent_name, symbol). Most recent wins.
     direction='flat' with conviction=0 is the canonical 'I have no view' submission.
@@ -1260,6 +1261,11 @@ async def upsert_conviction(
         raise ValueError(f"conviction must be >= 0, got {conviction}")
     if direction == "flat" and conviction != 0:
         raise ValueError("flat direction requires conviction == 0")
+    # first_held_since: caller (pipelines/runner.py) passes a snapshotted value
+    # when the same direction is being re-published, so this acts as the anchor
+    # for "days since you first took this view." Defaults to NOW() when caller
+    # omits or when the prior direction differed (a fresh commitment).
+    held_since = first_held_since if first_held_since is not None else datetime.now(timezone.utc)
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -1267,10 +1273,10 @@ async def upsert_conviction(
                  (agent_name, symbol, direction, conviction,
                   expected_return_pct, time_to_target_days,
                   rationale, model_inputs, momentum_confirmed, expires_at,
-                  stop_pct)
+                  stop_pct, first_held_since)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,
                        NOW() + ($10 || ' hours')::interval,
-                       $11)
+                       $11, $12)
                ON CONFLICT (agent_name, symbol) DO UPDATE SET
                  direction           = EXCLUDED.direction,
                  conviction          = EXCLUDED.conviction,
@@ -1281,16 +1287,97 @@ async def upsert_conviction(
                  momentum_confirmed  = EXCLUDED.momentum_confirmed,
                  stop_pct            = EXCLUDED.stop_pct,
                  submitted_at        = NOW(),
-                 expires_at          = NOW() + ($10 || ' hours')::interval
+                 expires_at          = NOW() + ($10 || ' hours')::interval,
+                 -- preserve original anchor when direction is unchanged across
+                 -- re-publications; reset to the caller-supplied value when
+                 -- direction flipped.
+                 first_held_since    = CASE
+                     WHEN agent_conviction.direction = EXCLUDED.direction
+                       THEN agent_conviction.first_held_since
+                     ELSE EXCLUDED.first_held_since
+                 END
                RETURNING id""",
             agent_name, symbol.upper(), direction, conviction,
             expected_return_pct, time_to_target_days, rationale,
             json.dumps(model_inputs) if model_inputs is not None else None,
             momentum_confirmed,
             str(expires_in_hours),
-            stop_pct,
+            stop_pct, held_since,
         )
         return int(row["id"])
+
+
+async def get_position_aging(agent_name: str) -> list[dict]:
+    """For each currently-active non-flat conviction the agent holds, return:
+        symbol, direction, conviction, expected_return_pct, time_to_target_days,
+        first_held_since, days_held, rationale,
+        linked_theses: [{id, title, verify_by, days_until_verify}, ...]
+
+    Linked theses = this agent's open agent_thesis rows whose title or body
+    references the symbol as a word (word-boundary regex, case-sensitive — we
+    expect tickers in caps and want to avoid 'ON' matching 'concentration').
+
+    Used by prompt_builder to render the POSITION AGING section that gates
+    premature-flat behavior. See [DESK POLICY: COMMITMENT VS DRIFT]."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                ac.symbol,
+                ac.direction,
+                ac.conviction,
+                ac.expected_return_pct,
+                ac.time_to_target_days,
+                ac.first_held_since,
+                ac.submitted_at,
+                ac.rationale,
+                CASE
+                    WHEN ac.first_held_since IS NULL THEN NULL
+                    ELSE EXTRACT(EPOCH FROM (NOW() - ac.first_held_since)) / 86400.0
+                END AS days_held,
+                COALESCE(
+                    (SELECT jsonb_agg(jsonb_build_object(
+                                'id', t.id,
+                                'title', t.title,
+                                'verify_by', t.verify_by,
+                                'days_until_verify',
+                                CASE WHEN t.verify_by IS NULL THEN NULL
+                                     ELSE (t.verify_by - CURRENT_DATE)
+                                END))
+                       FROM agent_thesis t
+                       WHERE t.agent_name = ac.agent_name
+                         AND t.status = 'open'
+                         AND (
+                             t.title ~ ('\\y' || ac.symbol || '\\y')
+                             OR t.body ~ ('\\y' || ac.symbol || '\\y')
+                         )
+                    ),
+                    '[]'::jsonb
+                ) AS linked_theses
+            FROM agent_conviction ac
+            WHERE ac.agent_name = $1
+              AND ac.expires_at > NOW()
+              AND ac.conviction > 0
+            ORDER BY ac.symbol
+            """,
+            agent_name,
+        )
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            # asyncpg returns jsonb as a raw string unless a codec is registered.
+            # Parse linked_theses here so callers get a list[dict], not a string.
+            lt = d.get("linked_theses")
+            if isinstance(lt, str):
+                try:
+                    d["linked_theses"] = json.loads(lt)
+                except (ValueError, TypeError):
+                    d["linked_theses"] = []
+            elif lt is None:
+                d["linked_theses"] = []
+            out.append(d)
+        return out
 
 
 async def clear_agent_convictions(agent_name: str) -> int:
@@ -1315,7 +1402,7 @@ async def get_agent_active_convictions(agent_name: str) -> list[dict]:
         rows = await conn.fetch(
             """SELECT id, symbol, direction, conviction, expected_return_pct,
                       time_to_target_days, rationale, momentum_confirmed,
-                      stop_pct, submitted_at, expires_at
+                      stop_pct, submitted_at, expires_at, first_held_since
                FROM agent_conviction
                WHERE agent_name=$1 AND expires_at > NOW() AND conviction > 0
                ORDER BY conviction DESC""",

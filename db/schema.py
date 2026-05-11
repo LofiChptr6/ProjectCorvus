@@ -252,6 +252,11 @@ SCHEMA_STATEMENTS = [
     # of whether the agent re-publishes. Optional; NULL means "no stop." Useful
     # for inverse-ETF longs where decay compounds against late agent reactions.
     "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS stop_pct NUMERIC",
+    # Entry-date anchor for position-aging context (anti-premature-drop). Set
+    # to NOW() when the agent's direction on this symbol changes (flat↔non-flat
+    # or long↔short); preserved across upserts when direction is unchanged. So
+    # `NOW() - first_held_since` gives "days I've been committed to this view."
+    "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS first_held_since TIMESTAMPTZ",
     "CREATE INDEX IF NOT EXISTS idx_conv_active ON agent_conviction (expires_at) WHERE conviction > 0",
     "CREATE INDEX IF NOT EXISTS idx_conv_symbol ON agent_conviction (symbol, expires_at)",
     # Forecast rows — proof-of-work research. Each agent publishes ≥20 rows per

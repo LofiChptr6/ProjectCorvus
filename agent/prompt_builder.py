@@ -320,6 +320,72 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
                 )
             lines.append("")
 
+    # ── POSITION AGING (commitment vs. reality) ─────────────────────────────
+    # For sector agents: show each currently-active conviction with how long
+    # they've held it, target horizon remaining, and any open theses that
+    # reference the symbol. Gates premature flat-out behavior — if you have
+    # an open thesis with verify_by in the future, drifting to flat now
+    # requires explicit thesis invalidation, not just "price went against me."
+    if agent_name not in _DIRECTOR_AGENTS:
+        try:
+            aging = await store.get_position_aging(agent_name)
+        except Exception as exc:
+            log.warning("position aging fetch failed for %s: %s", agent_name, exc)
+            aging = []
+        if aging:
+            lines.append("--- POSITION AGING (your active commitments) ---")
+            for a in aging:
+                sym = a["symbol"]
+                direction = a["direction"]
+                conv = float(a["conviction"] or 0)
+                erp = a.get("expected_return_pct")
+                ttd = a.get("time_to_target_days")
+                days_held = a.get("days_held")
+                days_held_str = f"{float(days_held):.1f}d" if days_held is not None else "(new)"
+                target_str = (
+                    f"target {erp:+.1f}% over {ttd}d"
+                    if (erp is not None and ttd is not None)
+                    else "target unspecified"
+                )
+                remaining = None
+                if days_held is not None and ttd is not None:
+                    remaining = int(ttd) - float(days_held)
+                rem_str = ""
+                if remaining is not None:
+                    if remaining < 0:
+                        rem_str = f"  ⚠ HORIZON EXCEEDED ({-remaining:.0f}d past target)"
+                    elif remaining < 2:
+                        rem_str = f"  ⚠ {remaining:.0f}d to target — invalidate or roll"
+                    else:
+                        rem_str = f"  ({remaining:.0f}d remaining)"
+                lines.append(
+                    f"  {sym:<6} {direction:<5} conv={conv:.2f}  held {days_held_str}  "
+                    f"{target_str}{rem_str}"
+                )
+                # Linked open theses (substring word-match on symbol)
+                theses = a.get("linked_theses") or []
+                if theses:
+                    for t in theses:
+                        vb = t.get("verify_by")
+                        until = t.get("days_until_verify")
+                        if vb is None:
+                            vstr = ""
+                        elif until is None:
+                            vstr = f" — verify {vb}"
+                        elif until < 0:
+                            vstr = f" — verify_by {vb} PAST ({-int(until)}d ago)"
+                        else:
+                            vstr = f" — verify_by {vb} ({int(until)}d out)"
+                        lines.append(f"      thesis #{t['id']}: {(t.get('title') or '')[:80]}{vstr}")
+                else:
+                    lines.append(f"      (no linked open thesis on {sym} — consider recording one)")
+            lines.append(
+                "  → Within-horizon drawdown is NOT thesis invalidation. To flat any of"
+                " the above, first call update_thesis_status to invalidate the linked"
+                " thesis OR demonstrate the named catalyst has fired without expected price move."
+            )
+            lines.append("")
+
     # Inject the agent's private journal (skip director/risk personas)
     if agent_name not in _DIRECTOR_AGENTS:
         try:
@@ -622,6 +688,54 @@ Your quant models already compute both. Pass them through directly:
 
 direction='flat' with conviction=0 is the only path that may omit them — it's
 the canonical "I have no view on this name today" submission.
+
+
+[DESK POLICY: COMMITMENT VS DRIFT — DON'T FLAT JUST BECAUSE PRICE WENT AGAINST YOU]
+
+When you submitted a long/short conviction with time_to_target_days=N, you
+made a commitment to be patient for ~N days. Within-horizon drawdown is
+the price of being early, NOT thesis invalidation. The desk's most common
+loss pattern is dropping a name 3-5 days into a 30-day thesis because the
+tape is uncomfortable — and then watching the catalyst fire 2 weeks later
+without you.
+
+Read the POSITION AGING section in your context. For each name you currently
+hold (non-flat conviction), it shows:
+  - days held / target horizon (how patient have you committed to being?)
+  - linked open theses (with verify_by dates)
+  - whether the verify_by has passed
+
+Before publishing direction='flat' on any name in your active POSITION AGING:
+
+  1. Is there a linked open thesis with verify_by in the future?
+     YES → flat is only justified if you can NAME how the thesis was
+           invalidated. Options:
+             (a) catalyst fired and price didn't move → invalidate via
+                 update_thesis_status(id=#X, status='invalidated',
+                                       resolution_note='...')
+             (b) new information contradicts the business mechanic → record
+                 a NEW thesis with kind='observation' citing the change,
+                 then invalidate the old one
+             (c) the underlying universe / sector regime shifted (cite mike
+                 or your own observation thesis)
+           "Price went down" is not (a), (b), or (c). It's drawdown.
+
+  2. Has verify_by passed without the catalyst materializing?
+     YES → invalidate the thesis with kind='timeout' and reset. This is the
+           ONLY clean "thesis got it wrong" closure.
+
+  3. No linked thesis at all?
+     YES → flat is acceptable, but you should ALSO ask: why was I
+           publishing a non-flat conviction without an underlying recorded
+           thesis? That's a desk-policy gap; record_thesis going forward.
+
+The clear answer "stay patient when within horizon, invalidate only when
+the named catalyst proves you wrong" beats "drift to flat because the
+unrealized P&L is uncomfortable" on the desk's calibration tracker by a
+factor of ~2-3x on multi-month windows. Cassidy audits this evening: any
+flat published within X days of a non-flat with a still-future verify_by
+gets logged for the user's review.
+
 
 [DESK POLICY: NO DIRECT SHORTS — EXPRESS BEARISH VIEWS VIA INVERSE ETFS]
 The desk does not short individual stocks. To express a bearish view, go LONG

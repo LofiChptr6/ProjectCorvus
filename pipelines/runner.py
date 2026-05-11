@@ -207,8 +207,21 @@ async def _apply_review_output(
         summary["forecasts_inserted"] = result["inserted"]
         summary["forecast_errors"] = result["errors"]
     else:
+        # Snapshot prior (direction, first_held_since) so we can preserve the
+        # entry anchor across the clear+upsert cycle. Without this snapshot,
+        # every review would reset first_held_since because clear deletes the
+        # row before upsert recreates it. The preservation rule fires only when
+        # the agent re-publishes the same direction on the same symbol — flips
+        # (long↔flat, long↔short) correctly reset the anchor to NOW().
+        prior_rows = await store.get_agent_active_convictions(agent_name)
+        prior_anchor: dict[str, tuple[str, object]] = {
+            r["symbol"]: (r["direction"], r.get("first_held_since"))
+            for r in prior_rows
+        }
         await store.clear_agent_convictions(agent_name)
         for c in parsed.convictions:
+            prev = prior_anchor.get(c.symbol.upper())
+            preserved = prev[1] if (prev and prev[0] == c.direction) else None
             await store.upsert_conviction(
                 agent_name=agent_name,
                 symbol=c.symbol,
@@ -221,6 +234,7 @@ async def _apply_review_output(
                 expires_in_hours=c.expires_in_hours,
                 momentum_confirmed=c.momentum_confirmed,
                 stop_pct=c.stop_pct,
+                first_held_since=preserved,
             )
             summary["convictions_inserted"] += 1
 
