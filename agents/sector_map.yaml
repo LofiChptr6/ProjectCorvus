@@ -53,6 +53,7 @@ agents:
   fab:
     description: Semiconductor manufacturing — foundries, equipment, memory, AI infra (capex-cycle driven)
     universe:
+      SNDK:  {bearish_via: skip}   # Sandisk (memory storage, WDC NAND spin)
       TSM:   {bearish_via: skip}
       UMC:   {bearish_via: skip}
       GFS:   {bearish_via: skip}
@@ -87,6 +88,7 @@ agents:
   fabless:
     description: Semiconductor designers + sector ETFs (design-win + product-cycle driven)
     universe:
+      POET:  {bearish_via: skip}   # POET Technologies — silicon photonics / co-packaged optics for AI
       NVDA:  {bearish_via: skip}
       AMD:   {bearish_via: skip}
       AVGO:  {bearish_via: skip}
@@ -119,11 +121,13 @@ agents:
       CRDO:  {bearish_via: skip}
 
   rex:
-    description: Mega-cap tech ex-semi — cloud, ads, software, internet, payments, sharing
+    description: Mega-cap tech ex-semi — cloud, ads, software, internet, payments, sharing, data/AI software
     universe:
       AAPL:  {bearish_via: skip}
       MSFT:  {bearish_via: skip}
       GOOGL: {bearish_via: skip}
+      GOOG:  {bearish_via: skip}   # Alphabet class C (no voting), trades alongside GOOGL
+      PLTR:  {bearish_via: skip}   # Palantir — data analytics / AI software
       META:  {bearish_via: skip}
       AMZN:  {bearish_via: skip}
       NFLX:  {bearish_via: skip}
@@ -229,6 +233,9 @@ agents:
       PFE:   {bearish_via: skip}
       MRK:   {bearish_via: skip}
       ABBV:  {bearish_via: skip}
+      AZN:   {bearish_via: skip}   # AstraZeneca — UK big-pharma
+      SNY:   {bearish_via: skip}   # Sanofi — FR big-pharma
+      GEHC:  {bearish_via: skip}   # GE HealthCare — imaging + monitoring (med devices)
       BMY:   {bearish_via: skip}
       AMGN:  {bearish_via: skip}
       GILD:  {bearish_via: skip}
@@ -257,8 +264,11 @@ agents:
       IBB:   {bearish_via: skip}
 
   trump:
-    description: Consumer staples + discretionary — food/bev/tobacco, restaurants, apparel, big-box, beauty, autos, leisure
+    description: Consumer staples + discretionary — food/bev/tobacco, restaurants, apparel, big-box, beauty, autos, leisure, EVs, media
     universe:
+      DIS:   {bearish_via: skip}   # Disney — media + parks
+      DPZ:   {bearish_via: skip}   # Domino's — restaurants
+      RIVN:  {bearish_via: skip}   # Rivian — EV (sibling to F/GM)
       WMT:   {bearish_via: skip}
       COST:  {bearish_via: skip}
       PG:    {bearish_via: skip}
@@ -293,6 +303,7 @@ agents:
   iron:
     description: Industrials + transports + defense — aerospace/defense, capex, machinery, transports, airlines
     universe:
+      AAL:   {bearish_via: skip}   # American Airlines (sibling to existing DAL/UAL/LUV)
       CAT:   {bearish_via: skip}
       DE:    {bearish_via: skip}
       BA:    {bearish_via: skip}
