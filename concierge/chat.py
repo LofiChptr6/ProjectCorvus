@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from approval.telegram import send_message
@@ -21,6 +22,19 @@ from concierge import state, tools
 from db import store
 
 log = logging.getLogger(__name__)
+
+
+# Qwen3 wraps chain-of-thought in <think>…</think>. Strip before the text
+# reaches Telegram or the persisted history — Qwen explicitly recommends
+# excluding prior <think> blocks from subsequent turns, and the user sees no
+# value in the reasoning trace.
+_THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
+def _strip_think(text: Optional[str]) -> str:
+    if not text:
+        return ""
+    return _THINK_RE.sub("", text).strip()
 
 
 _SYSTEM_PROMPT = """You are the Concierge for a multi-agent quant trading desk. The user chats
@@ -163,15 +177,20 @@ async def handle(
                 for tc in msg.tool_calls
             ]
 
+        clean_content = _strip_think(msg.content)
+
         # Build the OpenAI-shape assistant turn and append to the local replay.
-        assistant_dict: dict[str, Any] = {"role": "assistant", "content": msg.content or ""}
+        # `clean_content` (think-stripped) is what goes into the LLM's next-turn
+        # history AND into the DB — preserving the raw think trace would only
+        # cause Qwen to mimic itself on future turns.
+        assistant_dict: dict[str, Any] = {"role": "assistant", "content": clean_content}
         if tc_list:
             assistant_dict["tool_calls"] = tc_list
         messages.append(assistant_dict)
 
         is_final = choice.finish_reason != "tool_calls" or not msg.tool_calls
         if is_final:
-            final_text = msg.content or "(no reply produced)"
+            final_text = clean_content or "(no reply produced)"
             # send_message logs the final turn to telegram_message as
             # kind='concierge_reply' / role='assistant'; no separate log_outbound.
             await send_message(
@@ -185,7 +204,7 @@ async def handle(
         try:
             await store.log_outbound(
                 chat_id, "concierge_reply",
-                msg.content or "",
+                clean_content,
                 role="assistant",
                 tool_calls=tc_list,
                 meta={"event": "intermediate_assistant_turn"},
