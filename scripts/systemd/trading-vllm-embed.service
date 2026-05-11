@@ -1,0 +1,39 @@
+[Unit]
+Description=Trading vLLM embed — local OpenAI-compatible embeddings server (BAAI/bge-large-en-v1.5)
+Documentation=https://docs.vllm.ai/en/latest/models/pooling_models.html
+After=network-online.target trading-vllm.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/home/tianyizhang/opus trading
+EnvironmentFile=/home/tianyizhang/opus trading/.env
+Environment=HF_HUB_DISABLE_TELEMETRY=1
+Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
+Environment=VLLM_LOGGING_LEVEL=INFO
+# First start downloads ~1.3 GB of model weights from HuggingFace.
+TimeoutStartSec=600
+## BGE-large-en-v1.5 is a 335M-param encoder-only BERT-style model, 1024-dim
+## output. vLLM serves it via --runner pooling, exposing the OpenAI
+## /v1/embeddings shape on port 8002 (8001 is reserved for obs.proxy).
+## Shares the GPU with the main Qwen3-32B vLLM (port 8000): we cap this one
+## at 0.04 utilization (~3.9 GB on a 96 GB card) and the main vLLM at 0.85
+## (~81 GB), leaving headroom for backfills + spikes.
+## --max-num-seqs caps batch parallelism — for our 50-articles/day ingest cadence
+## this is comfortably oversized.
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv-vllm/bin/vllm serve "${LOCAL_EMBED_MODEL}" \
+    --runner pooling \
+    --gpu-memory-utilization 0.04 \
+    --max-num-seqs 32 \
+    --max-model-len 512 \
+    --host 127.0.0.1 \
+    --port 8002'
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=600
+StartLimitBurst=4
+StandardOutput=append:/home/tianyizhang/opus trading/logs/vllm-embed.log
+StandardError=append:/home/tianyizhang/opus trading/logs/vllm-embed.log
+
+[Install]
+WantedBy=default.target

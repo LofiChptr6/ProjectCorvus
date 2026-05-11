@@ -1,15 +1,20 @@
 """Embedding-provider abstraction for the Phase B semantic-recall layer.
 
-Single entrypoint module. Picks a provider at module load:
+Single entrypoint module. Picks a provider at module load (priority order):
 
-    VOYAGE_API_KEY set         → voyage-finance-2 (1024-dim, finance-tuned)
-    else OPENAI_API_KEY set    → text-embedding-3-small (dimensions=1024)
-    else                       → no-op (embed_* returns None)
+    LOCAL_EMBED_URL + LOCAL_EMBED_MODEL set  → local OpenAI-compat endpoint
+                                                (e.g. vLLM serving BGE-large)
+    VOYAGE_API_KEY set                       → voyage-finance-2 (1024-dim, finance-tuned)
+    OPENAI_API_KEY set                       → text-embedding-3-small (dimensions=1024)
+    none of the above                        → no-op (embed_* returns None)
+
+The local path is preferred so a co-resident vLLM-embed instance beats paid
+providers when available. Falls back gracefully on each level.
 
 Public surface:
 
     provider_ready()           → bool — True iff some provider is configured
-    active_model_name()        → "voyage-finance-2" / "text-embedding-3-small" / None
+    active_model_name()        → "BAAI/bge-large-en-v1.5" / "voyage-finance-2" / etc.
     text_for_embedding(h, b)   → str — canonical "headline + lede" prep
     await embed_one(text)      → list[float] (1024) or None
     await embed_batch(texts)   → list[list[float] | None] (parallelizes/batches)
@@ -18,14 +23,12 @@ Public surface:
 Design notes:
 
   - All output vectors are 1024-dim, regardless of which provider serves them.
-    Voyage models are natively 1024; OpenAI 3-small/large support the
-    `dimensions` parameter so we always request 1024 to keep schema stable.
+    BGE-large + Voyage models are natively 1024; OpenAI 3-small/large support
+    the `dimensions` parameter so we always request 1024 to keep schema stable.
   - Best-effort: providers down → return None, never raise out of embed_*.
     Ingest must never block on embedding.
   - In-flight semaphore caps concurrency (default 4) to play nice with rate
     limits. Retries are exponential on 429 / 5xx (3 tries).
-  - Tiny in-process LRU cache on the exact text→embedding mapping (the same
-    article gets the same vector inside one ingest run).
 """
 
 from __future__ import annotations
@@ -33,7 +36,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from functools import lru_cache
 from typing import Optional
 
 import httpx
@@ -46,10 +48,14 @@ _VOYAGE_MODEL = "voyage-finance-2"
 _OPENAI_MODEL = "text-embedding-3-small"
 _VECTOR_DIM = 1024
 
+_LOCAL_URL = (os.environ.get("LOCAL_EMBED_URL", "").strip().rstrip("/")) or None
+_LOCAL_MODEL = (os.environ.get("LOCAL_EMBED_MODEL", "").strip()) or None
 _VOYAGE_KEY = os.environ.get("VOYAGE_API_KEY", "").strip() or None
 _OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "").strip() or None
 
-if _VOYAGE_KEY:
+if _LOCAL_URL and _LOCAL_MODEL:
+    _PROVIDER = "local"
+elif _VOYAGE_KEY:
     _PROVIDER = "voyage"
 elif _OPENAI_KEY:
     _PROVIDER = "openai"
@@ -66,6 +72,8 @@ def provider_ready() -> bool:
 
 
 def active_model_name() -> Optional[str]:
+    if _PROVIDER == "local":
+        return _LOCAL_MODEL
     if _PROVIDER == "voyage":
         return _VOYAGE_MODEL
     if _PROVIDER == "openai":
@@ -157,6 +165,65 @@ async def _voyage_embed(texts: list[str]) -> list[Optional[list[float]]]:
     return [None] * len(texts)
 
 
+# ── Local vLLM-embed backend (OpenAI-compatible) ──────────────────────────────
+
+async def _local_embed(texts: list[str]) -> list[Optional[list[float]]]:
+    """POST to a local OpenAI-compatible /v1/embeddings endpoint (e.g. vLLM
+    serving BAAI/bge-large-en-v1.5). vLLM exposes the OpenAI shape natively
+    via `vllm serve --task embed`, so we reuse that wire format.
+
+    No API key required — assumed local trusted endpoint."""
+    assert _LOCAL_URL and _LOCAL_MODEL, "local selected but URL/model missing"
+    client = _get_client()
+    payload = {
+        "input": texts,
+        "model": _LOCAL_MODEL,
+    }
+    # Some embedding models 1024-dim natively (BGE-large) and ignore the
+    # `dimensions` kwarg; vLLM also doesn't always honor it. We rely on the
+    # model choice giving us 1024 directly.
+    headers = {"Content-Type": "application/json"}
+    last_exc: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            r = await client.post(
+                f"{_LOCAL_URL}/v1/embeddings",
+                json=payload, headers=headers,
+            )
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_exc = httpx.HTTPStatusError(
+                    f"local embed returned {r.status_code}: {r.text[:200]}",
+                    request=r.request, response=r,
+                )
+                await asyncio.sleep(0.5 * (2 ** attempt))
+                continue
+            r.raise_for_status()
+            data = r.json()
+            out: list[Optional[list[float]]] = []
+            for item in (data.get("data") or []):
+                vec = item.get("embedding")
+                # BGE-large is natively 1024 — accept that exact width only so
+                # we never silently store a wrong-width vector.
+                if isinstance(vec, list) and len(vec) == _VECTOR_DIM:
+                    out.append([float(x) for x in vec])
+                elif isinstance(vec, list):
+                    log.warning(
+                        "local embed returned dim=%d, expected %d — model mismatch?",
+                        len(vec), _VECTOR_DIM,
+                    )
+                    out.append(None)
+                else:
+                    out.append(None)
+            while len(out) < len(texts):
+                out.append(None)
+            return out[: len(texts)]
+        except (httpx.TimeoutException, httpx.NetworkError) as e:
+            last_exc = e
+            await asyncio.sleep(0.5 * (2 ** attempt))
+    log.warning("local embed failed after retries: %s", last_exc)
+    return [None] * len(texts)
+
+
 # ── OpenAI backend ────────────────────────────────────────────────────────────
 
 async def _openai_embed(texts: list[str]) -> list[Optional[list[float]]]:
@@ -218,7 +285,9 @@ async def embed_batch(texts: list[str]) -> list[Optional[list[float]]]:
         return [None] * len(texts)
     inputs = [t for _, t in indexed]
     async with _sem:
-        if _PROVIDER == "voyage":
+        if _PROVIDER == "local":
+            vecs = await _local_embed(inputs)
+        elif _PROVIDER == "voyage":
             vecs = await _voyage_embed(inputs)
         elif _PROVIDER == "openai":
             vecs = await _openai_embed(inputs)
