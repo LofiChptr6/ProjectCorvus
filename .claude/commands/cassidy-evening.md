@@ -25,12 +25,6 @@ Call `send_telegram_update`:
 
 ---
 
-## STEP 2 — Process inbox
-
-Call `process_telegram_inbox` — resolve any pending proposals before compiling the report.
-
----
-
 ## STEP 3 — Full data gather
 
 Run all of the following. The DB-backed tools (pnl_summary, trade_blotter) work even if IBKR is offline.

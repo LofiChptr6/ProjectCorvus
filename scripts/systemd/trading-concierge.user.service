@@ -1,5 +1,5 @@
 [Unit]
-Description=Trading Concierge (Sonnet-backed Telegram bot, user mode)
+Description=Trading Concierge (local-LLM-backed Telegram bot, user mode)
 Documentation=file:///home/tianyizhang/opus%20trading/concierge/README.md
 After=network-online.target
 Wants=network-online.target
@@ -8,7 +8,9 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/home/tianyizhang/opus trading
 EnvironmentFile=/home/tianyizhang/opus trading/.env
-ExecStart=/home/tianyizhang/opus trading/.venv/bin/python -m concierge.service
+# systemd splits ExecStart on whitespace even when the binary is quoted —
+# wrap in bash -c so the space in "/home/tianyizhang/opus trading" survives.
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/python -m concierge.service'
 KillSignal=SIGTERM
 TimeoutStopSec=15
 Restart=on-failure

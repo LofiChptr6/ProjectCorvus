@@ -832,20 +832,6 @@ async def list_pending_proposals() -> str:
     return json.dumps({"pending": proposals.list_pending()})
 
 
-@mcp.tool()
-async def process_telegram_inbox() -> str:
-    """
-    Poll Telegram for new y/n replies, resolve matching proposals, and re-ping
-    any pending proposals older than 5 minutes since last ping.
-
-    Call this at the start of every routine (hourly review and 5-min nudge).
-    Returns which proposals got resolved and how many were nudged.
-    """
-    await _ensure_init_light()
-    from approval import proposals
-    return json.dumps(await proposals.process_inbox())
-
-
 # ── Mike analysis (director) ──────────────────────────────────────────────────
 
 # Market-anchored date — single source of truth for "today" across the whole system.

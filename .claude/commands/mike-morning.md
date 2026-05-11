@@ -39,14 +39,7 @@ Call `send_telegram_update`:
 
 ---
 
-## STEP 2 — Process inbox
-
-Call `process_telegram_inbox` — resolve any pending proposals before acting.
-If any allocation changes were approved, apply them via the allocation tools before continuing.
-
----
-
-## STEP 3 — Comprehensive market data
+## STEP 2 — Comprehensive market data
 
 Gather all of the following. Do not skip any item — this is the foundation of today's analysis.
 

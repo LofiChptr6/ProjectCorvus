@@ -22,11 +22,7 @@ If the current UTC time is between 05:00 and 12:00:
 
 ---
 
-## STEP 1 — Process telegram inbox
-
-`process_telegram_inbox()` — resolve any approved/rejected proposals so the next per-agent review sees the updated state.
-
-## STEP 2 — Snapshot desk state (read-only)
+## STEP 1 — Snapshot desk state (read-only)
 
 - `get_market_status()` — `is_open`, `is_half_day`, `today_session`
 - `get_kill_switch_status()`

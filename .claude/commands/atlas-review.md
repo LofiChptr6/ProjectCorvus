@@ -20,7 +20,6 @@ allowed-tools:
   - mcp__ibkr-trading__get_sector_stories
   - mcp__ibkr-trading__get_my_active_views
   - mcp__ibkr-trading__get_pnl_attribution
-  - mcp__ibkr-trading__process_telegram_inbox
   - mcp__ibkr-trading__get_quote
   - mcp__ibkr-trading__get_bars
   - mcp__ibkr-trading__compute_technicals
@@ -84,7 +83,6 @@ Sector reviews are **read-only** on the board. Posting (daily/weekly reports, ne
 - `get_sector_stories(agent_name="atlas", limit=4)` — your last ~month of archived narrative chapters; read these for continuity (don't repeat past mistakes, build on prior conviction arcs)
 - `get_my_active_views(agent_name="atlas")` — what you said last hour (continuity)
 - `get_agent_pnl_attribution(agent_name="atlas")` — your attributed P&L slice
-- `process_telegram_inbox()` — apply any user-approved proposals before deciding
 
 ## STEP 2 — Sector scan
 

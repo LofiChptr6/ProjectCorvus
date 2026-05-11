@@ -29,12 +29,18 @@ log = logging.getLogger(__name__)
 # excluding prior <think> blocks from subsequent turns, and the user sees no
 # value in the reasoning trace.
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+# Fallback for truncated responses: if max_tokens cut the model off mid-thought,
+# drop everything from <think> to end-of-string so the user never sees the raw
+# reasoning trace.
+_OPEN_THINK_RE = re.compile(r"<think>.*\Z", re.DOTALL | re.IGNORECASE)
 
 
 def _strip_think(text: Optional[str]) -> str:
     if not text:
         return ""
-    return _THINK_RE.sub("", text).strip()
+    out = _THINK_RE.sub("", text)
+    out = _OPEN_THINK_RE.sub("", out)
+    return out.strip()
 
 
 _SYSTEM_PROMPT = """You are the Concierge for a multi-agent quant trading desk. The user chats

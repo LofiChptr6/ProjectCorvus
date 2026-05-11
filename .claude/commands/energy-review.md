@@ -46,7 +46,6 @@ Sector reviews are **read-only** on the board. Posting (daily/weekly reports, ne
 - `get_sector_stories(agent_name="energy", limit=4)` — your last ~month of archived narrative chapters; read these for continuity (don't repeat past mistakes, build on prior conviction arcs)
 - `get_my_active_views(agent_name="energy")` — what you said last hour (continuity)
 - `get_agent_pnl_attribution(agent_name="energy")` — your attributed P&L slice
-- `process_telegram_inbox()` — apply any user-approved proposals before deciding
 
 ## STEP 2 — Sector scan
 

@@ -32,7 +32,7 @@ mark_inbox_responded(inbox_id=<id>, response_body="<your reply>", agent_name="mi
 
 ## Hard constraints
 
-- No `rebalance_desk` / `place_order` / `propose_strategic_change` / `process_telegram_inbox`.
+- No `rebalance_desk` / `place_order` / `propose_strategic_change`.
 - No new theses, no posting to threads, no Telegrams.
 - ~60s budget, ≤8 tool calls beyond inbox read (you may need a few more than sector agents because you read across the desk).
 - Skip-fast if empty.

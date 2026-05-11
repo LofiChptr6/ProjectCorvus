@@ -32,13 +32,7 @@ Call `send_telegram_update`:
 
 ---
 
-## STEP 2 — Process inbox
-
-Call `process_telegram_inbox` — resolve any pending proposals before assessing positions.
-
----
-
-## STEP 3 — Morning-to-now snapshot
+## STEP 2 — Morning-to-now snapshot
 
 Gather the current state of the desk:
 
