@@ -2689,3 +2689,130 @@ async def get_unattributed_fills(
                 ORDER BY f.filled_at DESC LIMIT 200""",
             *params)
         return [dict(r) for r in rows]
+
+
+# ── Telegram message log ─────────────────────────────────────────────────────
+# Single table for every Telegram event (inbound + outbound), tagged by `kind`.
+# Concierge LLM context is drawn from rows where kind in
+# ('user_text','concierge_reply','concierge_tool') — push/approval rows are
+# invisible to chat history by design.
+
+# kind values accepted by the schema CHECK constraint:
+TELEGRAM_KINDS = (
+    "user_text",        # inbound natural-language question
+    "slash_cmd",        # inbound /status, /pnl, /help, …
+    "approval",         # inbound /y /n or button tap, OR outbound proposal ping / confirmation
+    "push",             # outbound agent report / digest / chart caption
+    "concierge_reply",  # outbound LLM reply
+    "concierge_tool",   # internal: role='tool' result for concierge tool-use loop
+)
+
+_CONCIERGE_HISTORY_KINDS = ("user_text", "concierge_reply", "concierge_tool")
+
+
+async def log_inbound(
+    chat_id: Optional[str],
+    telegram_message_id: Optional[int],
+    kind: str,
+    content: str,
+    meta: Optional[dict] = None,
+) -> int:
+    """Record an inbound Telegram event. Returns the row id.
+
+    For 'user_text' rows, the concierge LLM later replays this row with role='user'.
+    Slash/approval rows are stored too for audit but never enter the LLM context.
+    """
+    role = "user" if kind == "user_text" else None
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO telegram_message
+                 (direction, kind, chat_id, telegram_message_id, role, content, meta)
+               VALUES ('inbound', $1, $2, $3, $4, $5, $6)
+               RETURNING id""",
+            kind, chat_id, telegram_message_id, role, content,
+            json.dumps(meta or {}),
+        )
+        return int(row["id"])
+
+
+async def log_outbound(
+    chat_id: Optional[str],
+    kind: str,
+    content: str,
+    *,
+    role: Optional[str] = None,
+    tool_calls: Optional[list] = None,
+    tool_call_id: Optional[str] = None,
+    meta: Optional[dict] = None,
+) -> int:
+    """Record an outbound Telegram event. Returns the row id.
+
+    For 'concierge_reply' rows pass role='assistant' and optionally tool_calls.
+    For 'concierge_tool' rows pass role='tool' and tool_call_id (these never go
+    to Telegram but are stored so the LLM can replay the full tool-use loop).
+    """
+    pool = await get_pool()
+    tc_json = json.dumps(tool_calls) if tool_calls is not None else None
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO telegram_message
+                 (direction, kind, chat_id, role, content, tool_calls, tool_call_id, meta)
+               VALUES ('outbound', $1, $2, $3, $4, $5::jsonb, $6, $7)
+               RETURNING id""",
+            kind, chat_id, role, content, tc_json, tool_call_id,
+            json.dumps(meta or {}),
+        )
+        return int(row["id"])
+
+
+async def load_concierge_history(chat_id: Optional[str], limit: int = 30) -> list[dict]:
+    """Return the last `limit` *user/assistant* messages plus the tool rows that
+    interleave them, in ascending order — ready to splice into an OpenAI
+    chat-completions `messages` array.
+
+    `limit` counts user+assistant rows; tool rows that fall in the same window
+    come along for the ride so the assistant→tool→assistant chain stays valid.
+    Push and approval rows are filtered out by `kind`.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # Find the id of the Nth-most-recent user/assistant row for this chat.
+        anchor = await conn.fetchrow(
+            f"""SELECT id FROM telegram_message
+                WHERE kind = ANY($1::text[])
+                  AND ($2::text IS NULL OR chat_id = $2)
+                  AND role IN ('user','assistant')
+                ORDER BY id DESC
+                OFFSET $3 LIMIT 1""",
+            list(_CONCIERGE_HISTORY_KINDS), chat_id, max(limit - 1, 0),
+        )
+        anchor_id = int(anchor["id"]) if anchor else 0
+
+        rows = await conn.fetch(
+            f"""SELECT role, content, tool_calls, tool_call_id
+                FROM telegram_message
+                WHERE kind = ANY($1::text[])
+                  AND ($2::text IS NULL OR chat_id = $2)
+                  AND id >= $3
+                ORDER BY id ASC""",
+            list(_CONCIERGE_HISTORY_KINDS), chat_id, anchor_id,
+        )
+
+    out: list[dict] = []
+    for r in rows:
+        msg: dict[str, Any] = {"role": r["role"], "content": r["content"] or ""}
+        tc = r["tool_calls"]
+        if tc:
+            # asyncpg returns jsonb as native python; tolerate str too.
+            if isinstance(tc, str):
+                try:
+                    tc = json.loads(tc)
+                except json.JSONDecodeError:
+                    tc = None
+            if tc:
+                msg["tool_calls"] = tc
+        if r["tool_call_id"]:
+            msg["tool_call_id"] = r["tool_call_id"]
+        out.append(msg)
+    return out

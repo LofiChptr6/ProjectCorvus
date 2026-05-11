@@ -90,10 +90,36 @@ async def _chat_id() -> str:
     return discovered
 
 
+async def _log_outbound_safe(
+    chat_id: Optional[str],
+    kind: str,
+    content: str,
+    *,
+    role: Optional[str] = None,
+    tool_calls: Optional[list] = None,
+    tool_call_id: Optional[str] = None,
+    meta: Optional[dict] = None,
+) -> None:
+    """Best-effort write to telegram_message — never break the send path."""
+    try:
+        from db.store import log_outbound
+        await log_outbound(
+            chat_id, kind, content,
+            role=role, tool_calls=tool_calls, tool_call_id=tool_call_id, meta=meta,
+        )
+    except Exception as exc:
+        log.debug("telegram_message log_outbound skipped: %s", exc)
+
+
 async def send_message(
     text: str,
     parse_mode: Optional[str] = "Markdown",
     reply_markup: Optional[dict] = None,
+    *,
+    kind: str = "push",
+    role: Optional[str] = None,
+    tool_calls: Optional[list] = None,
+    meta: Optional[dict] = None,
 ) -> Optional[dict]:
     """Send a message to the configured (or auto-detected) Telegram chat.
 
@@ -102,8 +128,15 @@ async def send_message(
 
     reply_markup, if given, is the Telegram inline-keyboard / reply-keyboard
     markup dict (e.g. {"inline_keyboard": [[{"text": "✅", "callback_data": "approve_xxx"}]]}).
+
+    `kind` tags the outbound row in the telegram_message log. Defaults to 'push'
+    (agent-initiated desk notifications). Pass 'approval' for proposal pings
+    and resolution confirmations, 'concierge_reply' for LLM replies, or
+    'slash_cmd' for built-in slash-command output.
     """
     url = _BASE.format(token=_token()) + "/sendMessage"
+    chat_id: Optional[str] = None
+    sent: Optional[dict] = None
     async with httpx.AsyncClient(timeout=15) as client:
         try:
             chat_id = await _chat_id()
@@ -123,21 +156,43 @@ async def send_message(
                 r = await client.post(url, json=payload)
             if r.status_code >= 400:
                 log.error("Telegram send failed: HTTP %d — body=%s", r.status_code, r.text[:300])
-                return None
-            return r.json()
+            else:
+                sent = r.json()
         except Exception as exc:
             log.error("Telegram send failed: %s", exc)
-            return None
+
+    # Log to telegram_message even on send-failure: the LLM's reply intent is
+    # still part of its conversation history, and an audit trail of attempted
+    # sends is useful. Only skip if we couldn't even resolve a chat_id.
+    if chat_id is not None or sent is not None:
+        await _log_outbound_safe(
+            chat_id, kind, text,
+            role=role, tool_calls=tool_calls, meta=meta,
+        )
+    return sent
 
 
-async def send_photo(image_path: str, caption: Optional[str] = None) -> Optional[dict]:
-    """Send an image (PNG/JPG) via Telegram sendPhoto. Returns response dict or None on failure."""
+async def send_photo(
+    image_path: str,
+    caption: Optional[str] = None,
+    *,
+    kind: str = "push",
+    meta: Optional[dict] = None,
+) -> Optional[dict]:
+    """Send an image (PNG/JPG) via Telegram sendPhoto. Returns response dict or None on failure.
+
+    Logs to telegram_message as kind='push' by default (charts/digests are
+    typically pushes). The logged `content` is the caption plus a tag noting
+    the image filename so an audit query can identify which chart was sent.
+    """
     from pathlib import Path as _Path
     url = _BASE.format(token=_token()) + "/sendPhoto"
     p = _Path(image_path)
     if not p.exists():
         log.error("Telegram sendPhoto: file not found at %s", image_path)
         return None
+    chat_id: Optional[str] = None
+    sent: Optional[dict] = None
     async with httpx.AsyncClient(timeout=30) as client:
         try:
             chat_id = await _chat_id()
@@ -150,11 +205,17 @@ async def send_photo(image_path: str, caption: Optional[str] = None) -> Optional
                 r = await client.post(url, data=data, files=files)
             if r.status_code >= 400:
                 log.error("Telegram sendPhoto failed: HTTP %d — %s", r.status_code, r.text[:300])
-                return None
-            return r.json()
+            else:
+                sent = r.json()
         except Exception as exc:
             log.error("Telegram sendPhoto failed: %s", exc)
-            return None
+
+    photo_meta = dict(meta or {})
+    photo_meta.setdefault("image_path", str(p))
+    content = caption or f"[photo: {p.name}]"
+    if chat_id is not None or sent is not None:
+        await _log_outbound_safe(chat_id, kind, content, meta=photo_meta)
+    return sent
 
 
 async def poll_for_reply(after_message_id: int, timeout_s: int = 120) -> Optional[str]:

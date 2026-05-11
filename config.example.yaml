@@ -79,14 +79,15 @@ news:
   enabled: false
   symbols: []
 
-# Concierge — long-running Sonnet-backed Telegram chat-ops service.
-# See concierge/README.md. Start with: bash scripts/start_concierge.sh
+# Concierge — long-running local-LLM-backed Telegram chat-ops service.
+# Talks to vLLM directly via the OpenAI SDK (see concierge/README.md).
+# Start with: systemctl --user start trading-concierge
 concierge:
   enabled: true
-  model: claude-sonnet-4-5-20250929   # override via env CONCIERGE_MODEL
+  model: Qwen/Qwen3-32B-FP8           # override via env CONCIERGE_MODEL or LOCAL_MODEL
   max_tool_iterations: 5
-  history_turns: 40
-  daily_usd_cap: 5.00                 # halts Sonnet calls when reached (UTC-midnight reset)
+  history_messages: 30                # rolling user/assistant rows shown to the LLM each turn
+  daily_token_cap: 2000000            # halts after this many in+out tokens (UTC-midnight reset; 0 disables)
   nudge_interval_s: 60                # stale-proposal re-ping cadence
   allowed_tools:
     - get_positions
@@ -97,6 +98,8 @@ concierge:
     - get_agent_list
     - get_mike_analysis
     - list_pending_proposals
+    - list_recent_decisions
     - resolve_proposal
+    - resolve_all_pending
     - propose_strategic_change
     - send_telegram_followup

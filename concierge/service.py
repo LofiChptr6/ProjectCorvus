@@ -122,9 +122,15 @@ def _allowed_chat_id() -> Optional[str]:
 
 
 async def _poll_once(client: httpx.AsyncClient, offset: int) -> tuple[int, list[dict[str, Any]]]:
-    """One long-poll call. Returns (new_offset, messages_to_handle)."""
+    """One long-poll call. Returns (new_offset, events_to_handle).
+
+    Events are dicts with a "type" discriminator: "message" (free-text/slash) or
+    "callback" (inline-button tap on a proposal ping). The router branches on
+    type — text goes through concierge.router; callbacks resolve a proposal in
+    place and answer the loading spinner.
+    """
     url = _BASE.format(token=_token()) + "/getUpdates"
-    params = {"offset": offset, "timeout": 25, "allowed_updates": '["message"]'}
+    params = {"offset": offset, "timeout": 25, "allowed_updates": '["message","callback_query"]'}
     try:
         r = await client.get(url, params=params)
         r.raise_for_status()
@@ -135,9 +141,27 @@ async def _poll_once(client: httpx.AsyncClient, offset: int) -> tuple[int, list[
 
     allowed_chat = _allowed_chat_id()
     new_offset = offset
-    messages: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
     for update in data.get("result", []):
         new_offset = update["update_id"] + 1
+
+        cq = update.get("callback_query")
+        if cq:
+            cb_data = (cq.get("data") or "").strip()
+            cb_msg = cq.get("message") or {}
+            chat_id = str((cb_msg.get("chat") or {}).get("id") or "")
+            if allowed_chat and chat_id and chat_id != allowed_chat:
+                log.warning("Dropped callback from unauthorized chat_id=%s data=%r", chat_id, cb_data[:80])
+                continue
+            events.append({
+                "type": "callback",
+                "data": cb_data,
+                "chat_id": chat_id,
+                "callback_query_id": cq.get("id"),
+                "message_id": cb_msg.get("message_id"),
+            })
+            continue
+
         msg = update.get("message") or update.get("edited_message") or {}
         if not msg:
             continue
@@ -148,8 +172,79 @@ async def _poll_once(client: httpx.AsyncClient, offset: int) -> tuple[int, list[
         if allowed_chat and chat_id and chat_id != allowed_chat:
             log.warning("Dropped message from unauthorized chat_id=%s text=%r", chat_id, text[:80])
             continue
-        messages.append({"text": text, "chat_id": chat_id, "message_id": msg.get("message_id")})
-    return new_offset, messages
+        events.append({"type": "message", "text": text, "chat_id": chat_id, "message_id": msg.get("message_id")})
+    return new_offset, events
+
+
+async def _answer_callback(client: httpx.AsyncClient, callback_query_id: str, text: str = "") -> None:
+    """Acknowledge a callback_query so Telegram dismisses the button's spinner."""
+    if not callback_query_id:
+        return
+    url = _BASE.format(token=_token()) + "/answerCallbackQuery"
+    payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+    if text:
+        payload["text"] = text[:200]  # Telegram caps at 200 chars
+    try:
+        await client.post(url, json=payload)
+    except httpx.HTTPError as exc:
+        log.warning("answerCallbackQuery failed: %s", exc)
+
+
+async def _handle_callback(client: httpx.AsyncClient, ev: dict[str, Any]) -> None:
+    """Resolve a proposal in response to an inline-button tap.
+
+    callback_data shape (set in approval/proposals._proposal_buttons):
+        approve_<short8>  |  reject_<short8>
+    """
+    from approval import proposals
+
+    data = ev.get("data") or ""
+    cq_id = ev.get("callback_query_id") or ""
+    if data.startswith("approve_"):
+        short, approved = data[len("approve_"):], True
+    elif data.startswith("reject_"):
+        short, approved = data[len("reject_"):], False
+    else:
+        log.warning("Unrecognised callback_data: %r", data[:80])
+        await _answer_callback(client, cq_id, "Unknown action.")
+        return
+
+    p = proposals._resolve(short, approved, reason=f"Telegram button: {data}")
+    if not p:
+        await _answer_callback(client, cq_id, "No matching pending proposal.")
+        # Log the inbound callback first (audit trail), then the response.
+        try:
+            from db import store
+            await store.log_inbound(
+                ev.get("chat_id"), None, "approval", data,
+                meta={"event": "button_tap_no_match", "callback_data": data},
+            )
+        except Exception:
+            log.debug("log_inbound (callback no-match) skipped", exc_info=True)
+        await send_message(
+            f"⚠️ Button tap for `{short}` — no matching pending proposal.",
+            kind="approval",
+            meta={"event": "button_no_match", "short_id": short, "callback_data": data},
+        )
+        return
+
+    try:
+        from db import store
+        await store.log_inbound(
+            ev.get("chat_id"), None, "approval", data,
+            meta={"event": "button_tap", "callback_data": data, "short_id": p["id"][:8], "approved": approved},
+        )
+    except Exception:
+        log.debug("log_inbound (callback) skipped", exc_info=True)
+
+    verb = "Approved" if approved else "Rejected"
+    icon = "✅" if approved else "❌"
+    await _answer_callback(client, cq_id, f"{verb}")
+    await send_message(
+        f"{icon} {verb}: `{p['id'][:8]}` — {p['title']}",
+        kind="approval",
+        meta={"event": "resolved_via_button", "short_id": p["id"][:8], "approved": approved},
+    )
 
 
 async def _nudge_loop(interval_s: int, stop_event: asyncio.Event) -> None:
@@ -177,6 +272,8 @@ async def _run() -> None:
         await send_message(
             "⚠️ Concierge cannot start: LOCAL_LLM_BASE_URL is missing in .env.",
             parse_mode=None,
+            kind="push",
+            meta={"author_agent": "system", "event": "concierge_startup_missing_env"},
         )
         return
     if not os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
@@ -192,7 +289,12 @@ async def _run() -> None:
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
 
-    await send_message("🤖 Concierge online. Ask me anything, or /help for commands.", parse_mode=None)
+    await send_message(
+        "🤖 Concierge online. Ask me anything, or /help for commands.",
+        parse_mode=None,
+        kind="push",
+        meta={"author_agent": "system", "event": "concierge_online"},
+    )
 
     nudge_interval = int(cfg.get("nudge_interval_s", 60))
     nudge_task = asyncio.create_task(_nudge_loop(nudge_interval, stop_event))
@@ -204,7 +306,7 @@ async def _run() -> None:
     async with httpx.AsyncClient(timeout=35) as client:
         while not stop_event.is_set():
             try:
-                new_offset, messages = await _poll_once(client, offset)
+                new_offset, events = await _poll_once(client, offset)
             except Exception:
                 log.exception("poll_once crashed — sleeping 5s")
                 await asyncio.sleep(5)
@@ -214,21 +316,30 @@ async def _run() -> None:
                 offset = new_offset
                 _write_offset(offset)
 
-            for msg in messages:
+            for ev in events:
                 try:
-                    await router.route(msg["text"], cfg)
+                    if ev["type"] == "callback":
+                        await _handle_callback(client, ev)
+                    else:
+                        await router.route(
+                            ev["text"], cfg,
+                            chat_id=ev.get("chat_id"),
+                            telegram_message_id=ev.get("message_id"),
+                        )
                 except Exception as exc:
-                    log.exception("Router crashed on message: %r", msg["text"][:80])
+                    log.exception("Router crashed on event: %r", ev)
                     try:
                         await send_message(
                             f"⚠️ Concierge hit an error: {type(exc).__name__}: {exc}",
                             parse_mode=None,
+                            kind="push",
+                            meta={"author_agent": "system", "event": "concierge_router_crash"},
                         )
                     except Exception:
                         pass
 
-            # Tiny breather when there were no messages (long-poll already waited 25s).
-            if not messages:
+            # Tiny breather when there were no events (long-poll already waited 25s).
+            if not events:
                 await asyncio.sleep(0.2)
 
     stop_event.set()
@@ -242,8 +353,11 @@ async def _run() -> None:
     try:
         await send_message(
             f"🤖 Concierge shutting down — {uptime_h:.1f}h uptime, "
-            f"{u['requests']} Sonnet requests, ${u['usd']:.3f} spent today.",
+            f"{u['requests']} LLM requests, "
+            f"{u.get('input_tokens', 0) + u.get('output_tokens', 0):,} tokens today.",
             parse_mode=None,
+            kind="push",
+            meta={"author_agent": "system", "event": "concierge_offline"},
         )
     except Exception:
         pass

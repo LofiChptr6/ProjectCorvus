@@ -105,6 +105,28 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "resolve_all_pending",
+        "description": "Bulk-resolve EVERY pending proposal at once. Use for requests like 'drop all pending approvals'. WRITE ACTION: the user will be asked to reply YES to confirm; your reply MUST enumerate the short_ids about to be actioned so the user can sanity-check before confirming.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "approve": {"type": "boolean", "description": "true to approve all pending, false to reject all."},
+                "reason": {"type": "string", "description": "Short note for the audit log (applied to every proposal)."},
+            },
+            "required": ["approve"],
+        },
+    },
+    {
+        "name": "list_recent_decisions",
+        "description": "List recently resolved (approved or rejected) proposals, newest first. Use when the user asks 'did I approve X' or 'what did I just decide'. Read-only.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "default": 20, "description": "Max rows to return (default 20)."},
+            },
+        },
+    },
+    {
         "name": "send_telegram_followup",
         "description": "Send an additional plain-text Telegram message to the user. Useful for 'fetching…' style updates while working through a multi-tool request.",
         "input_schema": {
@@ -249,9 +271,51 @@ async def _tool_propose_strategic_change(args: dict[str, Any]) -> str:
     })
 
 
+async def _tool_resolve_all_pending(args: dict[str, Any]) -> str:
+    """WRITE — stage a bulk-resolve intent. Returns the current pending list
+    so the model can enumerate them in its confirmation question."""
+    from concierge.state import save_pending_confirm
+    from approval import proposals
+    approve = bool(args.get("approve", False))
+    reason = args.get("reason", "via concierge bulk action")
+    pending = [
+        {"short_id": p["id"][:8], "title": p["title"]}
+        for p in proposals.list_pending()
+    ]
+    if not pending:
+        return json.dumps({"status": "noop", "message": "No pending proposals to action."})
+    intent = {
+        "kind": "resolve_all_pending",
+        "approve": approve,
+        "reason": reason,
+        "short_ids": [p["short_id"] for p in pending],
+    }
+    save_pending_confirm(intent)
+    verb = "APPROVE" if approve else "REJECT"
+    return json.dumps({
+        "status": "pending_user_confirmation",
+        "pending": pending,
+        "message": (
+            f"Staged: will {verb} all {len(pending)} pending proposals. "
+            "Your response to the user MUST list the short_ids being actioned "
+            "and ask them to reply YES to confirm, or anything else to cancel."
+        ),
+    })
+
+
+async def _tool_list_recent_decisions(args: dict[str, Any]) -> str:
+    from approval import proposals
+    limit = int(args.get("limit", 20) or 20)
+    return json.dumps(proposals.list_recent_decisions(limit))
+
+
 async def _tool_send_telegram_followup(args: dict[str, Any]) -> str:
     from approval.telegram import send_message
-    await send_message(args["text"], parse_mode=None)  # plain text — no markdown parsing risk
+    await send_message(
+        args["text"], parse_mode=None,
+        kind="concierge_reply", role="assistant",
+        meta={"event": "followup"},
+    )
     return json.dumps({"sent": True})
 
 
@@ -265,6 +329,8 @@ _DISPATCH = {
     "get_mike_analysis": _tool_get_mike_analysis,
     "list_pending_proposals": _tool_list_pending_proposals,
     "resolve_proposal": _tool_resolve_proposal,
+    "resolve_all_pending": _tool_resolve_all_pending,
+    "list_recent_decisions": _tool_list_recent_decisions,
     "propose_strategic_change": _tool_propose_strategic_change,
     "send_telegram_followup": _tool_send_telegram_followup,
 }
@@ -300,6 +366,13 @@ async def execute_confirmed_intent(intent: dict[str, Any]) -> dict[str, Any]:
         if result:
             return {"ok": True, "kind": kind, "short_id": result["id"][:8], "status": result["status"]}
         return {"ok": False, "kind": kind, "reason": "no matching pending proposal"}
+    if kind == "resolve_all_pending":
+        from approval import proposals
+        resolved = proposals.bulk_resolve(
+            bool(intent.get("approve")),
+            reason=intent.get("reason", "via concierge bulk action"),
+        )
+        return {"ok": True, "kind": kind, "resolved": resolved, "count": len(resolved)}
     if kind == "propose_strategic_change":
         from approval import proposals
         p = await proposals.create(title=intent["title"], details=intent["details"])

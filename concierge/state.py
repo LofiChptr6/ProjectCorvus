@@ -1,6 +1,10 @@
-"""Concierge persistent state — conversation history and usage tracking.
+"""Concierge persistent state — usage tracking + pending write-action confirmations.
 
-All state is JSON on disk. Atomic writes via temp-file-then-rename.
+Conversation history moved to the `telegram_message` Postgres table — see
+`db.store.load_concierge_history`. The two pieces still here are small,
+ephemeral, and don't benefit from DB storage:
+  - daily token usage counter (resets at UTC midnight)
+  - pending YES-to-confirm gate for staged write actions
 """
 
 from __future__ import annotations
@@ -15,7 +19,6 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-_CHAT_PATH = Path("data/concierge_chat.json")
 _USAGE_PATH = Path("data/concierge_usage.json")
 _PENDING_CONFIRM_PATH = Path("data/concierge_pending_confirm.json")
 
@@ -34,51 +37,6 @@ def _atomic_write(path: Path, text: str) -> None:
         except OSError:
             pass
         raise
-
-
-# ── Conversation history ──────────────────────────────────────────────────────
-
-
-def load_history() -> list[dict[str, Any]]:
-    if not _CHAT_PATH.exists():
-        return []
-    try:
-        return json.loads(_CHAT_PATH.read_text(encoding="utf-8"))
-    except Exception as exc:
-        log.warning("Could not load concierge history: %s — starting fresh", exc)
-        return []
-
-
-def save_history(messages: list[dict[str, Any]]) -> None:
-    _atomic_write(_CHAT_PATH, json.dumps(messages, indent=2, default=str))
-
-
-def prune_history(messages: list[dict[str, Any]], max_turns: int) -> list[dict[str, Any]]:
-    """Keep only the last `max_turns` user/assistant turns.
-
-    A turn = one user message + the assistant/tool messages that follow before
-    the next user message. (OpenAI shape uses role="tool" for tool results, so
-    role="user" reliably marks turn starts.)
-    """
-    if len(messages) <= max_turns * 2:
-        return messages
-    turns: list[list[dict[str, Any]]] = []
-    current: list[dict[str, Any]] = []
-    for msg in messages:
-        if msg.get("role") == "user":
-            if current:
-                turns.append(current)
-            current = [msg]
-        else:
-            current.append(msg)
-    if current:
-        turns.append(current)
-
-    kept = turns[-max_turns:]
-    flat: list[dict[str, Any]] = []
-    for t in kept:
-        flat.extend(t)
-    return flat
 
 
 # ── Usage / spend tracking ────────────────────────────────────────────────────

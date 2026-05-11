@@ -122,12 +122,15 @@ async def create(title: str, details: str) -> dict:
     proposals.append(proposal)
     _save(proposals)
 
+    proposal_meta = {"proposal_id": proposal["id"], "short_id": proposal["id"][:8]}
     if auto_approved:
         await send_message(
             f"⚡ *Strategic proposal auto-approved* ({bypass_reason})\n\n"
             f"*ID:* `{proposal['id'][:8]}`\n"
             f"*Title:* {title}\n\n"
-            f"{details}"
+            f"{details}",
+            kind="approval",
+            meta={**proposal_meta, "event": "auto_approved"},
         )
         log.info("Auto-approved proposal id=%s title=%s (%s)",
                  proposal["id"][:8], title, bypass_reason)
@@ -135,6 +138,8 @@ async def create(title: str, details: str) -> dict:
         await send_message(
             _fmt_message(proposal, nudge=False),
             reply_markup=_proposal_buttons(proposal),
+            kind="approval",
+            meta={**proposal_meta, "event": "created"},
         )
         log.info("Created proposal id=%s title=%s", proposal["id"][:8], title)
     return proposal
@@ -162,6 +167,8 @@ async def nudge_stale() -> int:
         await send_message(
             _fmt_message(p, nudge=True),
             reply_markup=_proposal_buttons(p),
+            kind="approval",
+            meta={"proposal_id": p["id"], "short_id": p["id"][:8], "event": "nudge"},
         )
         p["last_pinged_at"] = now
         p["ping_count"] += 1
@@ -198,6 +205,49 @@ def _resolve_oldest(approved: bool, reason: str = "") -> Optional[dict]:
     p["resolved_reason"] = reason
     _save(proposals)
     return p
+
+
+def bulk_resolve(approved: bool, reason: str = "") -> list[dict]:
+    """Resolve every pending proposal in one shot. Returns a list of
+    {short_id, title, status} entries for the proposals that were resolved.
+
+    Used by the concierge's `resolve_all_pending` tool. Does NOT send Telegram
+    confirmations — the caller composes a single summary message after the user
+    confirms the bulk action. No-op (returns []) if no proposals are pending.
+    """
+    proposals = _load()
+    out: list[dict] = []
+    now = time.time()
+    new_status = "approved" if approved else "rejected"
+    for p in proposals:
+        if p["status"] != "pending":
+            continue
+        p["status"] = new_status
+        p["resolved_at"] = now
+        p["resolved_reason"] = reason
+        out.append({"short_id": p["id"][:8], "title": p["title"], "status": p["status"]})
+    if out:
+        _save(proposals)
+    return out
+
+
+def list_recent_decisions(limit: int = 20) -> list[dict]:
+    """Return the most-recently resolved proposals (approved or rejected),
+    newest first. Read-only — used by the concierge to answer questions like
+    'did I approve the pause on Vera?' without trawling chat history."""
+    proposals = _load()
+    decided = [p for p in proposals if p.get("status") in ("approved", "rejected")]
+    decided.sort(key=lambda p: p.get("resolved_at") or 0, reverse=True)
+    out: list[dict] = []
+    for p in decided[:max(0, int(limit))]:
+        out.append({
+            "short_id": p["id"][:8],
+            "title": p["title"],
+            "status": p["status"],
+            "resolved_at": p.get("resolved_at"),
+            "resolved_reason": p.get("resolved_reason"),
+        })
+    return out
 
 
 async def process_inbox() -> dict:
@@ -260,7 +310,9 @@ async def process_inbox() -> dict:
                     if prop:
                         resolved.append({"id": prop["id"][:8], "title": prop["title"], "approved": approved})
                         await send_message(
-                            f"{'✅ Approved' if approved else '❌ Rejected'}: `{prop['id'][:8]}` — {prop['title']}"
+                            f"{'✅ Approved' if approved else '❌ Rejected'}: `{prop['id'][:8]}` — {prop['title']}",
+                            kind="approval",
+                            meta={"proposal_id": prop["id"], "short_id": prop["id"][:8], "event": "resolved", "approved": approved},
                         )
                     else:
                         # y/n with no pending proposal — treat as a stray, ignore

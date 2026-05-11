@@ -26,8 +26,10 @@ class _TelegramRecorder:
     def __init__(self):
         self.calls: list[dict[str, Any]] = []
     async def __call__(self, text: str, parse_mode: Optional[str] = "Markdown",
-                       reply_markup: Optional[dict] = None) -> Optional[dict]:
-        self.calls.append({"text": text, "parse_mode": parse_mode})
+                       reply_markup: Optional[dict] = None, **kwargs: Any) -> Optional[dict]:
+        # kwargs absorbs the new kind/role/meta keyword-only args on send_message.
+        # Recorders that care can inspect kwargs; existing tests only check text/parse_mode.
+        self.calls.append({"text": text, "parse_mode": parse_mode, **kwargs})
         return {"ok": True}
 
 
@@ -71,8 +73,8 @@ async def test_send_summary_safe_dry_run_prepends_prefix(telegram_recorder):
 
 async def test_send_chart_safe_dry_run_prepends_prefix(monkeypatch):
     captured: list[dict] = []
-    async def fake_chart(image_path, caption):
-        captured.append({"image_path": image_path, "caption": caption})
+    async def fake_chart(image_path, caption, **kwargs):
+        captured.append({"image_path": image_path, "caption": caption, **kwargs})
         return {"ok": True}
     import approval.telegram
     monkeypatch.setattr(approval.telegram, "send_photo", fake_chart)
@@ -83,8 +85,8 @@ async def test_send_chart_safe_dry_run_prepends_prefix(monkeypatch):
 
 async def test_send_chart_safe_live_no_prefix(monkeypatch):
     captured: list[dict] = []
-    async def fake_chart(image_path, caption):
-        captured.append({"image_path": image_path, "caption": caption})
+    async def fake_chart(image_path, caption, **kwargs):
+        captured.append({"image_path": image_path, "caption": caption, **kwargs})
         return {"ok": True}
     import approval.telegram
     monkeypatch.setattr(approval.telegram, "send_photo", fake_chart)

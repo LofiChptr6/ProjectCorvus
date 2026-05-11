@@ -4,7 +4,12 @@ Order:
   1. Outstanding write-action confirmation? — match YES/no, execute or cancel.
   2. y/n for a pending proposal — fast path, no LLM cost.
   3. /slash commands — cheap built-ins.
-  4. Everything else — Sonnet chat path.
+  4. Everything else — local-LLM concierge chat path.
+
+Every inbound message is classified into a `kind` (user_text | slash_cmd |
+approval) and recorded in the telegram_message log. Only kind='user_text' rows
+flow into the concierge LLM's conversation context; the other kinds are
+audit-only.
 """
 
 from __future__ import annotations
@@ -12,15 +17,36 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from approval.telegram import send_message
 from concierge import chat, state, tools as concierge_tools
+from db import store
 
 log = logging.getLogger(__name__)
 
 
-async def route(text: str, cfg: dict[str, Any]) -> None:
+def _classify(text: str) -> str:
+    """Return the telegram_message.kind for this inbound text (does not include
+    the YES-confirmation special case — that path always carries the prior
+    proposal_id intent in pending_confirm, so it's classified as 'approval')."""
+    stripped = text.strip()
+    lowered = stripped.lower()
+    first_word = lowered.split()[0] if lowered else ""
+    if first_word in ("y", "yes", "n", "no"):
+        return "approval"
+    if stripped.startswith("/"):
+        return "slash_cmd"
+    return "user_text"
+
+
+async def route(
+    text: str,
+    cfg: dict[str, Any],
+    *,
+    chat_id: Optional[str] = None,
+    telegram_message_id: Optional[int] = None,
+) -> None:
     """Main dispatcher. Sends responses via Telegram."""
     stripped = text.strip()
     lowered = stripped.lower()
@@ -28,52 +54,96 @@ async def route(text: str, cfg: dict[str, Any]) -> None:
     # 1. Pending write-action confirmation
     pending = state.load_pending_confirm()
     if pending is not None:
+        try:
+            await store.log_inbound(
+                chat_id, telegram_message_id, "approval", stripped,
+                meta={"event": "write_confirm_response", "pending_kind": pending.get("kind")},
+            )
+        except Exception:
+            log.debug("log_inbound (confirm) skipped", exc_info=True)
         await _handle_confirmation(pending, stripped)
         return
 
+    kind = _classify(stripped)
+    try:
+        await store.log_inbound(chat_id, telegram_message_id, kind, stripped)
+    except Exception:
+        log.debug("log_inbound skipped", exc_info=True)
+
     # 2. y/n fast path
-    first_word = lowered.split()[0] if lowered else ""
-    if first_word in ("y", "yes", "n", "no"):
+    if kind == "approval":
         await _handle_yn(stripped)
         return
 
     # 3. Slash commands
-    if stripped.startswith("/"):
+    if kind == "slash_cmd":
         await _handle_slash(stripped, cfg)
         return
 
-    # 4. Sonnet chat
-    reply = await chat.handle(stripped, cfg)
-    await send_message(reply, parse_mode=None)
+    # 4. LLM chat
+    reply = await chat.handle(stripped, cfg, chat_id=chat_id)
+    # chat.handle has already logged the assistant reply (and any tool rows)
+    # to telegram_message with kind='concierge_reply' / 'concierge_tool', and
+    # has sent the reply to Telegram. Nothing more to do here.
+    if reply is None:
+        # Defensive: chat.handle promises to send the reply. If it returned
+        # None we fall back to a generic ack.
+        await send_message(
+            "(no reply produced)", parse_mode=None, kind="concierge_reply", role="assistant",
+        )
 
 
 # ── 1. Confirmation gate ──────────────────────────────────────────────────────
 
 
 async def _handle_confirmation(pending: dict[str, Any], text: str) -> None:
+    pending_kind = pending.get("kind")
     if text.strip().upper() == "YES":
         result = await concierge_tools.execute_confirmed_intent(pending)
         state.clear_pending_confirm()
         if result.get("ok"):
-            if pending["kind"] == "resolve_proposal":
+            if pending_kind == "resolve_proposal":
                 verb = "approved" if pending.get("approve") else "rejected"
-                await send_message(f"✅ Proposal {result['short_id']} {verb}.", parse_mode=None)
-            elif pending["kind"] == "propose_strategic_change":
+                await send_message(
+                    f"✅ Proposal {result['short_id']} {verb}.",
+                    parse_mode=None, kind="approval",
+                    meta={"event": "write_confirm_resolved", "short_id": result["short_id"]},
+                )
+            elif pending_kind == "propose_strategic_change":
                 await send_message(
                     f"📝 New proposal filed: {result['short_id']} — '{pending['title']}'. "
                     f"You'll get the approval ping momentarily.",
-                    parse_mode=None,
+                    parse_mode=None, kind="approval",
+                    meta={"event": "write_confirm_filed", "short_id": result["short_id"]},
                 )
+            elif pending_kind == "resolve_all_pending":
+                resolved = result.get("resolved") or []
+                if resolved:
+                    body = "\n".join(f"• `{r['short_id']}` — {r['title']}" for r in resolved)
+                    verb = "approved" if pending.get("approve") else "rejected"
+                    await send_message(
+                        f"✅ {len(resolved)} proposal(s) {verb} in bulk:\n{body}",
+                        parse_mode=None, kind="approval",
+                        meta={"event": "write_confirm_bulk", "approved": bool(pending.get("approve")), "count": len(resolved)},
+                    )
+                else:
+                    await send_message(
+                        "No pending proposals to action.",
+                        parse_mode=None, kind="approval",
+                        meta={"event": "write_confirm_bulk_noop"},
+                    )
         else:
             await send_message(
                 f"⚠️ Could not execute: {result.get('reason', 'unknown error')}",
-                parse_mode=None,
+                parse_mode=None, kind="approval",
+                meta={"event": "write_confirm_failed", "pending_kind": pending_kind},
             )
     else:
         state.clear_pending_confirm()
         await send_message(
             "Cancelled — write action not executed. What would you like to do instead?",
-            parse_mode=None,
+            parse_mode=None, kind="approval",
+            meta={"event": "write_confirm_cancelled", "pending_kind": pending_kind},
         )
 
 
@@ -92,11 +162,16 @@ async def _handle_yn(text: str) -> None:
     if p:
         verb = "Approved" if approved else "Rejected"
         icon = "✅" if approved else "❌"
-        await send_message(f"{icon} {verb}: `{p['id'][:8]}` — {p['title']}")
+        await send_message(
+            f"{icon} {verb}: `{p['id'][:8]}` — {p['title']}",
+            kind="approval",
+            meta={"event": "resolved_via_yn", "short_id": p["id"][:8], "approved": approved},
+        )
     else:
         await send_message(
             "No pending proposal matches that reply. Use /proposals to see open items.",
-            parse_mode=None,
+            parse_mode=None, kind="approval",
+            meta={"event": "yn_no_match"},
         )
 
 
@@ -122,7 +197,7 @@ async def _handle_slash(text: str, cfg: dict[str, Any]) -> None:
 
     try:
         if cmd == "/help":
-            await send_message(_HELP_TEXT, parse_mode=None)
+            await send_message(_HELP_TEXT, parse_mode=None, kind="slash_cmd", meta={"cmd": cmd})
         elif cmd == "/status":
             await _send_status()
         elif cmd == "/positions":
@@ -136,10 +211,18 @@ async def _handle_slash(text: str, cfg: dict[str, Any]) -> None:
         elif cmd == "/budget":
             await _send_budget(cfg)
         else:
-            await send_message(f"Unknown command: {cmd}. Try /help.", parse_mode=None)
+            await send_message(
+                f"Unknown command: {cmd}. Try /help.",
+                parse_mode=None, kind="slash_cmd",
+                meta={"cmd": cmd, "event": "unknown_command"},
+            )
     except Exception as exc:
         log.exception("Slash handler failed for %s", cmd)
-        await send_message(f"⚠️ {cmd} failed: {type(exc).__name__}: {exc}", parse_mode=None)
+        await send_message(
+            f"⚠️ {cmd} failed: {type(exc).__name__}: {exc}",
+            parse_mode=None, kind="slash_cmd",
+            meta={"cmd": cmd, "event": "slash_handler_error"},
+        )
 
 
 async def _send_status() -> None:
@@ -201,14 +284,14 @@ async def _send_status() -> None:
         for p in pending[:5]:
             lines.append(f"• `{p['id'][:8]}` — {p['title']}")
 
-    await send_message("\n".join(lines))
+    await send_message("\n".join(lines), kind="slash_cmd", meta={"cmd": "/status"})
 
 
 async def _send_positions() -> None:
     from ibkr.account import get_positions
     positions = await get_positions()
     if not positions:
-        await send_message("No open positions.", parse_mode=None)
+        await send_message("No open positions.", parse_mode=None, kind="slash_cmd", meta={"cmd": "/positions"})
         return
     lines = ["*Open positions:*"]
     for p in positions:
@@ -216,14 +299,14 @@ async def _send_positions() -> None:
             f"• {p.get('symbol', '?')}  qty {p.get('quantity', 0):+g}  "
             f"avg ${p.get('avg_cost', 0):.2f}  unreal {_fmt_pnl(p.get('unrealized_pnl', 0))}"
         )
-    await send_message("\n".join(lines))
+    await send_message("\n".join(lines), kind="slash_cmd", meta={"cmd": "/positions"})
 
 
 async def _send_pnl() -> None:
     from db import store
     rows = await store.get_pnl_summary(period="today")
     if not rows:
-        await send_message("No P&L rows for today.", parse_mode=None)
+        await send_message("No P&L rows for today.", parse_mode=None, kind="slash_cmd", meta={"cmd": "/pnl"})
         return
     lines = ["*Today's P&L by agent:*"]
     for r in rows:
@@ -234,27 +317,30 @@ async def _send_pnl() -> None:
             f"• {r.get('agent_name', '?')}: total {_fmt_pnl(total)}  "
             f"(realized {_fmt_pnl(realized)}, unreal {_fmt_pnl(unreal)})"
         )
-    await send_message("\n".join(lines))
+    await send_message("\n".join(lines), kind="slash_cmd", meta={"cmd": "/pnl"})
 
 
 async def _send_proposals() -> None:
     from approval import proposals
     pending = proposals.list_pending()
     if not pending:
-        await send_message("No pending proposals.", parse_mode=None)
+        await send_message("No pending proposals.", parse_mode=None, kind="slash_cmd", meta={"cmd": "/proposals"})
         return
     lines = ["*Pending proposals:*"]
     for p in pending:
         lines.append(f"• `{p['id'][:8]}` — {p['title']}")
     lines.append("")
     lines.append("Reply `y <short_id>` to approve or `n <short_id>` to reject.")
-    await send_message("\n".join(lines))
+    await send_message("\n".join(lines), kind="slash_cmd", meta={"cmd": "/proposals"})
 
 
 async def _raise_pause(agent: str) -> None:
     from approval import proposals
     if not agent:
-        await send_message("Usage: /pause <agent_name>  — e.g. /pause atlas", parse_mode=None)
+        await send_message(
+            "Usage: /pause <agent_name>  — e.g. /pause atlas",
+            parse_mode=None, kind="slash_cmd", meta={"cmd": "/pause", "event": "usage"},
+        )
         return
     title = f"Pause {agent} — requested via /pause"
     details = (
@@ -264,6 +350,8 @@ async def _raise_pause(agent: str) -> None:
     p = await proposals.create(title=title, details=details)
     await send_message(
         f"📝 Proposal {p['id'][:8]} filed — reply `y {p['id'][:8]}` to confirm pause.",
+        kind="slash_cmd",
+        meta={"cmd": "/pause", "agent": agent, "short_id": p["id"][:8]},
     )
 
 
@@ -281,7 +369,7 @@ async def _send_budget(cfg: dict[str, Any]) -> None:
         f"Concierge today: {total:,} tokens{cap_str}\n"
         f"{u.get('requests', 0)} requests · "
         f"{u.get('input_tokens', 0):,}in / {u.get('output_tokens', 0):,}out",
-        parse_mode=None,
+        parse_mode=None, kind="slash_cmd", meta={"cmd": "/budget"},
     )
 
 

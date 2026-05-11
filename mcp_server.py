@@ -134,7 +134,11 @@ async def _ensure_init() -> None:
     except Exception as exc:
         try:
             from approval.telegram import send_message
-            await send_message(f"⚠️ *IBKR daemon unreachable*\n`{type(exc).__name__}: {exc}`\nTool call aborted. Check ibkr-daemon.service / IB Gateway.")
+            await send_message(
+                f"⚠️ *IBKR daemon unreachable*\n`{type(exc).__name__}: {exc}`\nTool call aborted. Check ibkr-daemon.service / IB Gateway.",
+                kind="push",
+                meta={"author_agent": "system", "event": "ibkr_daemon_unreachable"},
+            )
         except Exception:
             pass
         raise
@@ -701,7 +705,11 @@ async def activate_kill_switch(reason: str, agent_name: Optional[str] = None) ->
     scope = f"agent={agent_name}" if agent_name else "GLOBAL"
     try:
         from approval.telegram import send_message
-        await send_message(f"🛑 *Kill switch activated* ({scope})\nReason: {reason}")
+        await send_message(
+            f"🛑 *Kill switch activated* ({scope})\nReason: {reason}",
+            kind="push",
+            meta={"author_agent": "system", "event": "kill_switch_activated", "scope": scope},
+        )
     except Exception:
         pass
     return json.dumps({"status": "activated", "scope": scope, "reason": reason})
@@ -772,20 +780,26 @@ async def get_market_status() -> str:
 # ── Telegram / proposals ──────────────────────────────────────────────────────
 
 @mcp.tool()
-async def send_telegram_update(text: str) -> str:
+async def send_telegram_update(text: str, author_agent: Optional[str] = None) -> str:
     """
     Send a plain status message to the user via Telegram.
     Use for the hourly summary ping. Does NOT require a reply.
 
     Args:
         text: Markdown-formatted message body.
+        author_agent: Optional agent identifier ('mike', 'atlas', 'cassidy', …)
+                      for the telegram_message audit log. Defaults to 'system'.
     """
     await _ensure_init_light()
     ok, reason = _rate_check("send_telegram_update")
     if not ok:
         return json.dumps({"sent": False, "error": reason})
     from approval.telegram import send_message
-    result = await send_message(text)
+    result = await send_message(
+        text,
+        kind="push",
+        meta={"author_agent": author_agent or "system"},
+    )
     return json.dumps({"sent": result is not None})
 
 
@@ -1366,7 +1380,11 @@ async def record_evening_digest(
 # ── Telegram chart ────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def send_telegram_chart(image_path: str, caption: Optional[str] = None) -> str:
+async def send_telegram_chart(
+    image_path: str,
+    caption: Optional[str] = None,
+    author_agent: Optional[str] = None,
+) -> str:
     """
     Send an image (PNG/JPG) to Telegram via sendPhoto. Use for end-of-day chart digests.
 
@@ -1374,10 +1392,16 @@ async def send_telegram_chart(image_path: str, caption: Optional[str] = None) ->
         image_path: Path to image file (relative to repo root or absolute).
         caption: Optional caption text, <1024 chars. Plain text is safest; Telegram's
                  Markdown parsing is finicky with underscores and special chars.
+        author_agent: Optional agent identifier ('mike', 'atlas', 'cassidy', …)
+                      for the telegram_message audit log. Defaults to 'system'.
     """
     await _ensure_init_light()
     from approval.telegram import send_photo
-    result = await send_photo(image_path, caption)
+    result = await send_photo(
+        image_path, caption,
+        kind="push",
+        meta={"author_agent": author_agent or "system"},
+    )
     return json.dumps({"sent": result is not None})
 
 

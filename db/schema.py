@@ -534,6 +534,32 @@ END $$""",
         run_session_id        TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_forecast_shadow_agent_run ON agent_forecast_shadow (agent_name, submitted_at DESC)",
+    # Unified Telegram message log. One row per inbound or outbound Telegram event.
+    # `kind` partitions the stream into three audiences:
+    #   - concierge LLM sees rows with kind IN ('user_text','concierge_reply','concierge_tool')
+    #   - approval flow uses kind='approval' (inbound /y/n/buttons + outbound pings/confirmations)
+    #   - everything else (agent reports, digests, charts) is kind='push' and is invisible to
+    #     the concierge's chat context — fetched on demand via tools when needed.
+    # role/tool_calls/tool_call_id are OpenAI chat-completions shape, allowing direct
+    # replay into the LLM `messages` array without translation.
+    """CREATE TABLE IF NOT EXISTS telegram_message (
+        id                  BIGSERIAL PRIMARY KEY,
+        direction           TEXT NOT NULL CHECK (direction IN ('inbound','outbound')),
+        kind                TEXT NOT NULL CHECK (kind IN (
+                              'user_text','slash_cmd','approval','push',
+                              'concierge_reply','concierge_tool'
+                            )),
+        chat_id             TEXT,
+        telegram_message_id BIGINT,
+        role                TEXT,
+        content             TEXT,
+        tool_calls          JSONB,
+        tool_call_id        TEXT,
+        meta                JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_telegram_message_kind_id ON telegram_message (kind, id DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_telegram_message_chat_id_id ON telegram_message (chat_id, id DESC)",
 ]
 
 
