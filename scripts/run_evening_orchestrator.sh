@@ -1,11 +1,13 @@
 #!/usr/bin/env bash
-# Evening orchestrator — fans out 11 sector evenings via the Python pipeline,
-# then runs cassidy-evening (compliance, harness). Called by
-# trading-sector-evenings.timer at 20:00 AZ. Titan-evening was decommissioned
-# (energy + commodity supersede titan's scope).
+# Evening orchestrator — fans out 11 sector evenings via the Python pipeline.
+# Called by trading-sector-evenings.timer at 20:00 AZ. Titan-evening was
+# decommissioned (energy + commodity supersede titan's scope).
 #
-# Cassidy runs LAST so it can read every other agent's evening_digest row.
-# Each per-sector evening writes its digest before exit; cassidy aggregates.
+# Cassidy is NOT fired from here anymore (was firing twice per evening —
+# once at 20:00 via this script's phase 2, again at 22:00 via its dedicated
+# timer). The dedicated timer is the single canonical Cassidy invocation;
+# each per-sector evening still writes its digest before exit so Cassidy
+# can aggregate them when she runs.
 
 set -u
 
@@ -54,9 +56,4 @@ if [[ ${#HARNESS_SKILLS[@]} -gt 0 ]]; then
     done
 fi
 
-log "phase 2: running cassidy-evening (harness, aggregates per-agent digests)"
-timeout --foreground "$SKILL_TIMEOUT_SEC" bash "$SCRIPT_DIR/run_scheduled_skill.sh" cassidy-evening
-ec=$?
-if [[ $ec -ne 0 ]]; then log "phase 2: cassidy-evening exited non-zero (exit=$ec)"; fi
-
-log "evening-orchestrator end"
+log "evening-orchestrator end (cassidy fires separately at 22:00 via her own timer)"
