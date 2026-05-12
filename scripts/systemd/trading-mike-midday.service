@@ -1,14 +1,15 @@
 [Unit]
-Description=Mike's 11:00 ET midday review — invokes Claude Code /mike-midday
+Description=Mike's 11:00 ET midday review — local-LLM harness for /mike-midday
 Documentation=file:///home/tianyizhang/opus%20trading/.claude/commands/mike-midday.md
-After=network-online.target
-Wants=network-online.target
+After=network-online.target trading-vllm.service trading-llm-proxy.service
+Wants=network-online.target trading-vllm.service trading-llm-proxy.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=/home/tianyizhang/opus trading
+EnvironmentFile=/home/tianyizhang/opus trading/.env
 Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/tianyizhang/.local/bin/claude -p "/mike-midday" --dangerously-skip-permissions
-TimeoutStartSec=1200
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/python scripts/run_harness_local.py mike-midday'
+TimeoutStartSec=1800
 StandardOutput=append:/home/tianyizhang/opus trading/logs/mike-midday.log
 StandardError=append:/home/tianyizhang/opus trading/logs/mike-midday.log
