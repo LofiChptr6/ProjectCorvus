@@ -15,8 +15,9 @@ Call `get_market_status` immediately.
 The quiet window is **10:00 PM – 5:00 AM Arizona (MST, UTC-7) = 05:00 – 12:00 UTC**.
 
 If the current UTC time is between 05:00 and 12:00:
-- Send ONE Telegram message: "🌙 Hourly heartbeat skipped — quiet window (AZ 10pm–5am)."
-- **STOP. Do not call any other tool. Exit immediately.**
+- **STOP immediately. Do not call any other tool. Do not send Telegram.**
+  (Skipping is normal during quiet hours — don't spam the user. The
+  orchestrator log records the skip; that's the audit trail.)
 
 > **Note:** when invoked by the hourly orchestrator, phases 1–2 (sector reviews + mike-allocator) were already skipped before this skill ran — this step is intentionally heartbeat-only.
 
