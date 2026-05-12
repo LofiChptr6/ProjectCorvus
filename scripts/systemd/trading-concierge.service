@@ -1,33 +1,22 @@
 [Unit]
-Description=Trading Concierge (Sonnet-backed Telegram bot)
+Description=Trading Concierge (local-LLM-backed Telegram bot, user mode)
 Documentation=file:///home/tianyizhang/opus%20trading/concierge/README.md
-After=network-online.target postgresql.service
+After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-# Run as the desk owner so .env, .venv, and data/ paths are readable.
-User=tianyizhang
-Group=tianyizhang
 WorkingDirectory=/home/tianyizhang/opus trading
 EnvironmentFile=/home/tianyizhang/opus trading/.env
-ExecStart=/home/tianyizhang/opus trading/.venv/bin/python -m concierge.service
-# SIGTERM triggers concierge.service._signal_handler → graceful shutdown
-# (releases lockfile, sends Telegram offline ping). Allow 15s for it.
+# systemd splits ExecStart on whitespace even when the binary is quoted —
+# wrap in bash -c so the space in "/home/tianyizhang/opus trading" survives.
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/python -m concierge.service'
 KillSignal=SIGTERM
 TimeoutStopSec=15
-# Auto-restart on crash, mirroring NSSM's `AppRestartDelay 10000`.
 Restart=on-failure
 RestartSec=10
-# Rotate stdout/stderr through journald — view with: journalctl -u trading-concierge -f
-StandardOutput=journal
-StandardError=journal
-# Light hardening — concierge has no business writing outside its repo.
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/home/tianyizhang/opus trading/data /home/tianyizhang/opus trading/logs
 
 [Install]
-WantedBy=multi-user.target
+# Mode C analog: runs while the user has an active session. To survive
+# logout/reboot without re-login, run:  loginctl enable-linger tianyizhang
+WantedBy=default.target

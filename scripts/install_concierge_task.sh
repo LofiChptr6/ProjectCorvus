@@ -17,7 +17,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-UNIT_SRC="${REPO_ROOT}/scripts/systemd/trading-concierge.user.service"
+UNIT_SRC="${REPO_ROOT}/scripts/systemd/trading-concierge.service"
 UNIT_DIR="${HOME}/.config/systemd/user"
 UNIT_DST="${UNIT_DIR}/trading-concierge.service"
 

@@ -24,6 +24,19 @@ logs/
 concierge.lock
 *.lock
 
+# ── Per-agent runtime state ──────────────────────────────────────────────────
+# Sector agents write working notes, cached data exports, inbox messages,
+# and watchlists into their own subdirectories at runtime. Those are
+# transient and machine-specific — they don't belong in the repo. The
+# convention-describing README.md files in `data/` and `notes/` ARE tracked
+# so newcomers can see what each directory is for.
+agents/*/data/*
+!agents/*/data/README.md
+agents/*/notes/*
+!agents/*/notes/README.md
+agents/*/inbox/
+agents/*/watchlist.md
+
 # ── Python ────────────────────────────────────────────────────────────────────
 __pycache__/
 *.pyc
