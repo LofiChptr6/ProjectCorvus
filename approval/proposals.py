@@ -61,10 +61,27 @@ def _proposal_buttons(p: dict) -> dict:
 async def create(title: str, details: str) -> dict:
     """Create a new pending proposal and send initial Telegram ping.
 
+    If a pending proposal with the same title already exists, return it
+    unchanged (no new record, no fresh Telegram ping). The nudge loop will
+    keep re-pinging the existing one. This prevents agents like Cassidy
+    from re-filing the same architectural-drift proposal every evening.
+
     If bypass mode is active, the proposal is created in `approved` state
     immediately (audit trail preserved) and a different Telegram ping is
     sent. No nudge loop runs for auto-approved proposals."""
     from approval import bypass
+
+    proposals = _load()
+    existing = next(
+        (p for p in proposals if p["status"] == "pending" and p["title"] == title),
+        None,
+    )
+    if existing is not None:
+        log.info(
+            "Skipping duplicate proposal title=%s; existing id=%s (status=pending, ping_count=%d)",
+            title, existing["id"][:8], existing.get("ping_count", 0),
+        )
+        return existing
 
     now = time.time()
     auto_approved = bypass.is_active()
@@ -81,7 +98,6 @@ async def create(title: str, details: str) -> dict:
         "resolved_at": now if auto_approved else None,
         "resolved_reason": bypass_reason if auto_approved else None,
     }
-    proposals = _load()
     proposals.append(proposal)
     _save(proposals)
 
