@@ -1,12 +1,15 @@
-"""Read/write agent capital allocations as % of live NAV.
+"""Agent roster helper.
 
-The single source of truth is `allocation_pct` (0.0–1.0). Dollar amounts are
-always derived as `pct × current_NAV` at read time, so NAV changes propagate
-automatically without manual rebalancing.
+In the post-2026-04-26 conviction-driven architecture there is **no per-agent
+capital allocation**. Mike-allocator sizes the whole desk against
+consolidated conviction views; sector agents publish convictions and never
+hold a NAV sleeve. This module's sole remaining job is to enumerate the
+agent roster (with the legacy allocation columns left in the response shape
+at 0.0 so callers like Cassidy's Step 4b.0 audit don't break).
 
-Disabled agents (or unallocated %) become idle cash — other agents do NOT
-auto-grow to fill the gap (option B). To fully deploy capital, propose an
-explicit allocation change.
+The `agent_allocations` DB table is retained but no longer written.
+`set_allocation` was removed 2026-05-12 along with the CLI `allocate`
+command — submit a `submit_conviction_view` instead.
 """
 
 from __future__ import annotations
@@ -15,60 +18,23 @@ import db.store as store
 from agent.agent_registry import list_agents
 
 
-async def _live_nav() -> float:
-    """Fetch current account NAV from IBKR. Returns 0 on failure."""
-    try:
-        from ibkr.account import get_account_summary
-        s = await get_account_summary()
-        return float(s.get("nav", 0) or 0)
-    except Exception:
-        return 0.0
-
-
 async def get_all_allocations(nav: float | None = None) -> list[dict]:
-    """Return per-agent allocation. The only source of truth is the
-    `agent_allocations` DB table. Agents without a row are reported as 0% —
-    no YAML fallback. To allocate capital, write an explicit DB row via
-    `set_allocation`."""
-    if nav is None:
-        nav = await _live_nav()
+    """Return the agent roster with always-zero allocation fields.
 
+    Kept for back-compat with `get_agent_list` (MCP tool) and Cassidy's
+    Step 4b.0 audit, which iterates the list and checks per-agent state.
+    The `allocation_pct` / `allocated_usd` fields are vestigial and always
+    0 under the conviction-driven architecture."""
     db_rows = {r["agent_name"]: r for r in await store.get_allocations()}
-    agents = list_agents(enabled_only=False)
-    result = []
-    for a in agents:
-        name = a["name"]
-        db_entry = db_rows.get(name)
-        if db_entry is not None:
-            pct = float(db_entry["allocation_pct"])
-            source = "db"
-            updated_at = db_entry.get("updated_at")
-        else:
-            pct = 0.0
-            source = "missing"
-            updated_at = None
-        result.append({
-            "agent_name": name,
-            "allocation_pct": pct,
-            "allocated_usd": pct * nav,
-            "updated_at": updated_at,
-            "source": source,
+    return [
+        {
+            "agent_name": a["name"],
+            "allocation_pct": float(db_rows[a["name"]]["allocation_pct"]) if a["name"] in db_rows else 0.0,
+            "allocated_usd": 0.0,
+            "updated_at": db_rows.get(a["name"], {}).get("updated_at"),
+            "source": "db" if a["name"] in db_rows else "missing",
             "enabled": a.get("enabled", True),
-        })
-    return result
-
-
-async def set_allocation(agent_name: str, pct: float, by: str = "cli") -> None:
-    """Set agent's NAV percentage. Validates 0.0–1.0 and warns if total enabled sum > 1.0."""
-    await store.set_allocation(agent_name, pct, updated_by=by)
-    # Soft check: warn if total now exceeds 100%. Don't block — rebalances are multi-step.
-    rows = await get_all_allocations(nav=1.0)  # nav doesn't matter for sum check
-    total = sum(r["allocation_pct"] for r in rows if r["enabled"])
-    if total > 1.0:
-        import logging
-        logging.getLogger(__name__).warning(
-            "Allocation sum exceeds 100%%: %.1f%% — over-deployed by %.1f%%",
-            total * 100, (total - 1.0) * 100,
-        )
-
-
+            "direct_trade_allowed": bool(a.get("direct_trade_allowed", False)),
+        }
+        for a in list_agents(enabled_only=False)
+    ]

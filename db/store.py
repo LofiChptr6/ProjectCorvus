@@ -273,25 +273,9 @@ async def set_kill_switch(
 
 
 # ── Agent allocations ─────────────────────────────────────────────────────────
-
-async def set_allocation(
-    agent_name: str, allocation_pct: float, updated_by: str = "cli", db_path: str = DB_PATH
-) -> None:
-    """Persist agent's NAV percentage (0.0–1.0). Dollar allocation is always derived as pct × live NAV."""
-    if not 0.0 <= allocation_pct <= 1.0:
-        raise ValueError(f"allocation_pct must be 0.0–1.0, got {allocation_pct}")
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """INSERT INTO agent_allocations (agent_name, allocation_pct, updated_at, updated_by)
-               VALUES ($1,$2,$3,$4)
-               ON CONFLICT (agent_name) DO UPDATE SET
-                 allocation_pct=EXCLUDED.allocation_pct,
-                 updated_at=EXCLUDED.updated_at,
-                 updated_by=EXCLUDED.updated_by""",
-            agent_name, allocation_pct, _now(), updated_by,
-        )
-
+# Table retained for back-compat (Cassidy's Step 4b.0 audit reads from it).
+# Writes were removed 2026-05-12 along with the per-agent allocation concept —
+# the conviction-driven architecture sizes the whole desk via mike-allocator.
 
 async def get_allocations(db_path: str = DB_PATH) -> list[dict]:
     pool = await get_pool()

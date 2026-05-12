@@ -83,46 +83,6 @@ def status(
     _run(_show())
 
 
-# ── trade allocate ────────────────────────────────────────────────────────────
-
-@app.command()
-def allocate(
-    agent: Optional[str] = typer.Argument(None),
-    pct: Optional[float] = typer.Argument(None, help="Percentage of NAV (0.0–1.0, e.g. 0.25 for 25%)"),
-    show: bool = typer.Option(False, "--show"),
-    config: str = typer.Option("config.yaml", "--config"),
-):
-    """Set agent capital allocation as % of NAV, or show all allocations.
-
-    Example: trade allocate rex 0.30   # gives Rex 30% of NAV
-    """
-    _load_config(config)
-
-    async def _alloc():
-        from db.schema import init_db
-        from meta_agent.allocation_manager import get_all_allocations, set_allocation
-        from cli.display import console, allocations_table
-        await init_db()
-
-        if show or (agent is None):
-            rows = await get_all_allocations()
-            console.print(allocations_table(rows))
-            return
-
-        if pct is None:
-            console.print("[red]Provide pct: trade allocate <agent> <pct>  (e.g. 0.25 for 25%)[/red]")
-            raise SystemExit(1)
-        if not 0.0 <= pct <= 1.0:
-            console.print(f"[red]pct must be 0.0–1.0, got {pct}[/red]")
-            raise SystemExit(1)
-
-        await set_allocation(agent, pct)
-        console.print(f"[green]Set {agent} allocation to {pct:.1%} of NAV[/green]")
-
-    _run(_alloc())
-
-
-
 # ── trade report ──────────────────────────────────────────────────────────────
 
 @app.command()

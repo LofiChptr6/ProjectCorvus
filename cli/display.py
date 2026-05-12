@@ -74,25 +74,3 @@ def pnl_table(rows: list[dict], title: str = "P&L Summary") -> Table:
     return t
 
 
-def allocations_table(rows: list[dict]) -> Table:
-    t = Table(title="Agent Allocations", box=box.ROUNDED, header_style="bold blue")
-    t.add_column("Agent")
-    t.add_column("Enabled")
-    t.add_column("% NAV", justify="right")
-    t.add_column("≈ USD", justify="right")
-    t.add_column("Source")
-    t.add_column("Updated")
-    total_pct = 0.0
-    for r in rows:
-        if r.get("enabled"):
-            total_pct += r.get("allocation_pct", 0)
-        t.add_row(
-            r["agent_name"],
-            "✓" if r.get("enabled") else "✗",
-            f"{r.get('allocation_pct', 0):.1%}",
-            f"${r.get('allocated_usd', 0):,.0f}",
-            r.get("source", "-"),
-            (r.get("updated_at") or "-")[:19],
-        )
-    t.caption = f"Enabled total: {total_pct:.1%}  |  Idle cash: {max(0.0, 1.0 - total_pct):.1%}"
-    return t
