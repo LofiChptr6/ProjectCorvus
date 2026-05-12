@@ -95,7 +95,9 @@ def main() -> int:
         help=(
             "Route writes to *_shadow tables / models_shadow/ dir instead of "
             "live tables. For respond, dry-run has no effect (the sole write is "
-            "mark_inbox_responded which is always live)."
+            "mark_inbox_responded which is always live). "
+            "TELEGRAM IS INTENTIONALLY SENT IN DRY-RUN (with `[DRY-RUN] ` prefix) — "
+            "this validates the Telegram path itself; see pipelines/notify.py."
         ),
     )
     args = p.parse_args()

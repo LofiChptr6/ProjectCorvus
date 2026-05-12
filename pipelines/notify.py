@@ -3,6 +3,23 @@
 Wraps approval.telegram.send_message so the runner can fire a per-skill
 summary without crashing the pipeline if Telegram is unreachable / mis-
 configured. Always logs failures and returns False; never raises.
+
+────────────────────────────────────────────────────────────────────────────
+DRY-RUN INTENTIONALLY FIRES TELEGRAM. THIS IS NOT A BUG.
+
+If you came here because `write_summary.telegram_sent` was True on a
+`--dry-run` invocation: that is by design. The contract is:
+
+    dry-run fires *everything* except production-table writes.
+
+Rationale: the Telegram path has its own moving parts (markdown render,
+bot token, network, rate limits, message-size truncation). If we silenced
+it under dry-run, every regression in that path would only surface on a
+live run — when it's already too late. The `[DRY-RUN] ` prefix makes the
+provenance visible to the human reading Telegram. Don't "fix" this by
+gating the send on `not dry_run`. (Owner decision, recorded here so
+nobody re-litigates the question.)
+────────────────────────────────────────────────────────────────────────────
 """
 from __future__ import annotations
 
