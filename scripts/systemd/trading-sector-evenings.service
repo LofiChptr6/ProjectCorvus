@@ -1,14 +1,14 @@
 [Unit]
 Description=Trading sector-evenings orchestrator — fans out 11 sector-evening attribution reviews
-Documentation=file:///home/tianyizhang/opus%20trading/scripts/run_evening_orchestrator.sh
+Documentation=file://@REPO_URL_PATH@/scripts/run_evening_orchestrator.sh
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/tianyizhang/opus trading
-Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/bin/bash "/home/tianyizhang/opus trading/scripts/run_evening_orchestrator.sh"
+WorkingDirectory=@REPO_PATH@
+Environment=PATH=@CLAUDE_BIN_DIR@:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash "@REPO_PATH@/scripts/run_evening_orchestrator.sh"
 TimeoutStartSec=2700
-StandardOutput=append:/home/tianyizhang/opus trading/logs/evening-orchestrator.log
-StandardError=append:/home/tianyizhang/opus trading/logs/evening-orchestrator.log
+StandardOutput=append:@REPO_PATH@/logs/evening-orchestrator.log
+StandardError=append:@REPO_PATH@/logs/evening-orchestrator.log

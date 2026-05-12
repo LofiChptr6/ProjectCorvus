@@ -3,8 +3,8 @@ Description=Trading per-agent state hourly snapshot timer — every hour at :05
 
 [Timer]
 # Replaces the cron entry in install_scheduled_tasks.sh, which silently failed
-# because the unquoted path-with-space (`/home/tianyizhang/opus trading/...`)
-# made cron try to exec `/home/tianyizhang/opus`. systemd handles spaces.
+# whenever REPO_PATH contained a space (cron tried to exec the first
+# whitespace-delimited token). systemd handles spaces in paths correctly.
 OnCalendar=*-*-* *:05:00
 Persistent=true
 AccuracySec=30s

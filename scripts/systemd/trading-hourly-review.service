@@ -1,14 +1,14 @@
 [Unit]
 Description=Trading hourly orchestrator — fans out 10 sector reviews + mike-allocator, then /hourly-review heartbeat
-Documentation=file:///home/tianyizhang/opus%20trading/scripts/run_hourly_orchestrator.sh
+Documentation=file://@REPO_URL_PATH@/scripts/run_hourly_orchestrator.sh
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/tianyizhang/opus trading
-Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/bin/bash "/home/tianyizhang/opus trading/scripts/run_hourly_orchestrator.sh"
+WorkingDirectory=@REPO_PATH@
+Environment=PATH=@CLAUDE_BIN_DIR@:/usr/local/bin:/usr/bin:/bin
+ExecStart=/bin/bash "@REPO_PATH@/scripts/run_hourly_orchestrator.sh"
 TimeoutStartSec=2700
-StandardOutput=append:/home/tianyizhang/opus trading/logs/hourly-orchestrator.log
-StandardError=append:/home/tianyizhang/opus trading/logs/hourly-orchestrator.log
+StandardOutput=append:@REPO_PATH@/logs/hourly-orchestrator.log
+StandardError=append:@REPO_PATH@/logs/hourly-orchestrator.log

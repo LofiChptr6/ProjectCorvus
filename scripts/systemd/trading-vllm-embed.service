@@ -6,8 +6,8 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-WorkingDirectory=/home/tianyizhang/opus trading
-EnvironmentFile=/home/tianyizhang/opus trading/.env
+WorkingDirectory=@REPO_PATH@
+EnvironmentFile=@REPO_PATH@/.env
 Environment=HF_HUB_DISABLE_TELEMETRY=1
 Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
 Environment=VLLM_LOGGING_LEVEL=INFO
@@ -21,7 +21,7 @@ TimeoutStartSec=600
 ## (~81 GB), leaving headroom for backfills + spikes.
 ## --max-num-seqs caps batch parallelism — for our 50-articles/day ingest cadence
 ## this is comfortably oversized.
-ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv-vllm/bin/vllm serve "${LOCAL_EMBED_MODEL}" \
+ExecStart=/bin/bash -c 'cd "@REPO_PATH@" && exec .venv-vllm/bin/vllm serve "${LOCAL_EMBED_MODEL}" \
     --runner pooling \
     --gpu-memory-utilization 0.04 \
     --max-num-seqs 32 \
@@ -32,8 +32,8 @@ Restart=on-failure
 RestartSec=15
 StartLimitIntervalSec=600
 StartLimitBurst=4
-StandardOutput=append:/home/tianyizhang/opus trading/logs/vllm-embed.log
-StandardError=append:/home/tianyizhang/opus trading/logs/vllm-embed.log
+StandardOutput=append:@REPO_PATH@/logs/vllm-embed.log
+StandardError=append:@REPO_PATH@/logs/vllm-embed.log
 
 [Install]
 WantedBy=default.target

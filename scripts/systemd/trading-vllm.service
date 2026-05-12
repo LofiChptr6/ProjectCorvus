@@ -6,8 +6,8 @@ Wants=network-online.target
 
 [Service]
 Type=exec
-WorkingDirectory=/home/tianyizhang/opus trading
-EnvironmentFile=/home/tianyizhang/opus trading/.env
+WorkingDirectory=@REPO_PATH@
+EnvironmentFile=@REPO_PATH@/.env
 Environment=HF_HUB_DISABLE_TELEMETRY=1
 Environment=HF_HUB_DISABLE_PROGRESS_BARS=1
 Environment=VLLM_LOGGING_LEVEL=INFO
@@ -27,7 +27,7 @@ TimeoutStartSec=600
 ## factor=4 extends to 163,840 — leaves comfortable headroom for the largest
 ## skill prompts (mike-allocator, sector-archivist) without OOM under the
 ## orchestrator's 4-concurrent-agent fan-out.
-ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv-vllm/bin/vllm serve "${LOCAL_MODEL}" \
+ExecStart=/bin/bash -c 'cd "@REPO_PATH@" && exec .venv-vllm/bin/vllm serve "${LOCAL_MODEL}" \
     --served-model-name "${LOCAL_MODEL}" claude-opus-4-7 claude-sonnet-4-5-20250929 claude-sonnet-4-6 claude-haiku-4-5-20251001 claude-3-5-sonnet-20241022 \
     --quantization fp8 \
     --gpu-memory-utilization 0.85 \
@@ -42,8 +42,8 @@ RestartSec=15
 # A vLLM crash-loop on missing weights or OOM should not retry forever.
 StartLimitIntervalSec=600
 StartLimitBurst=4
-StandardOutput=append:/home/tianyizhang/opus trading/logs/vllm.log
-StandardError=append:/home/tianyizhang/opus trading/logs/vllm.log
+StandardOutput=append:@REPO_PATH@/logs/vllm.log
+StandardError=append:@REPO_PATH@/logs/vllm.log
 
 [Install]
 WantedBy=default.target

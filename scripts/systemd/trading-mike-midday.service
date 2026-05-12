@@ -1,14 +1,14 @@
 [Unit]
 Description=Mike's 11:00 ET midday review — invokes Claude Code /mike-midday
-Documentation=file:///home/tianyizhang/opus%20trading/.claude/commands/mike-midday.md
+Documentation=file://@REPO_URL_PATH@/.claude/commands/mike-midday.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/tianyizhang/opus trading
-Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/tianyizhang/.local/bin/claude -p "/mike-midday" --dangerously-skip-permissions
+WorkingDirectory=@REPO_PATH@
+Environment=PATH=@CLAUDE_BIN_DIR@:/usr/local/bin:/usr/bin:/bin
+ExecStart=@CLAUDE_BIN@ -p "/mike-midday" --dangerously-skip-permissions
 TimeoutStartSec=1200
-StandardOutput=append:/home/tianyizhang/opus trading/logs/mike-midday.log
-StandardError=append:/home/tianyizhang/opus trading/logs/mike-midday.log
+StandardOutput=append:@REPO_PATH@/logs/mike-midday.log
+StandardError=append:@REPO_PATH@/logs/mike-midday.log

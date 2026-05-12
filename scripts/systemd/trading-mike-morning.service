@@ -1,14 +1,14 @@
 [Unit]
 Description=Mike's 9:06 ET morning analysis — invokes Claude Code /mike-morning
-Documentation=file:///home/tianyizhang/opus%20trading/.claude/commands/mike-morning.md
+Documentation=file://@REPO_URL_PATH@/.claude/commands/mike-morning.md
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/tianyizhang/opus trading
-Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/tianyizhang/.local/bin/claude -p "/mike-morning" --dangerously-skip-permissions
+WorkingDirectory=@REPO_PATH@
+Environment=PATH=@CLAUDE_BIN_DIR@:/usr/local/bin:/usr/bin:/bin
+ExecStart=@CLAUDE_BIN@ -p "/mike-morning" --dangerously-skip-permissions
 TimeoutStartSec=1200
-StandardOutput=append:/home/tianyizhang/opus trading/logs/mike-morning.log
-StandardError=append:/home/tianyizhang/opus trading/logs/mike-morning.log
+StandardOutput=append:@REPO_PATH@/logs/mike-morning.log
+StandardError=append:@REPO_PATH@/logs/mike-morning.log

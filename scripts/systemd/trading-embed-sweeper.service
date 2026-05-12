@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-WorkingDirectory=/home/tianyizhang/opus trading
-EnvironmentFile=/home/tianyizhang/opus trading/.env
+WorkingDirectory=@REPO_PATH@
+EnvironmentFile=@REPO_PATH@/.env
 TimeoutStartSec=300
-ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/python scripts/embed_news_sweeper.py'
-StandardOutput=append:/home/tianyizhang/opus trading/logs/embed-sweeper.log
-StandardError=append:/home/tianyizhang/opus trading/logs/embed-sweeper.log
+ExecStart=/bin/bash -c 'cd "@REPO_PATH@" && exec .venv/bin/python scripts/embed_news_sweeper.py'
+StandardOutput=append:@REPO_PATH@/logs/embed-sweeper.log
+StandardError=append:@REPO_PATH@/logs/embed-sweeper.log

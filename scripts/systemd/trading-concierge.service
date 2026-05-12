@@ -1,17 +1,17 @@
 [Unit]
 Description=Trading Concierge (Sonnet-backed Telegram bot)
-Documentation=file:///home/tianyizhang/opus%20trading/concierge/README.md
+Documentation=file://@REPO_URL_PATH@/concierge/README.md
 After=network-online.target postgresql.service
 Wants=network-online.target
 
 [Service]
 Type=simple
 # Run as the desk owner so .env, .venv, and data/ paths are readable.
-User=tianyizhang
-Group=tianyizhang
-WorkingDirectory=/home/tianyizhang/opus trading
-EnvironmentFile=/home/tianyizhang/opus trading/.env
-ExecStart=/home/tianyizhang/opus trading/.venv/bin/python -m concierge.service
+User=@USER@
+Group=@USER@
+WorkingDirectory=@REPO_PATH@
+EnvironmentFile=@REPO_PATH@/.env
+ExecStart=@REPO_PATH@/.venv/bin/python -m concierge.service
 # SIGTERM triggers concierge.service._signal_handler → graceful shutdown
 # (releases lockfile, sends Telegram offline ping). Allow 15s for it.
 KillSignal=SIGTERM
@@ -27,7 +27,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/tianyizhang/opus trading/data /home/tianyizhang/opus trading/logs
+ReadWritePaths=@REPO_PATH@/data @REPO_PATH@/logs
 
 [Install]
 WantedBy=multi-user.target

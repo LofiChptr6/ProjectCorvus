@@ -30,8 +30,15 @@ if [[ ! -x "${REPO_ROOT}/.venv/bin/python" ]]; then
     exit 1
 fi
 
+REPO_URL_PATH="$(python3 -c "import urllib.parse,sys;print(urllib.parse.quote(sys.argv[1]))" "$REPO_ROOT")"
+
 mkdir -p "$UNIT_DIR"
-install -m 0644 "$UNIT_SRC" "$UNIT_DST"
+sed \
+    -e "s|@REPO_PATH@|${REPO_ROOT}|g" \
+    -e "s|@REPO_URL_PATH@|${REPO_URL_PATH}|g" \
+    -e "s|@USER@|${USER}|g" \
+    "$UNIT_SRC" > "$UNIT_DST"
+chmod 0644 "$UNIT_DST"
 systemctl --user daemon-reload
 systemctl --user enable trading-concierge.service
 

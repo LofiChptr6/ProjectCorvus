@@ -5,15 +5,15 @@ Wants=trading-llm-proxy.service
 
 [Service]
 Type=exec
-WorkingDirectory=/home/tianyizhang/opus trading
-EnvironmentFile=/home/tianyizhang/opus trading/.env
-ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/streamlit run obs/dashboard.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false --client.showSidebarNavigation false'
+WorkingDirectory=@REPO_PATH@
+EnvironmentFile=@REPO_PATH@/.env
+ExecStart=/bin/bash -c 'cd "@REPO_PATH@" && exec .venv/bin/streamlit run obs/dashboard.py --server.address 127.0.0.1 --server.port 8501 --server.headless true --browser.gatherUsageStats false --client.showSidebarNavigation false'
 Restart=on-failure
 RestartSec=5
 StartLimitIntervalSec=300
 StartLimitBurst=5
-StandardOutput=append:/home/tianyizhang/opus trading/logs/dashboard.log
-StandardError=append:/home/tianyizhang/opus trading/logs/dashboard.log
+StandardOutput=append:@REPO_PATH@/logs/dashboard.log
+StandardError=append:@REPO_PATH@/logs/dashboard.log
 
 [Install]
 WantedBy=default.target
