@@ -135,6 +135,33 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["text"],
         },
     },
+    {
+        "name": "get_position_dossier",
+        "description": "Why is a position held? Returns every agent's active conviction view on the symbol (with rationale), recent fills (30d), and P&L breakdown by agent. Use when the user asks 'why do we hold X' / 'who's long X' / 'what's the thesis on X'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"symbol": {"type": "string", "description": "Ticker, e.g. ASML, AAPL, SPY."}},
+            "required": ["symbol"],
+        },
+    },
+    {
+        "name": "get_agent_overview",
+        "description": "Full snapshot of one sector agent: active convictions (with rationales), open theses, recent thesis resolutions, P&L today + week, last 2 sector stories, last evening digest. Use for 'what is Fab thinking' / 'how is Maya doing' / 'show me X's book'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"agent_name": {"type": "string", "description": "One of: atlas, fab, fabless, iron, maya, rex, trump, vera, volt, energy, commodity (mike/cassidy are not sector publishers)."}},
+            "required": ["agent_name"],
+        },
+    },
+    {
+        "name": "get_agent_journal",
+        "description": "An agent's working memory: open theses (hypotheses + predictions + observations), predictions due for verification today or earlier, and the last 3 resolved theses. Use to answer 'what did Fab predict last week' / 'what is X still tracking'.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"agent_name": {"type": "string"}},
+            "required": ["agent_name"],
+        },
+    },
 ]
 
 
@@ -319,6 +346,115 @@ async def _tool_send_telegram_followup(args: dict[str, Any]) -> str:
     return json.dumps({"sent": True})
 
 
+# ── Agent reasoning surface ───────────────────────────────────────────────────
+# These let the concierge answer "why does Fab hold ASML" / "what is Maya
+# thinking" by reading every agent's published convictions, theses, and
+# rationales straight from the canonical tables. Without them the concierge
+# would only see prices + positions, never the *reason* behind a position.
+
+
+async def _tool_get_position_dossier(args: dict[str, Any]) -> str:
+    import asyncio
+    import db.store as store
+    from reporting.agent_pnl import get_symbol_unrealized
+
+    sym = (args.get("symbol") or "").upper().strip()
+    if not sym:
+        return json.dumps({"error": "symbol required"})
+
+    convictions, fills, pnl, unrealized = await asyncio.gather(
+        store.get_convictions_for_symbol(sym),
+        store.get_symbol_fills(sym, lookback_days=30),
+        store.get_symbol_pnl_summary(sym),
+        get_symbol_unrealized(sym),
+    )
+    realized = sum(float(r.get("attributed_pnl") or 0) for r in pnl)
+    combined = realized + float(unrealized or 0.0)
+
+    if not convictions and not fills:
+        note = f"No desk exposure to {sym} — no active conviction and no fills in the last 30 days."
+    else:
+        long_agents = [c["agent_name"] for c in convictions if c["direction"] == "long"]
+        short_agents = [c["agent_name"] for c in convictions if c["direction"] == "short"]
+        conflict = (f" NOTE: conflicting views — {long_agents} long vs {short_agents} short."
+                    if long_agents and short_agents else "")
+        note = (f"Desk holds {len(convictions)} active conviction(s) on {sym} "
+                f"({len(long_agents)} long, {len(short_agents)} short), "
+                f"{len(fills)} fill(s) in 30d, total P&L {combined:+,.2f} "
+                f"(real {realized:+,.2f}, unreal {float(unrealized or 0.0):+,.2f}).{conflict}")
+    return json.dumps({
+        "symbol": sym,
+        "active_convictions": convictions,
+        "recent_fills_30d": fills,
+        "pnl_by_agent": pnl,
+        "realized_pnl": realized,
+        "unrealized_pnl": float(unrealized or 0.0),
+        "total_pnl": combined,
+        "analyst_note": note,
+    }, default=str)
+
+
+async def _tool_get_agent_overview(args: dict[str, Any]) -> str:
+    import asyncio
+    import db.store as store
+    from reporting.agent_pnl import get_pnl_combined
+
+    agent = (args.get("agent_name") or "").strip()
+    if not agent:
+        return json.dumps({"error": "agent_name required"})
+
+    (convictions, open_theses, resolutions, combined_today, pnl_week,
+     digest, stories) = await asyncio.gather(
+        store.get_agent_active_convictions(agent),
+        store.get_open_theses(agent, limit=10),
+        store.get_recent_resolutions(agent, limit=5),
+        get_pnl_combined(agent_name=agent),
+        store.get_pnl_summary(agent_name=agent, period="week"),
+        store.get_agent_evening_digest(agent),
+        store.get_sector_stories(agent, limit=2),
+    )
+    today_row = next(iter(combined_today["rows"]), None)
+    t_pnl = float(today_row["total_pnl"]) if today_row else 0.0
+    t_real = float(today_row["realized_pnl"]) if today_row else 0.0
+    t_unreal = float(today_row["unrealized_pnl"]) if today_row else 0.0
+    w_pnl = sum(float(r.get("total_pnl") or 0) for r in pnl_week)
+    note = (f"{agent.capitalize()}: {len(convictions)} active conviction(s). "
+            f"P&L today {t_pnl:+,.2f} (real {t_real:+,.2f}, unreal {t_unreal:+,.2f}), "
+            f"week {w_pnl:+,.2f}. {len(open_theses)} open thesis(es).")
+    return json.dumps({
+        "agent_name": agent,
+        "pnl_today": t_pnl,
+        "pnl_today_realized": t_real,
+        "pnl_today_unrealized": t_unreal,
+        "pnl_week_realized": w_pnl,
+        "active_convictions": convictions,
+        "open_theses": open_theses,
+        "recent_thesis_resolutions": resolutions,
+        "last_evening_digest": digest,
+        "recent_sector_stories": stories,
+        "analyst_note": note,
+    }, default=str)
+
+
+async def _tool_get_agent_journal(args: dict[str, Any]) -> str:
+    from datetime import date as _date
+    import db.store as store
+
+    agent = (args.get("agent_name") or "").strip()
+    if not agent:
+        return json.dumps({"error": "agent_name required"})
+
+    today = _date.today().isoformat()
+    open_theses = await store.get_open_theses(agent, limit=10)
+    due = await store.get_theses_due(agent, on_or_before=today)
+    resolved = await store.get_recent_resolutions(agent, limit=3)
+    return json.dumps(
+        {"agent_name": agent, "open": open_theses,
+         "due_today_or_earlier": due, "recent_resolutions": resolved},
+        default=str,
+    )
+
+
 _DISPATCH = {
     "get_positions": _tool_get_positions,
     "get_balances": _tool_get_balances,
@@ -333,6 +469,9 @@ _DISPATCH = {
     "list_recent_decisions": _tool_list_recent_decisions,
     "propose_strategic_change": _tool_propose_strategic_change,
     "send_telegram_followup": _tool_send_telegram_followup,
+    "get_position_dossier": _tool_get_position_dossier,
+    "get_agent_overview": _tool_get_agent_overview,
+    "get_agent_journal": _tool_get_agent_journal,
 }
 
 
