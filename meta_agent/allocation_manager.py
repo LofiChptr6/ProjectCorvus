@@ -26,7 +26,10 @@ async def _live_nav() -> float:
 
 
 async def get_all_allocations(nav: float | None = None) -> list[dict]:
-    """Return per-agent allocation: pct (DB or YAML default) + derived USD at current NAV."""
+    """Return per-agent allocation. The only source of truth is the
+    `agent_allocations` DB table. Agents without a row are reported as 0% —
+    no YAML fallback. To allocate capital, write an explicit DB row via
+    `set_allocation`."""
     if nav is None:
         nav = await _live_nav()
 
@@ -41,8 +44,8 @@ async def get_all_allocations(nav: float | None = None) -> list[dict]:
             source = "db"
             updated_at = db_entry.get("updated_at")
         else:
-            pct = float(a.get("allocation_pct", 0))
-            source = "yaml_default"
+            pct = 0.0
+            source = "missing"
             updated_at = None
         result.append({
             "agent_name": name,
@@ -69,20 +72,3 @@ async def set_allocation(agent_name: str, pct: float, by: str = "cli") -> None:
         )
 
 
-async def get_effective_allocation_pct(agent_name: str) -> float:
-    """Return the effective allocation % for an agent (DB first, then YAML default)."""
-    rows = await store.get_allocations()
-    for r in rows:
-        if r["agent_name"] == agent_name:
-            return float(r["allocation_pct"])
-    from agent.agent_registry import load_agent
-    cfg = load_agent(agent_name)
-    return float(cfg.get("allocation_pct", 0))
-
-
-async def get_effective_allocation(agent_name: str, nav: float | None = None) -> float:
-    """Return the effective allocation in USD: pct × current NAV."""
-    pct = await get_effective_allocation_pct(agent_name)
-    if nav is None:
-        nav = await _live_nav()
-    return pct * nav

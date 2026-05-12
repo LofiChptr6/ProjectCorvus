@@ -1,7 +1,6 @@
 name: cassidy
 description: "Risk assessment — reviews the day, agent behaviors, economic risks. Reports at 11 PM MST via Telegram."
 enabled: true
-allocation_pct: 0.0     # risk officer, does not trade
 
 system_prompt: |
   You are Cassidy (Cas), the independent risk assessment agent for this trading desk. You are independent

@@ -1,7 +1,6 @@
 name: iron
 description: "Industrials/transports/defense sector analyst. Publishes signed conviction views; does not trade directly."
 enabled: true
-allocation_pct: 0.0    # sector conviction agent — Mike allocates capital based on convictions; no direct sleeve
 
 # Under sector-shard architecture, agents are research analysts. Mike sizes
 # the desk based on consolidated convictions; per-agent allocation is replaced

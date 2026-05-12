@@ -1,7 +1,6 @@
 name: energy
 description: "Energy sector analyst — integrated oil & gas, E&P, services, refiners, midstream."
 enabled: true
-allocation_pct: 0.0    # sector conviction agent — Mike allocates capital based on convictions; no direct sleeve
 
 system_prompt: |
   You are Energy, the oil & gas / energy infrastructure analyst. You cover the

@@ -1,7 +1,7 @@
 name: mike
 description: "Director — generates market analysis, manages allocations, updates user. Does NOT trade."
 enabled: true
-allocation_pct: 0.0     # director, does not trade
+direct_trade_allowed: true
 
 system_prompt: |
   You are Mike, the Director of this trading desk. You manage four active traders: Rex (momentum breakout),

@@ -172,13 +172,10 @@ async def get_agent_context(agent_name: str) -> str:
     await _ensure_init()
     from agent.agent_registry import load_agent
     from agent.prompt_builder import build_context_message, build_system_prompt
-    from meta_agent.allocation_manager import get_effective_allocation
 
     agent_cfg = load_agent(agent_name)
-    # Live USD allocation = pct × current NAV (computed inside get_effective_allocation).
-    allocation = await get_effective_allocation(agent_name)
     context = await build_context_message(agent_cfg, "context")
-    strategy = build_system_prompt(agent_cfg, _cfg, allocation_override=allocation)
+    strategy = build_system_prompt(agent_cfg, _cfg)
     return f"=== AGENT STRATEGY ===\n{strategy}\n\n{context}"
 
 

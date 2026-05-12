@@ -155,20 +155,17 @@ def _truncate_sections(text: str, limit: int = 3000) -> str:
 async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
     """Fetch live account state and format it as Claude's first user message."""
     from ibkr.account import get_account_summary, get_positions, get_open_orders
-    from meta_agent.allocation_manager import get_effective_allocation_pct
     import db.store as store
 
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     agent_name = agent_cfg["name"]
 
-    # NAV first — allocation is derived as pct × NAV.
     try:
         summary = await get_account_summary()
     except Exception as e:
         summary = {"error": str(e)}
     nav = summary.get("nav", 0) if isinstance(summary, dict) else 0
-    pct = await get_effective_allocation_pct(agent_name)
-    allocation = pct * nav
+    direct_trade = bool(agent_cfg.get("direct_trade_allowed", False))
 
     try:
         positions = await get_positions()
@@ -200,7 +197,7 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
     lines = [
         f"=== {routine_name.upper()} | Agent: {agent_name} | {now} ===",
         "",
-        f"Your allocated capital: ${allocation:,.0f}  ({pct:.1%} of NAV)",
+        f"Desk NAV: ${nav:,.0f}  ({'allocator — sizes whole desk' if direct_trade else 'conviction-only — does not trade directly'})",
         f"Trading mode: {summary.get('mode', 'unknown')}",
         "",
         "--- ACCOUNT SUMMARY ---",
@@ -962,9 +959,8 @@ their allocation_pct halved.
 """
 
 
-def build_system_prompt(agent_cfg: dict, cfg: dict, allocation_override: float | None = None) -> str:
-    allocation = allocation_override if allocation_override is not None else agent_cfg.get("allocation_usd", 0)
-    prompt = agent_cfg["system_prompt"].replace("${allocation_usd}", f"${allocation:,.0f}")
+def build_system_prompt(agent_cfg: dict, cfg: dict) -> str:
+    prompt = agent_cfg["system_prompt"]
     risk = cfg.get("risk", {})
     mode = cfg.get("trading", {}).get("mode", "paper")
     prompt += f"\n\n[SYSTEM CONSTRAINTS]\nMode: {mode}\nMax order value: ${risk.get('max_order_value', 10000):,.0f}\nMax position: {risk.get('max_position_pct', 0.20):.0%} of NAV\nDaily loss limit: ${risk.get('max_daily_loss', 500):,.0f}\n"

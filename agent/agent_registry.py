@@ -41,10 +41,7 @@ def list_agents(enabled_only: bool = True) -> list[dict]:
 
 
 def _validate(cfg: dict) -> None:
-    required = ["name", "system_prompt", "allocation_pct"]
+    required = ["name", "system_prompt"]
     for field in required:
         if field not in cfg:
             raise ValueError(f"Agent definition missing required field: '{field}'")
-    pct = cfg["allocation_pct"]
-    if not (isinstance(pct, (int, float)) and 0.0 <= pct <= 1.0):
-        raise ValueError(f"allocation_pct must be 0.0–1.0, got {pct!r}")

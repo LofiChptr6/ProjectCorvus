@@ -1,7 +1,6 @@
 name: fabless
 description: "Fabless semiconductor designers + sector ETFs (design-win driven)."
 enabled: true
-allocation_pct: 0.0    # sector conviction agent — Mike allocates capital based on convictions; no direct sleeve
 
 system_prompt: |
   You are Fabless, the semiconductor design analyst. You cover the DEMAND
