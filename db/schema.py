@@ -586,24 +586,43 @@ def _load_pg_cfg() -> dict:
     return _pool_cfg
 
 
-async def get_pool() -> asyncpg.Pool:
-    """Return the shared asyncpg pool, creating it on first call.
+class _BoundedAcquirePool:
+    """Proxy around an asyncpg.Pool that defaults `acquire()` to a 10 s
+    timeout, so a stuck/exhausted pool surfaces an `asyncio.TimeoutError`
+    instead of blocking forever. Every MCP tool funnels through this
+    pool; without the timeout, a single zombie connection can hang any
+    tool and therefore hang the Claude Code worker ("session stopped
+    responding"). Existing call sites that do `async with pool.acquire()
+    as c:` inherit the default automatically. Callers that legitimately
+    need a different bound can still pass `timeout=N` explicitly.
 
-    The returned pool's `acquire()` is monkey-patched to default a hard
-    10 s timeout, so a stuck/exhausted pool surfaces an
-    `asyncio.TimeoutError` instead of blocking forever. Every MCP tool
-    funnels through this pool; without the timeout, a single zombie
-    connection can hang any tool and therefore hang the Claude Code
-    worker ("session stopped responding"). Existing call sites that do
-    `async with pool.acquire() as c:` inherit the default automatically.
-    Callers that legitimately need a different bound can still pass
-    `timeout=N` explicitly.
-    """
+    A proxy is used instead of a direct monkey-patch because
+    `asyncpg.Pool` defines `__slots__`, so `pool.acquire = wrapped`
+    raises AttributeError. All non-`acquire` attributes delegate to the
+    underlying pool via `__getattr__`."""
+
+    __slots__ = ("_pool",)
+
+    def __init__(self, pool: asyncpg.Pool):
+        object.__setattr__(self, "_pool", pool)
+
+    def acquire(self, *args, **kwargs):
+        kwargs.setdefault("timeout", 10)
+        return self._pool.acquire(*args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._pool, name)
+
+
+async def get_pool() -> asyncpg.Pool:
+    """Return the shared asyncpg pool (wrapped in `_BoundedAcquirePool`),
+    creating it on first call. See `_BoundedAcquirePool` for the
+    motivation behind the wrapper."""
     global _pool
     if _pool is not None:
         return _pool
     cfg = _load_pg_cfg()
-    _pool = await asyncpg.create_pool(
+    raw = await asyncpg.create_pool(
         host=cfg["host"],
         port=cfg["port"],
         database=cfg["database"],
@@ -613,15 +632,13 @@ async def get_pool() -> asyncpg.Pool:
         max_size=cfg["max_size"],
         timeout=10,
         command_timeout=cfg["command_timeout"],
+        # Recycle idle connections every 60s (default 300s). Defends against
+        # silently-dead idle conns (Postgres server timeout, network blip)
+        # in a long-running MCP process.
+        max_inactive_connection_lifetime=60,
     )
-    _orig_acquire = _pool.acquire
-
-    def _acquire_bounded(*args, **kwargs):
-        kwargs.setdefault("timeout", 10)
-        return _orig_acquire(*args, **kwargs)
-
-    _pool.acquire = _acquire_bounded  # type: ignore[method-assign]
-    return _pool
+    _pool = _BoundedAcquirePool(raw)  # type: ignore[assignment]
+    return _pool  # type: ignore[return-value]
 
 
 async def init_db(db_path: str = DB_PATH) -> None:
