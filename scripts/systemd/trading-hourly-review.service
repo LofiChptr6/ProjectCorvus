@@ -1,6 +1,6 @@
 [Unit]
-Description=Trading hourly orchestrator — fans out 10 sector reviews + mike-allocator, then /hourly-review heartbeat
-Documentation=file:///home/tianyizhang/opus%20trading/scripts/run_hourly_orchestrator.sh
+Description=Trading hourly orchestrator — fans out 11 sector reviews + mike-allocator, then /hourly-review heartbeat
+Documentation=file:///home/tianyizhang/opus%20trading/scripts/run_hourly_orchestrator.py
 After=network-online.target
 Wants=network-online.target
 
@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/home/tianyizhang/opus trading
 Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/bin/bash "/home/tianyizhang/opus trading/scripts/run_hourly_orchestrator.sh"
+ExecStart=/home/tianyizhang/opus trading/.venv/bin/python /home/tianyizhang/opus trading/scripts/run_hourly_orchestrator.py
 TimeoutStartSec=2700
 StandardOutput=append:/home/tianyizhang/opus trading/logs/hourly-orchestrator.log
 StandardError=append:/home/tianyizhang/opus trading/logs/hourly-orchestrator.log
