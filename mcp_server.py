@@ -1894,6 +1894,19 @@ async def submit_conviction_view(
         return json.dumps({"error": reason})
     if symbol.upper() == "CASH" and direction != "long":
         return json.dumps({"error": "CASH conviction must be direction='long' (cash reserve, not margin)"})
+    # Catch LLM-fabricated technical-indicator blobs slipping in as model_inputs
+    # (the 2026-05-12 audit found 23/34 recent rows had keys no model emits).
+    # Warn-only by default; the validator logs each hit to its dedicated log
+    # file. Flip via MODEL_INPUTS_VALIDATOR_MODE=reject after the observation
+    # window confirms agents now route through their models.
+    from meta_agent.model_inputs_validator import (
+        validate as _validate_model_inputs, is_reject_mode as _mi_reject_mode,
+    )
+    mi_ok, mi_reason = _validate_model_inputs(
+        agent_name, model_inputs, symbol=symbol, direction=direction,
+    )
+    if not mi_ok and _mi_reject_mode():
+        return json.dumps({"error": f"model_inputs: {mi_reason}"})
     # Non-flat convictions MUST carry a forecast — without (expected_return_pct,
     # time_to_target_days) the evening forecast panel can't draw a line and
     # Mike's calibration tracker has nothing to score the call against. CASH
