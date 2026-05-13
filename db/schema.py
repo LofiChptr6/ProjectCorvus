@@ -587,7 +587,18 @@ def _load_pg_cfg() -> dict:
 
 
 async def get_pool() -> asyncpg.Pool:
-    """Return the shared asyncpg pool, creating it on first call."""
+    """Return the shared asyncpg pool, creating it on first call.
+
+    The returned pool's `acquire()` is monkey-patched to default a hard
+    10 s timeout, so a stuck/exhausted pool surfaces an
+    `asyncio.TimeoutError` instead of blocking forever. Every MCP tool
+    funnels through this pool; without the timeout, a single zombie
+    connection can hang any tool and therefore hang the Claude Code
+    worker ("session stopped responding"). Existing call sites that do
+    `async with pool.acquire() as c:` inherit the default automatically.
+    Callers that legitimately need a different bound can still pass
+    `timeout=N` explicitly.
+    """
     global _pool
     if _pool is not None:
         return _pool
@@ -603,6 +614,13 @@ async def get_pool() -> asyncpg.Pool:
         timeout=10,
         command_timeout=cfg["command_timeout"],
     )
+    _orig_acquire = _pool.acquire
+
+    def _acquire_bounded(*args, **kwargs):
+        kwargs.setdefault("timeout", 10)
+        return _orig_acquire(*args, **kwargs)
+
+    _pool.acquire = _acquire_bounded  # type: ignore[method-assign]
     return _pool
 
 
