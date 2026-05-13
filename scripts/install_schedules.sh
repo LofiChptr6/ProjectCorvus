@@ -46,6 +46,7 @@ UNITS=(
     trading-refresh-agent-state
     trading-weekly-tune
     trading-forecast-resolver
+    trading-thesis-resolver
 )
 
 # Sanity: claude CLI present?
