@@ -8,7 +8,11 @@
 #       This is the new path: bundler → template → vLLM → structured-output writes.
 #   1b. Legacy harness skills (currently empty — titan was decommissioned in
 #       favor of energy + commodity, which together cover its scope).
-#   2.  Mike-allocator — harness path (writes live orders; sensitive).
+#   2.  Mike-allocator — programmatic Python runner (scripts/run_mike_allocator.py).
+#       Replaces the LLM-driven /mike-allocator skill 2026-05-12 after the LLM
+#       repeatedly hallucinated "market closed" during open hours and skipped
+#       trading. The runner calls rebalance_desk directly; the LLM is only
+#       invoked AFTER orders land to write the Telegram "why" sentence.
 #   3.  Hourly-review heartbeat — harness path.
 #
 # Skip-fast: during the AZ quiet window (22:00–05:00) or weekends we skip
@@ -82,10 +86,17 @@ if [[ ${#HARNESS_SKILLS[@]} -gt 0 ]]; then
     done
 fi
 
-log "phase 2: running mike-allocator (harness)"
-timeout --foreground "$SKILL_TIMEOUT_SEC" bash "$SCRIPT_DIR/run_scheduled_skill.sh" mike-allocator
+log "phase 2: running mike-allocator (programmatic)"
+ALLOCATOR_TIMEOUT_SEC="${ALLOCATOR_TIMEOUT_SEC:-180}"
+timeout --foreground "$ALLOCATOR_TIMEOUT_SEC" \
+    "$PYTHON" "$SCRIPT_DIR/run_mike_allocator.py"
 ec=$?
-if [[ $ec -ne 0 ]]; then log "phase 2: mike-allocator exited non-zero (exit=$ec, may be timeout 124)"; fi
+case $ec in
+    0) log "phase 2: mike-allocator ok" ;;
+    2) log "phase 2: mike-allocator skipped by guard (market/kill/quiet)" ;;
+    124) log "phase 2: mike-allocator TIMED OUT after ${ALLOCATOR_TIMEOUT_SEC}s" ;;
+    *) log "phase 2: mike-allocator exited non-zero (exit=$ec)" ;;
+esac
 
 log "phase 3: running hourly-review heartbeat (harness)"
 timeout --foreground "$SKILL_TIMEOUT_SEC" bash "$SCRIPT_DIR/run_scheduled_skill.sh" hourly-review
