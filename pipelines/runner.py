@@ -253,6 +253,9 @@ async def _apply_review_output(
             kind=t.kind, title=t.title, body=t.body,
             verify_by=t.verify_by, parent_id=t.parent_id,
             market_snapshot=t.market_snapshot,
+            primary_symbol=t.primary_symbol,
+            direction=t.direction,
+            entry_price=t.entry_price,
         )
         summary["theses_recorded"] += 1
 

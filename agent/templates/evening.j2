@@ -69,7 +69,7 @@ Grade your day, then emit a single final assistant message containing only valid
   "pnl_today": <number>,
   "pnl_week":  <number>,
   "telegram_caption": "{{ agent_name|upper }} | <sector>  | {{ bundle.trading_date_iso }} EOD",
-  "theses_to_record": [{ "kind": "...", "title": "...", "body": "...", "verify_by": "YYYY-MM-DD or null" }],
+  "theses_to_record": [{ "kind": "...", "title": "...", "body": "...", "verify_by": "YYYY-MM-DD or null", "primary_symbol": "<TICKER or null>", "direction": "long|short|null", "entry_price": "<number or null>" }],
   "theses_to_grade":  [{ "thesis_id": <int>, "status": "confirmed|wrong|superseded", "resolution_note": "..." }]
 }
 ```
@@ -78,3 +78,4 @@ Grade your day, then emit a single final assistant message containing only valid
 - Output **must be JSON only** in your final message — no prose wrapper, no markdown fences.
 - Do **NOT** call any tools — evening is single-shot. The orchestrator will generate the slide image and send the Telegram from your structured output.
 - Do **NOT** submit conviction views or forecasts — those belong to /<agent>-review, not evening.
+- For single-ticker predictions, set `primary_symbol` + `direction` + `entry_price` together — the nightly thesis_resolver verifies them against bars at ±2% threshold (replaces self-graded confirmations). Omit the triple for sector-wide or qualitative theses.
