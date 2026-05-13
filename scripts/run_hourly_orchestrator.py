@@ -129,7 +129,7 @@ async def _run_allocator() -> dict:
 
 async def _run_heartbeat() -> dict:
     return await _run_subprocess_impl(
-        ["bash", str(_REPO_ROOT / "scripts" / "run_scheduled_skill.sh"), "hourly-review"],
+        [PYTHON, str(_REPO_ROOT / "scripts" / "run_hourly_review.py")],
         _REPO_ROOT / "logs" / "hourly-review.log",
         HEARTBEAT_TIMEOUT_SEC,
     )

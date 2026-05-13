@@ -133,8 +133,7 @@ def _make_subprocess_stub(orch, monkeypatch, results_by_skill: dict[str, dict]):
     calls_log: list[dict] = []
 
     async def _stub(args: list[str], log_path, timeout_sec: int):
-        # Identify skill: last positional arg for run_skill.py / run_scheduled_skill.sh,
-        # or the .py filename for run_mike_allocator.py.
+        # Identify skill from argv shape.
         key = None
         if any("run_skill.py" in a for a in args):
             # ['python', '.../run_skill.py', '<sector>', 'review']
@@ -143,6 +142,8 @@ def _make_subprocess_stub(orch, monkeypatch, results_by_skill: dict[str, dict]):
             key = args[-1]
         elif any("run_mike_allocator.py" in a for a in args):
             key = "mike-allocator"
+        elif any("run_hourly_review.py" in a for a in args):
+            key = "hourly-review"
         calls_log.append({"key": key, "args": args, "timeout_sec": timeout_sec})
         default = {"exit_code": 0, "duration_ms": 100, "timed_out": False}
         result = {**default, **(results_by_skill.get(key, {}))}
