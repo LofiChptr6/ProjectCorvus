@@ -1495,7 +1495,10 @@ async def upsert_forecasts_batch(
                      method              = EXCLUDED.method,
                      rationale           = EXCLUDED.rationale,
                      submitted_at        = NOW(),
-                     expires_at          = NOW() + ($10 || ' hours')::interval""",
+                     expires_at          = NOW() + ($10 || ' hours')::interval,
+                     realized_return_pct = NULL,
+                     resolved_at         = NULL,
+                     resolution_source   = NULL""",
                 [(*t, str(expires_in_hours)) for t in prepared],
             )
     return {"inserted": len(prepared), "errors": errors}

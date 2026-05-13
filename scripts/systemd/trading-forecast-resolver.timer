@@ -1,0 +1,12 @@
+[Unit]
+Description=Trading forecast resolver timer — every hour at :12
+
+[Timer]
+# Fires after the hourly orchestrator (top of hour) and the refresh-agent-state
+# snapshot (:05) so resolver runs see the latest forecast batch.
+OnCalendar=*-*-* *:12:00
+Persistent=true
+Unit=trading-forecast-resolver.service
+
+[Install]
+WantedBy=timers.target

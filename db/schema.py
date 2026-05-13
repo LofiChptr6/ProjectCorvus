@@ -306,6 +306,15 @@ END $$""",
     "CREATE INDEX IF NOT EXISTS idx_forecast_active ON agent_forecast (agent_name, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_forecast_symbol ON agent_forecast (symbol, expires_at)",
     "CREATE INDEX IF NOT EXISTS idx_forecast_horizon ON agent_forecast (agent_name, symbol, horizon)",
+    # Forecast-outcome columns — filled by scripts/run_forecast_resolver.py when
+    # a forecast's horizon elapses. The resolver fetches daily bars from Massive,
+    # computes realized return from submitted_at close → submitted_at+horizon close,
+    # writes the answer here. NULL until resolved; reset to NULL on UPSERT so a
+    # republished forecast starts a fresh outcome window.
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS realized_return_pct NUMERIC",
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ",
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS resolution_source TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_forecast_unresolved ON agent_forecast (submitted_at, time_to_target_days) WHERE resolved_at IS NULL",
     # Mike's allocator decisions — one row per rebalance run.
     """CREATE TABLE IF NOT EXISTS allocation_decision (
         id                       BIGSERIAL PRIMARY KEY,
