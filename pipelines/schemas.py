@@ -70,13 +70,24 @@ class ForecastRow(BaseModel):
 
 
 class ThesisRecord(BaseModel):
-    """Append-only journal entry."""
+    """Append-only journal entry.
+
+    `primary_symbol` + `direction` + `entry_price` are the price-anchor triple
+    that opts a thesis into nightly price-anchored verification (see
+    scripts/run_thesis_resolver.py). When the triple is set, the resolver
+    classifies the thesis as confirmed/wrong/ambiguous against ±2% from
+    entry_price on the verify_by date — replacing the agent's self-grade.
+    All three are optional individually; supply them together or not at all.
+    """
     kind: Literal["hypothesis", "prediction", "observation", "question"]
     title: str = Field(..., max_length=200)
     body: str
     verify_by: Optional[str] = None  # YYYY-MM-DD
     parent_id: Optional[int] = None
     market_snapshot: Optional[dict[str, Any]] = None
+    primary_symbol: Optional[str] = None  # ticker the thesis claims a view on
+    direction: Optional[Literal["long", "short"]] = None
+    entry_price: Optional[float] = None  # reference close on verify_by - horizon
 
 
 class ThesisGrade(BaseModel):

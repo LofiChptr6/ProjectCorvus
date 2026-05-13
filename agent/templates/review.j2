@@ -114,7 +114,10 @@ When you've gathered enough evidence, **emit a single final assistant message co
       "title": "<short>",
       "body": "<full reasoning>",
       "verify_by": "<YYYY-MM-DD or null>",
-      "parent_id": <int or null>
+      "parent_id": <int or null>,
+      "primary_symbol": "<TICKER or null>",
+      "direction": "long" | "short" | null,
+      "entry_price": <number or null>
     },
     ...
   ],
@@ -134,3 +137,4 @@ When you've gathered enough evidence, **emit a single final assistant message co
 - Do **NOT** post to threads, send Telegrams, or place orders.
 - Submit `direction="flat"` (with conviction=0) for any name you actively chose to NOT trade — the absence of a row means the allocator never heard from you about it.
 - For shorts: per desk policy, route through inverse ETFs by submitting a `direction="long"` conviction on the inverse symbol — sized for the leverage of that ETF.
+- For **predictions on a single ticker**, set `primary_symbol`, `direction`, AND `entry_price` together (the price-anchor triple). The nightly thesis_resolver then verifies your call against the close on `verify_by` instead of trusting a self-grade. Use the symbol's current quote for `entry_price` (e.g. from `get_quote`); the resolver classifies as `confirmed`/`wrong` at ±2% moves, `ambiguous` inside that band. Omit the triple for sector-wide or qualitative theses — those stay self-graded as before.

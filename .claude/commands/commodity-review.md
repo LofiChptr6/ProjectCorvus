@@ -186,7 +186,7 @@ Convictions in STEP 4 are independent — submit only the names you'd put money 
 ## STEP 5 — Journal continuity
 
 - Grade any predictions due today (⚠ DUE TODAY in your journal): `update_thesis_status(thesis_id, status, resolution_note)`.
-- For your strongest convictions today, optionally `record_thesis(kind="prediction", verify_by=YYYY-MM-DD)` so future-you can grade it.
+- For your strongest **single-ticker** predictions today, set the price-anchor triple on `record_thesis`: `record_thesis(kind="prediction", verify_by=YYYY-MM-DD, primary_symbol="<TICKER>", direction="long"|"short", entry_price=<current quote>)`. The nightly thesis_resolver verifies these against bars at ±2% — no more self-grading. For sector-wide or qualitative theses, omit the triple and they stay self-graded.
 - Tool gap? `raise_tool_gap(agent_name="commodity", tool_name, description, use_case, priority)`.
 - Strategic ask (universe change, model rewrite, influence-weight change)? `propose_strategic_change(title, details)`.
 
