@@ -58,13 +58,20 @@ def _proposal_buttons(p: dict) -> dict:
     }
 
 
-async def create(title: str, details: str) -> dict:
+async def create(
+    title: str,
+    details: str,
+    *,
+    kind: str = "strategic_change",
+    payload: Optional[dict] = None,
+) -> dict:
     """Create a new pending proposal and send initial Telegram ping.
 
-    If a pending proposal with the same title already exists, return it
-    unchanged (no new record, no fresh Telegram ping). The nudge loop will
-    keep re-pinging the existing one. This prevents agents like Cassidy
-    from re-filing the same architectural-drift proposal every evening.
+    `kind` discriminates flows: 'strategic_change' (default, Cassidy/agent
+    drift proposals) vs 'trade_approval' (inverse-ETF gate from rebalance_desk
+    — payload carries the executable order shape). Dedup of pending proposals
+    is scoped to (kind, title) so an open strategic_change doesn't block a
+    trade_approval that happens to share a title.
 
     If bypass mode is active, the proposal is created in `approved` state
     immediately (audit trail preserved) and a different Telegram ping is
@@ -73,7 +80,12 @@ async def create(title: str, details: str) -> dict:
 
     proposals = _load()
     existing = next(
-        (p for p in proposals if p["status"] == "pending" and p["title"] == title),
+        (
+            p for p in proposals
+            if p["status"] == "pending"
+            and p["title"] == title
+            and p.get("kind", "strategic_change") == kind
+        ),
         None,
     )
     if existing is not None:
@@ -89,8 +101,10 @@ async def create(title: str, details: str) -> dict:
 
     proposal = {
         "id": str(uuid.uuid4()),
+        "kind": kind,
         "title": title,
         "details": details,
+        "payload": payload,
         "created_at": now,
         "last_pinged_at": now,
         "ping_count": 1,
@@ -130,6 +144,33 @@ def list_pending() -> list[dict]:
 
 def list_all() -> list[dict]:
     return _load()
+
+
+def list_by(kind: str, statuses: tuple[str, ...]) -> list[dict]:
+    """Return proposals of a given `kind` whose status is in `statuses`,
+    oldest-first (matches creation order on disk). Used by rebalance_desk
+    to drain approved trade_approval proposals before each run."""
+    return [
+        p for p in _load()
+        if p.get("kind", "strategic_change") == kind and p["status"] in statuses
+    ]
+
+
+def mark_placed(proposal_id: str) -> Optional[dict]:
+    """Flip a proposal from 'approved' to 'placed' after rebalance_desk has
+    actually submitted the order. Idempotent — already-placed proposals are
+    returned unchanged. Returns None if the id is unknown."""
+    proposals = _load()
+    for p in proposals:
+        if p["id"] != proposal_id:
+            continue
+        if p["status"] == "placed":
+            return p
+        p["status"] = "placed"
+        p["placed_at"] = time.time()
+        _save(proposals)
+        return p
+    return None
 
 
 async def nudge_stale() -> int:
