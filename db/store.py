@@ -556,19 +556,26 @@ async def record_thesis(
     verify_by: Optional[str] = None,
     parent_id: Optional[int] = None,
     market_snapshot: Optional[dict] = None,
+    primary_symbol: Optional[str] = None,
+    direction: Optional[str] = None,
+    entry_price: Optional[float] = None,
 ) -> int:
     if kind not in _VALID_THESIS_KINDS:
         raise ValueError(f"kind must be one of {_VALID_THESIS_KINDS}, got {kind!r}")
+    if direction is not None and direction not in ("long", "short"):
+        raise ValueError(f"direction must be 'long' or 'short' when provided, got {direction!r}")
     verify_by_dt = date.fromisoformat(verify_by) if isinstance(verify_by, str) else verify_by
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO agent_thesis
-               (agent_name, kind, title, body, verify_by, parent_id, market_snapshot)
-               VALUES ($1,$2,$3,$4,$5::date,$6,$7::jsonb)
+               (agent_name, kind, title, body, verify_by, parent_id, market_snapshot,
+                primary_symbol, direction, entry_price)
+               VALUES ($1,$2,$3,$4,$5::date,$6,$7::jsonb,$8,$9,$10)
                RETURNING id""",
             agent_name, kind, title, body, verify_by_dt, parent_id,
             json.dumps(market_snapshot) if market_snapshot is not None else None,
+            (primary_symbol or "").upper() or None, direction, entry_price,
         )
         return int(row["id"])
 
@@ -578,30 +585,34 @@ async def update_thesis_status(
     status: str,
     resolution_note: Optional[str],
     agent_name: Optional[str] = None,
+    resolution_source: Optional[str] = "self_graded",
 ) -> bool:
     """Update status of a thesis. If `agent_name` is provided, ownership is enforced.
+    `resolution_source` tags the cohort — defaults to 'self_graded' for agent-driven
+    updates; the price-anchored resolver passes 'price_anchored' explicitly.
     Returns True if a row was updated."""
     if status not in _VALID_THESIS_STATUSES:
         raise ValueError(f"status must be one of {_VALID_THESIS_STATUSES}, got {status!r}")
+    closing = status in ("confirmed", "wrong", "superseded")
     pool = await get_pool()
     async with pool.acquire() as conn:
         if agent_name is not None:
             result = await conn.execute(
                 """UPDATE agent_thesis
                    SET status=$1, resolution_note=$2,
-                       resolved_at = CASE WHEN $1 IN ('confirmed','wrong','superseded')
-                                          THEN NOW() ELSE resolved_at END
+                       resolved_at = CASE WHEN $5 THEN NOW() ELSE resolved_at END,
+                       resolution_source = CASE WHEN $5 THEN $6 ELSE resolution_source END
                    WHERE id=$3 AND agent_name=$4""",
-                status, resolution_note, thesis_id, agent_name,
+                status, resolution_note, thesis_id, agent_name, closing, resolution_source,
             )
         else:
             result = await conn.execute(
                 """UPDATE agent_thesis
                    SET status=$1, resolution_note=$2,
-                       resolved_at = CASE WHEN $1 IN ('confirmed','wrong','superseded')
-                                          THEN NOW() ELSE resolved_at END
+                       resolved_at = CASE WHEN $4 THEN NOW() ELSE resolved_at END,
+                       resolution_source = CASE WHEN $4 THEN $5 ELSE resolution_source END
                    WHERE id=$3""",
-                status, resolution_note, thesis_id,
+                status, resolution_note, thesis_id, closing, resolution_source,
             )
         # asyncpg returns "UPDATE n" — parse the count.
         return result.endswith(" 1")

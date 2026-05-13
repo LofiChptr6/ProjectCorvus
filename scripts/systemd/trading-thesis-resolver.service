@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading thesis outcome resolver — price-anchored verification of open theses past verify_by
+Documentation=file:///home/tianyizhang/opus%%20trading/scripts/run_thesis_resolver.py
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/tianyizhang/opus trading
+Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/tianyizhang/opus trading/.venv/bin/python /home/tianyizhang/opus trading/scripts/run_thesis_resolver.py
+TimeoutStartSec=900
+StandardOutput=append:/home/tianyizhang/opus trading/logs/thesis-resolver.log
+StandardError=append:/home/tianyizhang/opus trading/logs/thesis-resolver.log
+
+[Install]
+WantedBy=multi-user.target

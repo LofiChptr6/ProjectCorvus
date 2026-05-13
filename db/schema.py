@@ -198,6 +198,25 @@ SCHEMA_STATEMENTS = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_thesis_agent_status ON agent_thesis (agent_name, status, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_thesis_verify_open ON agent_thesis (agent_name, verify_by) WHERE status = 'open'",
+    # Price-anchored thesis verification — see scripts/run_thesis_resolver.py.
+    # primary_symbol + direction + entry_price snapshot the thesis's testable
+    # claim at record time; the nightly resolver compares against the current
+    # close and writes a quantitative resolution_note. resolution_source tags
+    # the cohort:
+    #   'price_anchored' — the resolver verified against bars
+    #   'self_graded'    — the owning agent self-confirmed via update_thesis_status
+    #   NULL             — still open (no resolution yet)
+    "ALTER TABLE agent_thesis ADD COLUMN IF NOT EXISTS primary_symbol TEXT",
+    "ALTER TABLE agent_thesis ADD COLUMN IF NOT EXISTS direction TEXT",
+    "ALTER TABLE agent_thesis ADD COLUMN IF NOT EXISTS entry_price NUMERIC",
+    "ALTER TABLE agent_thesis ADD COLUMN IF NOT EXISTS resolution_source TEXT",
+    # One-time backfill: existing closed theses were all self-graded by agents.
+    # Tag them so the resolver-vs-self cohort split shows real history.
+    """UPDATE agent_thesis SET resolution_source = 'self_graded'
+       WHERE status IN ('confirmed','wrong','superseded') AND resolution_source IS NULL""",
+    "CREATE INDEX IF NOT EXISTS idx_thesis_resolvable ON agent_thesis (verify_by) "
+    "WHERE status = 'open' AND primary_symbol IS NOT NULL AND direction IS NOT NULL "
+    "AND entry_price IS NOT NULL",
     # Tool-gap requests routed through Mike (Mike consolidates in his morning analysis).
     """CREATE TABLE IF NOT EXISTS agent_tool_gaps (
         id           BIGSERIAL PRIMARY KEY,

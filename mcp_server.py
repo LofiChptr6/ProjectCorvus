@@ -1107,6 +1107,9 @@ async def record_thesis(
     verify_by: Optional[str] = None,
     parent_id: Optional[int] = None,
     market_snapshot: Optional[dict] = None,
+    primary_symbol: Optional[str] = None,
+    direction: Optional[str] = None,
+    entry_price: Optional[float] = None,
 ) -> str:
     """
     Append an entry to your private thesis journal. Append-only — to revise, post a new
@@ -1125,9 +1128,32 @@ async def record_thesis(
         parent_id: ID of an existing entry this refines or supersedes.
         market_snapshot: Optional dict with context at write time, e.g.
                          {"nav": 43950, "regime": "BULLISH", "spy": 715.20, "vix": 17.4}.
+        primary_symbol: Ticker the thesis claims a view on (e.g. 'XOM'). When set
+                        together with `direction`, the nightly thesis_resolver
+                        verifies the call against bars instead of trusting your
+                        self-grade.
+        direction: 'long' or 'short' — what move would confirm the thesis. Required
+                   for price-anchored verification.
+        entry_price: Reference close for the verifier. If omitted but `primary_symbol`
+                     is set, the server snapshots get_quote() now. Pass explicitly
+                     when you want a level that isn't the latest tick (e.g. a
+                     prior close).
     """
     await _ensure_init_light()
     from db import store
+    sym = (primary_symbol or "").upper() or None
+    # Auto-snapshot entry_price when the agent gave us a symbol+direction but no
+    # explicit reference level. Quote failures fall through to NULL — the thesis
+    # still records, it just won't be price-anchored-resolvable.
+    if sym and direction and entry_price is None:
+        try:
+            from data.massive_client import get_quote
+            q = await get_quote(sym)
+            last = q.get("last") or q.get("price") or q.get("close")
+            if last is not None:
+                entry_price = float(last)
+        except Exception as exc:
+            log.warning("record_thesis: get_quote(%s) failed: %s — entry_price stays NULL", sym, exc)
     thesis_id = await store.record_thesis(
         agent_name=agent_name,
         kind=kind,
@@ -1136,8 +1162,16 @@ async def record_thesis(
         verify_by=verify_by,
         parent_id=parent_id,
         market_snapshot=market_snapshot,
+        primary_symbol=sym,
+        direction=direction,
+        entry_price=entry_price,
     )
-    return json.dumps({"thesis_id": thesis_id})
+    return json.dumps({
+        "thesis_id": thesis_id,
+        "primary_symbol": sym,
+        "direction": direction,
+        "entry_price": entry_price,
+    })
 
 
 @mcp.tool()

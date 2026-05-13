@@ -1,0 +1,13 @@
+[Unit]
+Description=Trading thesis resolver timer — nightly at 22:30 AZ (market closed)
+
+[Timer]
+# AZ stays on MST year-round (no DST), so the Arizona-local schedule lands at
+# a fixed UTC hour. 22:30 MST = 05:30 UTC. Lock to the explicit UTC time so a
+# host TZ misconfiguration can't move the firing.
+OnCalendar=*-*-* 05:30:00 UTC
+Persistent=true
+Unit=trading-thesis-resolver.service
+
+[Install]
+WantedBy=timers.target
