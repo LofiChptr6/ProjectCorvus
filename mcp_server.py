@@ -1985,12 +1985,6 @@ async def submit_conviction_view(
         return json.dumps({"error": f"validation: {e}"})
 
 
-_BAR_FREQ_TO_SIZE: dict[str, str] = {
-    "1m": "1 min", "5m": "5 mins", "15m": "15 mins",
-    "30m": "30 mins", "1h": "1 hour", "1d": "1 day",
-}
-
-
 @mcp.tool()
 async def submit_conviction_from_model(
     agent_name: str,
@@ -2031,10 +2025,6 @@ async def submit_conviction_from_model(
     """
     await _ensure_init_light()
     import re
-    import importlib
-    from data.massive_client import get_bars as _get_bars
-    from ibkr.account import get_account_summary
-    from meta_agent.model_loader import discover_models
 
     _ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
     if not _ID_RE.match(agent_name or ""):
@@ -2055,103 +2045,33 @@ async def submit_conviction_from_model(
     if not allowed:
         return json.dumps({"error": f"sector_map: {reason}"})
 
-    if model_name not in discover_models(agent_name):
-        return json.dumps({"error": f"model not found: agents/{agent_name}/models/{model_name}.py"})
-    try:
-        module = importlib.import_module(f"agents.{agent_name}.models.{model_name}")
-        module = importlib.reload(module)
-    except Exception as exc:
-        return json.dumps({"error": f"model import failed: {type(exc).__name__}: {exc}"})
-    if not hasattr(module, "compute"):
-        return json.dumps({"error": "model lacks compute(symbol, bars, context) entry point"})
-
-    model_version = str(getattr(module, "MODEL_VERSION", "unset"))
-    bar_freq = str(getattr(module, "BAR_FREQUENCY", "1d"))
-    lookback_days = int(getattr(module, "LOOKBACK_DAYS", 252))
-    bar_size = _BAR_FREQ_TO_SIZE.get(bar_freq)
-    if bar_size is None:
-        return json.dumps({"error": f"model declares unsupported BAR_FREQUENCY={bar_freq!r}; allowed: {sorted(_BAR_FREQ_TO_SIZE)}"})
-    duration = f"{lookback_days} D"
-
-    bars_response = await _get_bars(symbol, bar_size, duration, "TRADES")
-    bars = bars_response.get("bars", []) if isinstance(bars_response, dict) else bars_response
-    if not bars:
-        return json.dumps({"error": f"no bars returned for {symbol} (bar_size={bar_size}, duration={duration})"})
-
-    try:
-        summary = await get_account_summary()
-    except Exception:
-        summary = {}
-    regime = None
-    try:
-        mike_path = Path("data/mike_analysis") / f"{_market_date()}.json"
-        if mike_path.exists():
-            with open(mike_path, "r", encoding="utf-8") as f:
-                regime = (json.load(f) or {}).get("regime")
-    except Exception:
-        pass
-    context = {"nav": summary.get("nav"), "regime": regime, "agent_name": agent_name}
-
-    try:
-        result = module.compute(symbol, bars, context)
-    except Exception as exc:
-        return json.dumps({"error": f"model crashed: {type(exc).__name__}: {exc}"})
-    if not isinstance(result, dict):
-        return json.dumps({"error": f"model returned non-dict: {type(result).__name__}"})
-
-    signal = result.get("signal")
-    direction = result.get("direction")
-    if signal is None or direction in (None, "flat"):
+    from meta_agent.conviction_from_model import compute_conviction_payload
+    res = await compute_conviction_payload(agent_name, model_name, symbol)
+    if res["status"] == "error":
+        return json.dumps({"error": res["error"]})
+    if res["status"] == "skipped":
         return json.dumps({
             "skipped": True,
-            "reason": result.get("reason") or f"signal={signal} direction={direction}",
+            "reason": res["reason"],
             "model": model_name,
-            "model_version": model_version,
+            "model_version": res.get("model_version", "unset"),
         })
-    if direction not in ("long", "short"):
-        return json.dumps({"error": f"model produced invalid direction={direction!r} (must be long/short/flat/None)"})
 
-    try:
-        conviction = float(result.get("conviction", 0.0))
-        expected_return_pct = float(result["expected_return_pct"])
-        time_to_target_days = int(result["time_to_target_days"])
-    except (KeyError, TypeError, ValueError) as exc:
-        return json.dumps({"error": f"model output missing/invalid numeric field: {type(exc).__name__}: {exc}"})
-    if time_to_target_days <= 0:
-        return json.dumps({"error": "model produced time_to_target_days <= 0 with non-flat direction"})
-    # Sign discipline (per MODEL_CONTRACT): signed expected_return matches direction.
-    if direction == "long" and expected_return_pct < 0:
-        return json.dumps({"error": f"model contract violation: direction='long' but expected_return_pct={expected_return_pct} < 0"})
-    if direction == "short" and expected_return_pct > 0:
-        return json.dumps({"error": f"model contract violation: direction='short' but expected_return_pct={expected_return_pct} > 0"})
-
-    stop_pct = result.get("stop_pct")
-    if stop_pct is not None:
-        try:
-            stop_pct = float(stop_pct)
-        except (TypeError, ValueError):
-            stop_pct = None
-
-    model_inputs = result.get("inputs") or {}
-    if not isinstance(model_inputs, dict):
-        model_inputs = {}
-    # Stamp provenance so the audit trail records which model/version produced the row.
-    model_inputs = {**model_inputs, "_model": model_name, "_version": model_version}
-
+    payload = res["payload"]
     from db import store
     try:
         view_id = await store.upsert_conviction(
             agent_name=agent_name,
             symbol=symbol,
-            direction=direction,
-            conviction=conviction,
-            expected_return_pct=expected_return_pct,
-            time_to_target_days=time_to_target_days,
+            direction=payload["direction"],
+            conviction=payload["conviction"],
+            expected_return_pct=payload["expected_return_pct"],
+            time_to_target_days=payload["time_to_target_days"],
             rationale=rationale,
-            model_inputs=model_inputs,
+            model_inputs=payload["model_inputs"],
             expires_in_hours=expires_in_hours,
             momentum_confirmed=momentum_confirmed,
-            stop_pct=stop_pct,
+            stop_pct=payload["stop_pct"],
         )
     except (ValueError, AssertionError) as exc:
         return json.dumps({"error": f"validation: {exc}"})
@@ -2159,13 +2079,13 @@ async def submit_conviction_from_model(
     return json.dumps({
         "view_id": view_id,
         "symbol": symbol.upper(),
-        "direction": direction,
-        "conviction": conviction,
-        "expected_return_pct": expected_return_pct,
-        "time_to_target_days": time_to_target_days,
-        "stop_pct": stop_pct,
+        "direction": payload["direction"],
+        "conviction": payload["conviction"],
+        "expected_return_pct": payload["expected_return_pct"],
+        "time_to_target_days": payload["time_to_target_days"],
+        "stop_pct": payload["stop_pct"],
         "from_model": model_name,
-        "model_version": model_version,
+        "model_version": res.get("model_version", "unset"),
     })
 
 
