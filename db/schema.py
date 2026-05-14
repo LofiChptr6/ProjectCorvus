@@ -300,15 +300,6 @@ SCHEMA_STATEMENTS = [
     )""",
     # Backfill horizon column for pre-existing tables created without it.
     "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS horizon TEXT NOT NULL DEFAULT 'intraday'",
-    # Re-derive horizon from time_to_target_days for any row still at 'intraday'
-    # default that was actually a longer-horizon forecast (one-time backfill;
-    # idempotent — rows already on the correct non-'intraday' horizon are skipped).
-    """UPDATE agent_forecast SET horizon = CASE
-        WHEN time_to_target_days <= 1 THEN 'intraday'
-        WHEN time_to_target_days <= 5 THEN 'near'
-        WHEN time_to_target_days <= 30 THEN 'far'
-        ELSE 'cycle'
-    END WHERE horizon = 'intraday'""",
     # Drop old per-(agent,symbol) uniqueness; replace with per-(agent,symbol,horizon).
     "ALTER TABLE agent_forecast DROP CONSTRAINT IF EXISTS agent_forecast_agent_name_symbol_key",
     """DO $$

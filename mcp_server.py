@@ -1142,18 +1142,29 @@ async def record_thesis(
     await _ensure_init_light()
     from db import store
     sym = (primary_symbol or "").upper() or None
-    # Auto-snapshot entry_price when the agent gave us a symbol+direction but no
-    # explicit reference level. Quote failures fall through to NULL — the thesis
-    # still records, it just won't be price-anchored-resolvable.
-    if sym and direction and entry_price is None:
+    # Cross-check entry_price against a live quote whenever symbol+direction are
+    # provided. Agents repeatedly fabricated anchors (e.g. AAPL=198.45 stamped
+    # across 14 hourly theses with real last=298, or DIA=27.5 vs real 497) and
+    # the resolver mis-graded them. Now: agent passes nothing → use live; agent
+    # passes within 10% of live → accept; agent passes >10% off → overwrite
+    # with live + warn. Quote failures leave the agent's value untouched.
+    if sym and direction:
         try:
             from data.massive_client import get_quote
             q = await get_quote(sym)
             last = q.get("last") or q.get("price") or q.get("close")
             if last is not None:
-                entry_price = float(last)
+                live = float(last)
+                if entry_price is None:
+                    entry_price = live
+                elif live and abs(float(entry_price) - live) / live > 0.10:
+                    log.warning(
+                        "record_thesis: agent=%s sym=%s entry_price=%.4f deviates >10%% from live %.4f — overwriting",
+                        agent_name, sym, float(entry_price), live,
+                    )
+                    entry_price = live
         except Exception as exc:
-            log.warning("record_thesis: get_quote(%s) failed: %s — entry_price stays NULL", sym, exc)
+            log.warning("record_thesis: get_quote(%s) failed: %s — entry_price unchanged", sym, exc)
     thesis_id = await store.record_thesis(
         agent_name=agent_name,
         kind=kind,

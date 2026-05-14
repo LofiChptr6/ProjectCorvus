@@ -158,6 +158,7 @@ def validate(
 
 
 def is_reject_mode() -> bool:
-    """Hard-reject bad submissions when MODEL_INPUTS_VALIDATOR_MODE=reject.
-    Default is warn-only (log to logs/model_inputs_validator.log, accept)."""
-    return os.environ.get("MODEL_INPUTS_VALIDATOR_MODE", "warn").lower() == "reject"
+    """Hard-reject bad submissions unless MODEL_INPUTS_VALIDATOR_MODE=warn.
+    Default flipped to reject 2026-05-13: warn-mode let agents keep shipping
+    fabricated indicator blobs (RSI/BBAND/etc.) instead of real model keys."""
+    return os.environ.get("MODEL_INPUTS_VALIDATOR_MODE", "reject").lower() != "warn"
