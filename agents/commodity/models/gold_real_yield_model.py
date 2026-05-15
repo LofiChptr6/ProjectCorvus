@@ -1,40 +1,73 @@
-# agents/commodity/models/gold_real_yield_model.py
-MODEL_VERSION = "1.0"
+"""Commodity gold_real_yield_model: gold direction via TIP ETF as real-yield proxy.
 
-def compute(symbol, bars, context):
-    # Simple model: gold is a real yield inverse.
-    # This model will output a long/short signal based on 10Y TIPS yield change.
-    # For simplicity, use 10Y TIPS yield from context.
-    
-    # Example: if TIPS yield rises → gold gets bearish → model says short (long GLL)
-    
-    # Placeholder logic for demo — replace with real data linkage.
-    # Assume we have access to TIPS yield via context['real_yield_10y']
-    
-    real_yield_change = context.get('real_yield_10y_change', 0)
-    
-    # If TIPS yield rises, gold gets bearish
-    if real_yield_change > 0:
+TIP tracks 10Y TIPS; TIP daily return inversely tracks real-yield change.
+TIP down → TIPS yields up → gold bearish (emit flat per inverse-ETF route).
+TIP up → real yields easing → gold long.
+"""
+from __future__ import annotations
+
+from typing import Any
+
+MODEL_VERSION = "1.1"
+BAR_FREQUENCY = "1d"
+MIN_BARS = 2
+LOOKBACK_DAYS = 30
+EXTRA_SYMBOLS = ["TIP"]
+
+
+def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
+    if len(bars) < MIN_BARS:
         return {
-            'direction': 'short',
-            'conviction': 0.6,
-            'expected_return_pct': -3.0,
-            'time_to_target_days': 10,
-            'inputs': {'real_yield_10y_change': real_yield_change}
+            "signal": None, "direction": None, "conviction": 0.0,
+            "expected_return_pct": 0.0, "time_to_target_days": 0,
+            "inputs": {}, "reason": f"need >={MIN_BARS} bars, got {len(bars)}",
         }
-    elif real_yield_change < 0:
+    tip_bars = (context.get("extra_bars") or {}).get("TIP") or []
+    if len(tip_bars) < 2:
         return {
-            'direction': 'long',
-            'conviction': 0.6,
-            'expected_return_pct': +3.0,
-            'time_to_target_days': 10,
-            'inputs': {'real_yield_10y_change': real_yield_change}
+            "signal": None, "direction": None, "conviction": 0.0,
+            "expected_return_pct": 0.0, "time_to_target_days": 0,
+            "inputs": {}, "reason": f"extra_bars.TIP needs >=2, got {len(tip_bars)}",
         }
-    else:
+
+    tip_prev = float(tip_bars[-2]["c"])
+    tip_now = float(tip_bars[-1]["c"])
+    tip_return_pct = (tip_now - tip_prev) / tip_prev * 100 if tip_prev else 0.0
+    real_yield_change_proxy_bps = round(-tip_return_pct * 100, 2)  # inverse, in bps
+
+    inputs = {
+        "tip_return_pct": round(tip_return_pct, 3),
+        "real_yield_change_proxy_bps": real_yield_change_proxy_bps,
+    }
+
+    # Threshold: ~0.3% TIP move on the day (≈ 30 bps yield change).
+    if tip_return_pct < -0.3:
+        # TIP down → real yields up → gold bearish → flat (inverse-ETF route).
         return {
-            'direction': 'flat',
-            'conviction': 0.0,
-            'expected_return_pct': 0.0,
-            'time_to_target_days': 0,
-            'inputs': {'real_yield_10y_change': real_yield_change}
+            "signal": round(real_yield_change_proxy_bps, 3),
+            "direction": "flat",
+            "conviction": 0.0,
+            "expected_return_pct": 0.0,
+            "time_to_target_days": 5,
+            "inputs": inputs,
+            "interpretation": "real yields rising (TIP down) — bearish gold; emit flat",
         }
+    if tip_return_pct > 0.3:
+        return {
+            "signal": round(real_yield_change_proxy_bps, 3),
+            "direction": "long",
+            "conviction": round(min(abs(tip_return_pct) / 1.0, 0.7), 3),
+            "expected_return_pct": round(min(abs(tip_return_pct) * 5, 3.0), 3),
+            "time_to_target_days": 10,
+            "inputs": inputs,
+            "interpretation": "real yields easing (TIP up) — bullish gold",
+        }
+    return {
+        "signal": round(real_yield_change_proxy_bps, 3),
+        "direction": "flat",
+        "conviction": 0.0,
+        "expected_return_pct": 0.0,
+        "time_to_target_days": 10,
+        "inputs": inputs,
+        "interpretation": "no decisive real-yield move",
+    }

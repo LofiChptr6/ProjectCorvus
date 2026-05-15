@@ -88,7 +88,24 @@ def run_all_models(
             if not hasattr(module, "compute"):
                 entry["error"] = "no compute(symbol, bars, context) entry point"
             else:
-                entry["result"] = module.compute(symbol, bars, context)
+                # If the model declares EXTRA_SYMBOLS, ensure context["extra_bars"]
+                # has a non-empty entry for each. Callers that already populate
+                # extra_bars (the runtime helper) pass through unchanged; callers
+                # that don't (the validator's registry build) get the main `bars`
+                # arg as a synthetic stand-in so the model can still hit its
+                # `inputs`-emitting code path.
+                model_ctx = context
+                extras = list(getattr(module, "EXTRA_SYMBOLS", []) or [])
+                if extras:
+                    existing = dict(context.get("extra_bars") or {})
+                    filled = False
+                    for sym in extras:
+                        if not existing.get(sym):
+                            existing[sym] = bars
+                            filled = True
+                    if filled:
+                        model_ctx = {**context, "extra_bars": existing}
+                entry["result"] = module.compute(symbol, bars, model_ctx)
         except Exception as exc:
             entry["error"] = f"{type(exc).__name__}: {exc}"
         out[name] = entry

@@ -26,10 +26,43 @@ MODEL_VERSION  = "1.0"        # bump on any compute() behavior change
 BAR_FREQUENCY  = "1d"         # one of: "1m", "5m", "15m", "1h", "1d"
 MIN_BARS       = 22           # minimum bars required to emit a signal
 LOOKBACK_DAYS  = 60           # bars the runner will fetch (default 252)
+EXTRA_SYMBOLS  = []           # optional: other tickers whose bars the runner
+                              # should also fetch and pass under
+                              # context["extra_bars"]. Default [].
 
 def compute(symbol: str, bars: list[dict], context: dict) -> dict:
     ...
 ```
+
+## Extra symbols (cross-asset signals)
+
+A model can declare `EXTRA_SYMBOLS = ["VIX", "XLV", ...]` to ask the runner to
+fetch bars for additional tickers at the same `BAR_FREQUENCY` and
+`LOOKBACK_DAYS` as the main symbol. They arrive in `context["extra_bars"]`:
+
+```python
+context["extra_bars"] = {
+    "VIX": [{o, h, l, c, v}, ...],
+    "XLV": [{o, h, l, c, v}, ...],
+}
+```
+
+Semantics:
+- **Per-symbol fetch failure → empty list.** The model is expected to check
+  `len(context["extra_bars"].get(sym, [])) >= N` and return the no-signal shape
+  if it can't compute. The runner does NOT short-circuit on extra-fetch
+  failure — one missing extra shouldn't kill the conviction for everything else.
+- **Same frequency as main bars.** No per-extra `BAR_FREQUENCY` override.
+- **Validator behavior.** The startup registry build (`model_inputs_validator`)
+  uses synthetic bars and re-uses them as synthetic stand-ins for every
+  declared extra so the model's `inputs` keys still register. This means: when
+  designing the model, make sure the compute path that emits the full `inputs`
+  dict is reachable under synthetic OHLCV (random ±2% bars, prices around 100).
+  In practice this means including the inputs dict on the no-setup branch too.
+
+Compute the cross-asset feature INSIDE the model — don't expect pre-derived
+scalars in `context`. This keeps the helper sector-agnostic and lets each model
+pick its own definition of "RSI" / "curve slope" / "yield-change proxy".
 
 ## `compute()` inputs
 

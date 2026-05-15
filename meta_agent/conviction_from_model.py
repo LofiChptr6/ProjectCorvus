@@ -89,6 +89,23 @@ async def compute_conviction_payload(
     if not bars:
         return {"status": "error", "error": f"no bars returned for {symbol} (bar_size={bar_size}, duration={duration})"}
 
+    # Fetch declared cross-asset extras. Best-effort: a per-symbol fetch failure
+    # leaves an empty list under that key, the model decides whether it can
+    # proceed. We don't short-circuit the whole conviction on one bad extra.
+    extra_symbols = list(getattr(module, "EXTRA_SYMBOLS", []) or [])
+    extra_bars: dict[str, list[dict]] = {}
+    for extra in extra_symbols:
+        try:
+            resp = await get_bars(extra, bar_size, duration, "TRADES")
+            eb = resp.get("bars", []) if isinstance(resp, dict) else (resp or [])
+            extra_bars[extra] = eb or []
+        except Exception as exc:
+            log.warning(
+                "conviction_from_model: extra_bars fetch failed agent=%s model=%s extra=%s err=%s",
+                agent_name, model_name, extra, exc,
+            )
+            extra_bars[extra] = []
+
     if nav is None or regime is None:
         try:
             from ibkr.account import get_account_summary
@@ -104,7 +121,7 @@ async def compute_conviction_payload(
                     regime = (json.loads(mike_path.read_text(encoding="utf-8")) or {}).get("regime")
             except Exception:
                 pass
-    context = {"nav": nav, "regime": regime, "agent_name": agent_name}
+    context = {"nav": nav, "regime": regime, "agent_name": agent_name, "extra_bars": extra_bars}
 
     try:
         result = module.compute(symbol, bars, context)
@@ -185,6 +202,7 @@ def discover_agent_models(agent_name: str) -> list[dict[str, Any]]:
             "version": str(getattr(module, "MODEL_VERSION", "unset")),
             "bar_frequency": str(getattr(module, "BAR_FREQUENCY", "1d")),
             "lookback_days": int(getattr(module, "LOOKBACK_DAYS", 252)),
+            "extra_symbols": list(getattr(module, "EXTRA_SYMBOLS", []) or []),
             "description": doc_first_line,
         })
     return out
