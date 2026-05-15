@@ -42,6 +42,7 @@ class ReviewBundle:
     market_status: Optional[dict[str, Any]] = None
     quiet_window: Optional[bool] = None
     kill_switch: Optional[dict[str, Any]] = None
+    available_models: list[dict[str, Any]] = field(default_factory=list)
     bundle_warnings: list[str] = field(default_factory=list)
 
 
@@ -126,6 +127,13 @@ async def get_review_bundle(agent_name: str) -> ReviewBundle:
 
     agent_context_text = await _agent_context_text(agent_name, warnings)
 
+    available_models: list[dict[str, Any]] = []
+    try:
+        from meta_agent.conviction_from_model import discover_agent_models
+        available_models = discover_agent_models(agent_name)
+    except Exception as e:
+        warnings.append(f"available_models: {type(e).__name__}: {e}")
+
     return ReviewBundle(
         agent_name=agent_name,
         now_iso=now_iso,
@@ -141,5 +149,6 @@ async def get_review_bundle(agent_name: str) -> ReviewBundle:
         market_status=market_status,
         quiet_window=quiet_window,
         kill_switch=kill_switch,
+        available_models=available_models,
         bundle_warnings=warnings,
     )

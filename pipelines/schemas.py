@@ -34,6 +34,10 @@ class ConvictionView(BaseModel):
     momentum_confirmed: Optional[bool] = None
     stop_pct: Optional[float] = None  # see _coerce_stop_pct: must be POSITIVE magnitude
     expires_in_hours: int = Field(default=1, ge=1, le=336)  # 14d max
+    from_model: Optional[str] = None  # name under agents/<agent>/models/; when
+                                      # set, runner overrides direction/conviction/
+                                      # expected_return_pct/time_to_target_days/
+                                      # stop_pct/model_inputs with model output
 
     @field_validator("symbol")
     @classmethod

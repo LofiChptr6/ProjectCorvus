@@ -157,6 +157,56 @@ def _parse_structured(skill_type: str, text: str) -> tuple[Optional[pydantic.Bas
 # ── Write dispatch (post-validation) ─────────────────────────────────────────
 
 
+async def _resolve_conviction_fields(
+    c: schemas.ConvictionView,
+    agent_name: str,
+) -> Optional[dict[str, Any]]:
+    """Return resolved numeric fields for a conviction row, or None to drop.
+
+    When `c.from_model` is set, run the helper and override LLM-authored
+    direction/conviction/expected_return_pct/time_to_target_days/stop_pct/
+    model_inputs with the model's output. Helper returns skipped/error → drop
+    with a log line. Model-emitted "short" → drop (inverse-ETF routing
+    convention: direct shorts are allocator-inert; the LLM should express
+    bearishness via an inverse-ETF long instead).
+
+    When `from_model` is None, pass the LLM-authored fields through unchanged.
+    """
+    if not c.from_model:
+        return {
+            "direction": c.direction,
+            "conviction": c.conviction,
+            "expected_return_pct": c.expected_return_pct,
+            "time_to_target_days": c.time_to_target_days,
+            "stop_pct": c.stop_pct,
+            "model_inputs": c.model_inputs,
+        }
+    from meta_agent.conviction_from_model import compute_conviction_payload
+    res = await compute_conviction_payload(agent_name, c.from_model, c.symbol)
+    if res["status"] == "skipped":
+        log.info("review.from_model skipped: agent=%s sym=%s model=%s reason=%s",
+                 agent_name, c.symbol, c.from_model, res["reason"])
+        return None
+    if res["status"] == "error":
+        log.warning("review.from_model error: agent=%s sym=%s model=%s err=%s",
+                    agent_name, c.symbol, c.from_model, res["error"])
+        return None
+    p = res["payload"]
+    if p["direction"] == "short":
+        log.info("review.from_model dropped short: agent=%s sym=%s model=%s "
+                 "(allocator skips direct shorts; LLM should express via inverse-ETF long)",
+                 agent_name, c.symbol, c.from_model)
+        return None
+    return {
+        "direction": p["direction"],
+        "conviction": p["conviction"],
+        "expected_return_pct": p["expected_return_pct"],
+        "time_to_target_days": p["time_to_target_days"],
+        "stop_pct": p["stop_pct"],
+        "model_inputs": p["model_inputs"],  # already stamped with _model/_version
+    }
+
+
 async def _apply_review_output(
     parsed: schemas.ReviewOutput,
     *,
@@ -182,18 +232,21 @@ async def _apply_review_output(
     if dry_run:
         await store.clear_agent_convictions_shadow(agent_name)
         for c in parsed.convictions:
+            resolved = await _resolve_conviction_fields(c, agent_name)
+            if resolved is None:
+                continue
             await store.insert_conviction_shadow(
                 agent_name=agent_name,
                 symbol=c.symbol,
-                direction=c.direction,
-                conviction=c.conviction,
-                expected_return_pct=c.expected_return_pct,
-                time_to_target_days=c.time_to_target_days,
+                direction=resolved["direction"],
+                conviction=resolved["conviction"],
+                expected_return_pct=resolved["expected_return_pct"],
+                time_to_target_days=resolved["time_to_target_days"],
                 rationale=c.rationale,
-                model_inputs=c.model_inputs,
+                model_inputs=resolved["model_inputs"],
                 expires_in_hours=c.expires_in_hours,
                 momentum_confirmed=c.momentum_confirmed,
-                stop_pct=c.stop_pct,
+                stop_pct=resolved["stop_pct"],
                 run_session_id=session_id,
             )
             summary["convictions_inserted"] += 1
@@ -220,20 +273,23 @@ async def _apply_review_output(
         }
         await store.clear_agent_convictions(agent_name)
         for c in parsed.convictions:
+            resolved = await _resolve_conviction_fields(c, agent_name)
+            if resolved is None:
+                continue
             prev = prior_anchor.get(c.symbol.upper())
-            preserved = prev[1] if (prev and prev[0] == c.direction) else None
+            preserved = prev[1] if (prev and prev[0] == resolved["direction"]) else None
             await store.upsert_conviction(
                 agent_name=agent_name,
                 symbol=c.symbol,
-                direction=c.direction,
-                conviction=c.conviction,
-                expected_return_pct=c.expected_return_pct,
-                time_to_target_days=c.time_to_target_days,
+                direction=resolved["direction"],
+                conviction=resolved["conviction"],
+                expected_return_pct=resolved["expected_return_pct"],
+                time_to_target_days=resolved["time_to_target_days"],
                 rationale=c.rationale,
-                model_inputs=c.model_inputs,
+                model_inputs=resolved["model_inputs"],
                 expires_in_hours=c.expires_in_hours,
                 momentum_confirmed=c.momentum_confirmed,
-                stop_pct=c.stop_pct,
+                stop_pct=resolved["stop_pct"],
                 first_held_since=preserved,
             )
             summary["convictions_inserted"] += 1
