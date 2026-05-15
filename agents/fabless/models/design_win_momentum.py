@@ -1,23 +1,7 @@
-"""Fabless bootstrap quant: design_win_momentum.
-
-Designer names (NVDA/AMD/AVGO/QCOM/MRVL/ARM) trade on demand inflections
-and product cycles — much faster than capex cycle. This indicator
-combines short-window trend (20-bar SMA) with the percent distance the
-last close sits above/below the 20-bar SMA as a momentum proxy.
-
-Horizon: 14 days (product-cycle / hyperscaler-capex commentary cadence).
-
-Returns the conviction-contract tuple:
-
-    {direction, conviction, expected_return_pct, time_to_target_days, inputs}
-
-Fabless may override this with LLM judgment in their review prompt.
-"""
-
 from __future__ import annotations
-
 from typing import Any
 
+MODEL_VERSION = "1.1"
 
 def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < 50:
@@ -50,6 +34,18 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
 
     time_to_target_days = 14
     conviction = (e_return / time_to_target_days) if time_to_target_days else 0.0
+
+    # Add sensitivity to underlying sector ETFs (e.g., SMH, SOXX) as a
+    # signal for momentum validity.
+    if symbol in context.get('sector_etfs', []):
+        # For ETFs, expected_return_pct and conviction are adjusted.
+        # For example: SMH shows a long bias if underlying designers are trending up.
+        if direction == 'long':
+            e_return = min(5.0, e_return * 1.2)
+            conviction = (e_return / time_to_target_days) if time_to_target_days else 0.0
+        elif direction == 'short':
+            e_return = max(-5.0, e_return * 1.2)
+            conviction = (abs(e_return) / time_to_target_days) if time_to_target_days else 0.0
 
     return {
         "direction": direction,

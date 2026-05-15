@@ -1,23 +1,8 @@
-"""Fab bootstrap quant: equipment_cycle.
-
-Capex-cycle proxy for foundries and equipment names. Reads long-window
-trend (200-bar SMA) vs medium-window (50-bar SMA) and the slope of the
-spread, similar to a Coppock-style turn detector. Capex names lead the
-chip cycle by 6-12 months, so we use a 90-day horizon by default — much
-slower than the fabless designers.
-
-Returns the conviction-contract tuple:
-
-    {direction, conviction, expected_return_pct, time_to_target_days, inputs}
-
-Fab may override this with LLM judgment in their review prompt; the
-model's job is to give a starting point.
-"""
-
 from __future__ import annotations
 
 from typing import Any
 
+MODEL_VERSION = '1.1'
 
 def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < 200:
@@ -49,16 +34,16 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     # capturing "weakly bullish on a stalling spread" or "fading uptrend that
     # hasn't yet rolled over" instead of forcing them to flat.
     slope_pct_of_price = (spread_slope / last_close * 100) if last_close else 0.0
-    score = 0.6 * spread_pct_of_price + 0.4 * slope_pct_of_price * 5.0   # slope weighted up since it's smaller-magnitude
+    score = 0.5 * spread_pct_of_price + 0.5 * slope_pct_of_price * 3.0   # slope weighted up since it's smaller-magnitude
 
     # Threshold below which the signal is too weak to act on
-    THRESHOLD = 0.4
+    THRESHOLD = 0.5
     if score > THRESHOLD:
         direction = "long"
-        e_return = score * 0.6   # 60% confidence haircut
+        e_return = score * 0.5   # 50% confidence haircut
     elif score < -THRESHOLD:
         direction = "short"
-        e_return = score * 0.6   # already negative
+        e_return = score * 0.5   # already negative
     else:
         direction = "flat"
         e_return = 0.0
@@ -79,6 +64,6 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
             "spread_pct_of_price": round(spread_pct_of_price, 3),
             "slope_pct_of_price": round(slope_pct_of_price, 4),
             "score": round(score, 3),
-            "note": "Capex cycle leads ~6-12mo; cross-check vs TSM CapEx guide and ASML book-to-bill.",
+            "note": "Capex cycle leads ~6-12mo; cross-check vs TSM CapEx guide and ASML book-to-bill."
         },
     }

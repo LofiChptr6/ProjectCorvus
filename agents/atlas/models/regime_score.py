@@ -1,4 +1,4 @@
-"""Atlas bootstrap indicator: regime_score.
+'''Atlas bootstrap indicator: regime_score.
 
 Composite long-side regime score in [-1, 1]:
   +0.5 if last close > 200d MA (long-term trend)
@@ -6,11 +6,14 @@ Composite long-side regime score in [-1, 1]:
   +0.2 if 20d MA slope is positive (recent acceleration)
 
 Pass at least 200 daily bars for a real reading.
-"""
+'''
 
 from __future__ import annotations
 
 from typing import Any
+
+
+import numpy as np
 
 
 def _sma(closes: list[float], n: int) -> float | None:
@@ -18,10 +21,9 @@ def _sma(closes: list[float], n: int) -> float | None:
         return None
     return sum(closes[-n:]) / n
 
-
 def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
-    if len(bars) < 50:
-        return {"signal": None, "reason": f"need >=50 bars, got {len(bars)}"}
+    if len(bars) < 200:
+        return {"signal": None, "reason": f"need >=200 bars, got {len(bars)}"}
 
     closes = [b["c"] for b in bars]
     last_close = closes[-1]
@@ -32,6 +34,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
 
     score = 0.0
     parts: dict[str, Any] = {}
+
 
     if sma200 is not None:
         above_200 = last_close > sma200
@@ -48,7 +51,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         score += 0.2 if slope_up else -0.2
         parts["sma20_slope_up"] = slope_up
 
-    direction = "long" if score > 0.3 else "short" if score < -0.3 else "flat"
+    direction = "long" if score > 0.5 else "flat"
     e_return = round(score * 6.0, 3) if direction != "flat" else 0.0
     horizon = 60
     conviction = round(abs(e_return) / horizon, 4) if horizon else 0.0
@@ -60,7 +63,6 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         "regime_from_mike": context.get("regime"),
         "interpretation": (
             "long-friendly" if score > 0.5
-            else "short-friendly" if score < -0.5
             else "mixed / chop"
         ),
         "direction": direction,
@@ -74,3 +76,5 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
             "sma20_slope_pos": parts.get("sma20_slope_up"),
         },
     }
+
+MODEL_VERSION = "1.1"

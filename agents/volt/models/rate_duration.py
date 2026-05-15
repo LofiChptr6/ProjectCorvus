@@ -1,21 +1,7 @@
-"""Volt bootstrap quant: rate_duration.
-
-Utilities and REITs are duration-sensitive. This indicator approximates the
-rate-driven move by tracking the rolling correlation between the symbol and
-TLT (long-bond proxy) over 60 bars, then scales by the recent spread of the
-symbol from its own 50-bar mean.
-
-Returns the new conviction contract:
-    {direction, conviction, expected_return_pct, time_to_target_days, inputs}
-
-Note: this bootstrap version uses only the symbol's own bars (no TLT cross-asset
-fetch). The LLM in volt-review.md is expected to overlay actual rate context.
-"""
-
 from __future__ import annotations
-
 from typing import Any
 
+import numpy as np
 
 def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < 60:
@@ -34,11 +20,14 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     rets = [(closes[i] - closes[i - 1]) / closes[i - 1] for i in range(-60, 0) if closes[i - 1]]
     if not rets:
         return {
-            "direction": "flat", "conviction": 0.0, "expected_return_pct": 0.0,
-            "time_to_target_days": 0, "inputs": {"reason": "no usable returns"},
+            "direction": "flat",
+            "conviction": 0.0,
+            "expected_return_pct": 0.0,
+            "time_to_target_days": 0,
+            "inputs": {"reason": "no usable returns"},
         }
-    mean_r = sum(rets) / len(rets)
-    var_r = sum((r - mean_r) ** 2 for r in rets) / len(rets)
+    mean_r = np.mean(rets)
+    var_r = np.var(rets)
     vol = var_r ** 0.5  # daily-ish
 
     # Mean-reversion thesis: distance from SMA50 normalized by vol.
@@ -69,3 +58,5 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
             "daily_vol": round(vol, 4),
         },
     }
+
+MODEL_VERSION = "1.1"

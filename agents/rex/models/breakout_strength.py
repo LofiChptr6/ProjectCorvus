@@ -1,14 +1,11 @@
-"""Rex bootstrap indicator: breakout_strength.
-
-Measures how decisively price is breaking above the prior 20-bar high, weighted by
-recent volume relative to the 20-bar average. Higher = stronger breakout.
-
-This is a starting point — Rex can rewrite or extend during evening reviews.
-"""
-
+"""Rex breakout_strength: weighted 20-bar high break × volume-ratio momentum proxy."""
 from __future__ import annotations
 
 from typing import Any
+
+MODEL_VERSION = "1.1"
+BAR_FREQUENCY = "1d"
+LOOKBACK_DAYS = 30
 
 
 def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
@@ -27,12 +24,9 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     volume_ratio = (last_volume / avg_volume) if avg_volume else 0.0
     strength = pct_above_high * volume_ratio  # signs: positive only when breaking up
 
-    if strength > 1.0:
+    if strength > 2.0:
         direction = "long"
         e_return = min(strength * 1.5, 8.0)
-    elif pct_above_high < -1.0 and volume_ratio > 1.0:
-        direction = "short"
-        e_return = max(pct_above_high * volume_ratio * 0.5, -6.0)
     else:
         direction = "flat"
         e_return = 0.0

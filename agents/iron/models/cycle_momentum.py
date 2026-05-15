@@ -1,16 +1,3 @@
-"""Iron bootstrap quant: cycle_momentum.
-
-Industrial / transport names trade on cycle inflections. This indicator looks
-at the slope of the 50-bar SMA against the 200-bar SMA — a classic cycle
-proxy — and converts it into a forecast tuple matching the new conviction
-contract:
-
-    {direction, conviction, expected_return_pct, time_to_target_days, inputs}
-
-Iron may override this with LLM judgment in their review prompt; the model's
-job is to give a starting point.
-"""
-
 from __future__ import annotations
 
 from typing import Any
@@ -52,9 +39,16 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         direction = "flat"
         e_return = 0.0
 
-    # Industrials are slow — assume 30-day horizon for the cycle move
-    time_to_target_days = 30
+    # Adjust horizon to 45 days for defense/industrial names (slow to reversion)
+    time_to_target_days = 45
     conviction = (e_return / time_to_target_days) if time_to_target_days else 0.0
+
+    # Add volatility-weighted conviction scaling for better calibration
+    if len(bars) >= 14:
+        atr_values = [b["h"] - b["l"] for b in bars[-14:]]
+        atr14_now = sum(atr_values) / 14
+        atr_ratio = abs(spread_pct_of_price) / atr14_now if atr14_now else 1.0
+        conviction = min(conviction * atr_ratio, 1.0)
 
     return {
         "direction": direction,
@@ -67,5 +61,9 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
             "spread_now": round(spread_now, 3),
             "spread_slope_10bar": round(spread_slope, 3),
             "spread_pct_of_price": round(spread_pct_of_price, 3),
+            "atr14_now": round(atr14_now, 3) if "atr14_now" in locals() else None,
+            "atr_ratio": round(atr_ratio, 3) if "atr_ratio" in locals() else None,
         },
     }
+
+MODEL_VERSION = "1.1"
