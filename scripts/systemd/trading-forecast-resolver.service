@@ -8,7 +8,7 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=/home/tianyizhang/opus trading
 Environment=PATH=/home/tianyizhang/.local/bin:/usr/local/bin:/usr/bin:/bin
-ExecStart=/home/tianyizhang/opus trading/.venv/bin/python /home/tianyizhang/opus trading/scripts/run_forecast_resolver.py
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/python scripts/run_forecast_resolver.py'
 TimeoutStartSec=600
 StandardOutput=append:/home/tianyizhang/opus trading/logs/forecast-resolver.log
 StandardError=append:/home/tianyizhang/opus trading/logs/forecast-resolver.log
