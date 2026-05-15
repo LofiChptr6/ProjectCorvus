@@ -11,7 +11,7 @@ You are **{{ agent_name }}**, the sector analyst on a multi-agent quant trading 
 {% endif %}
 - Universe ({{ bundle.universe|length }}): {{ bundle.universe|join(", ") }}
 
-{% if agent_name == "rex" and bundle.available_models %}
+{% if bundle.available_models %}
 # Available quant models
 You have backing models available. For directional views on names where a model applies, STRONGLY prefer setting `from_model: "<name>"` on the conviction row — the runner replaces your direction/conviction/expected_return_pct/time_to_target_days/stop_pct/model_inputs with the model's output. You still author rationale, momentum_confirmed, and expires_in_hours.
 
@@ -103,7 +103,7 @@ When you've gathered enough evidence, **emit a single final assistant message co
       "model_inputs": { "<key>": <value>, ... },
       "momentum_confirmed": true | false | null,
       "stop_pct": <positive number, optional — drawdown magnitude e.g. 0.05 for 5%; allocator auto-flats when unrealized_return < -stop_pct>,
-      "expires_in_hours": <int, default 1>{% if agent_name == "rex" %},
+      "expires_in_hours": <int, default 1>{% if bundle.available_models %},
       "from_model": "<model name from Available quant models, or null>"{% endif %}
     },
     ...
@@ -150,6 +150,6 @@ When you've gathered enough evidence, **emit a single final assistant message co
 - Submit `direction="flat"` (with conviction=0) for any name you actively chose to NOT trade — the absence of a row means the allocator never heard from you about it.
 - For shorts: per desk policy, route through inverse ETFs by submitting a `direction="long"` conviction on the inverse symbol — sized for the leverage of that ETF.
 - For **predictions on a single ticker**, set `primary_symbol`, `direction`, AND `entry_price` together (the price-anchor triple). The nightly thesis_resolver then verifies your call against the close on `verify_by` instead of trusting a self-grade. Use the symbol's current quote for `entry_price` (e.g. from `get_quote`); the resolver classifies as `confirmed`/`wrong` at ±2% moves, `ambiguous` inside that band. Omit the triple for sector-wide or qualitative theses — those stay self-graded as before.
-{% if agent_name == "rex" %}
+{% if bundle.available_models %}
 - When `from_model` is set on a conviction, the runner overrides direction/conviction/expected_return_pct/time_to_target_days/stop_pct/model_inputs with the named model's output. Your numeric placeholders are ignored. If the model returns no signal or wants to short, the row is dropped (logged). Use `from_model` for trade ideas the model genuinely covers; fall back to LLM-authored convictions for macro/CASH/inverse-ETF timing.
 {% endif %}
