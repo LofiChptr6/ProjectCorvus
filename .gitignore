@@ -51,8 +51,15 @@ htmlcov/
 
 # ── Virtualenvs ───────────────────────────────────────────────────────────────
 .venv/
+.venv-*/
 venv/
 env/
+
+# ── Model-tune backups ───────────────────────────────────────────────────────
+# file_ritual.py keeps a .bak.YYYYMMDD-HHMMSS next to each model it tunes,
+# as a rollback safety net. These are local audit artifacts — the canonical
+# previous-version lives in git history.
+agents/*/models/*.bak.*
 
 # ── Editor / OS ───────────────────────────────────────────────────────────────
 .DS_Store
