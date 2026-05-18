@@ -1,0 +1,33 @@
+[Unit]
+Description=IB Gateway via IBC (headless, auto-login)
+Documentation=https://github.com/IbcAlpha/IBC
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tianyizhang
+Group=tianyizhang
+# Path has a space; bash -c shields systemd's exec parser (see commit f751352)
+ExecStart=/bin/bash -c '"/home/tianyizhang/opus trading/scripts/ibc-launch.sh"'
+
+# IBC handles restart of Gateway internally via AutoRestartTime; we only
+# restart the whole unit if it crashes outright. RestartSec is generous to
+# avoid hammering IBKR after a transient login failure.
+Restart=on-failure
+RestartSec=60s
+
+# Gateway login + 2FA round-trip can take 30-60s; don't trip the watchdog
+TimeoutStartSec=300
+
+# Quiet, predictable shutdown so Xvfb child gets reaped via trap in launcher
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Forward to journald for `journalctl -u ibgateway.service -f`
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=trading-desk.target

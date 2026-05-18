@@ -9,6 +9,7 @@ Documentation=https://github.com/LofiChptr6/ProjectCorvus
 # to be co-managed with the daemons. Stopping this target only stops the
 # daemons; timers continue to fire and try to run (failing fast against missing
 # IBKR / vLLM is fine).
+Wants=ibgateway.service
 Wants=ibkr-daemon.service
 Wants=trading-vllm.service
 Wants=trading-vllm-embed.service

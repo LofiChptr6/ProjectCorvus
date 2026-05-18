@@ -1,0 +1,35 @@
+# IBC config template. Materialized at runtime by scripts/ibc-launch.sh:
+# envsubst expands ${IBKR_USER} and ${IBKR_PASSWORD} from .env into /tmp,
+# then the temp file is shredded on exit. Do not put real credentials here.
+
+# ── login ───────────────────────────────────────────────────────────────────
+IbLoginId=${IBKR_USER}
+IbPassword=${IBKR_PASSWORD}
+TradingMode=live
+FIX=no
+ReadOnlyLogin=no
+
+# ── session handling ────────────────────────────────────────────────────────
+ExistingSessionDetectedAction=primary
+AcceptIncomingConnectionAction=accept
+AllowBlindTrading=yes
+SuppressInfoMessages=yes
+
+# ── popups Gateway throws on the way up ─────────────────────────────────────
+DismissPasswordExpiryWarning=yes
+DismissNSEComplianceNotice=yes
+AcceptNonBrokerageAccountWarning=yes
+
+# ── restart behavior — this is what makes Sunday work ───────────────────────
+# Daily soft restart at 02:00 ET avoids the every-day re-auth prompt; the
+# weekly Sunday logout still triggers 2FA → IBKR Mobile push → tap on phone.
+AutoRestartTime=02:00
+ClosedownAt=
+IbAutoClosedown=no
+
+# ── 2FA ─────────────────────────────────────────────────────────────────────
+# Blank = use account default device. IBKR Mobile push lands on the phone and
+# the user taps Confirm from anywhere; no console interaction needed here.
+SecondFactorDevice=
+ReloginAfterSecondFactorAuthenticationTimeout=yes
+SecondFactorAuthenticationExitInterval=

@@ -14,6 +14,7 @@ audit-only.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -185,6 +186,7 @@ _HELP_TEXT = (
     "/proposals — list pending approval items\n"
     "/pause <agent> — raise a proposal to pause an agent\n"
     "/budget — today's concierge API spend\n"
+    "/relogin — restart IB Gateway (sends 2FA push to your phone)\n"
     "/help — this message\n\n"
     "Or just ask me anything in plain English."
 )
@@ -210,6 +212,8 @@ async def _handle_slash(text: str, cfg: dict[str, Any]) -> None:
             await _raise_pause(arg.strip())
         elif cmd == "/budget":
             await _send_budget(cfg)
+        elif cmd == "/relogin":
+            await _handle_relogin()
         else:
             await send_message(
                 f"Unknown command: {cmd}. Try /help.",
@@ -370,6 +374,70 @@ async def _send_budget(cfg: dict[str, Any]) -> None:
         f"{u.get('requests', 0)} requests · "
         f"{u.get('input_tokens', 0):,}in / {u.get('output_tokens', 0):,}out",
         parse_mode=None, kind="slash_cmd", meta={"cmd": "/budget"},
+    )
+
+
+async def _handle_relogin() -> None:
+    """Restart ibgateway.service so IBC re-types credentials and triggers a
+    fresh 2FA push. Operator taps the IBKR Mobile notification on their phone
+    to complete login; the daemon's _reconnect_loop picks up once port 4001
+    binds again. Requires the NOPASSWD sudoers entry at
+    /etc/sudoers.d/ibgateway (see scripts/sudoers.d/ibgateway)."""
+    proc = await asyncio.create_subprocess_exec(
+        "sudo", "-n", "systemctl", "restart", "ibgateway.service",
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        err = (stderr or stdout).decode("utf-8", errors="replace").strip() or "unknown"
+        msg = f"⚠️ /relogin failed: {err}"
+        if "password is required" in err or "a terminal is required" in err:
+            msg += (
+                "\n\nInstall the sudoers entry:\n"
+                "  sudo install -m 440 scripts/sudoers.d/ibgateway "
+                "/etc/sudoers.d/ibgateway"
+            )
+        await send_message(
+            msg, parse_mode=None, kind="slash_cmd",
+            meta={"cmd": "/relogin", "event": "restart_failed", "rc": proc.returncode},
+        )
+        return
+
+    await send_message(
+        "🔄 Restarting IB Gateway. Tap the IBKR Mobile push on your phone to "
+        "complete login — I'll confirm once port 4001 is back up.",
+        parse_mode=None, kind="slash_cmd", meta={"cmd": "/relogin"},
+    )
+    asyncio.create_task(_relogin_followup())
+
+
+async def _relogin_followup() -> None:
+    """Poll port 4001 for up to 3 minutes after a /relogin, then notify."""
+    deadline = asyncio.get_event_loop().time() + 180
+    while asyncio.get_event_loop().time() < deadline:
+        await asyncio.sleep(5)
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection("127.0.0.1", 4001), timeout=1
+            )
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            await send_message(
+                "✅ Gateway is back on 4001. Daemon should be reconnected.",
+                parse_mode=None, kind="slash_cmd",
+                meta={"cmd": "/relogin", "event": "gateway_up"},
+            )
+            return
+        except (OSError, asyncio.TimeoutError):
+            continue
+    await send_message(
+        "⏱️ Gateway didn't return within 3 minutes. Check `journalctl -u ibgateway.service -n 60` on the box.",
+        parse_mode=None, kind="slash_cmd",
+        meta={"cmd": "/relogin", "event": "gateway_timeout"},
     )
 
 

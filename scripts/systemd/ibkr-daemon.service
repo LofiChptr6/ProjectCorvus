@@ -1,0 +1,27 @@
+[Unit]
+Description=IBKR connection daemon (RPC at 127.0.0.1:7790)
+Documentation=file:///home/tianyizhang/opus%20trading/ibkr/daemon.py
+After=ibgateway.service postgresql.service
+Wants=ibgateway.service
+PartOf=trading-desk.target
+
+[Service]
+Type=simple
+User=tianyizhang
+Group=tianyizhang
+# Wait for Gateway to be reachable on port 4001 before starting the daemon
+# (avoids the daemon entering its slow reconnect loop on cold boot).
+# Wait for Gateway to be reachable on port 4001 before starting the daemon
+# (avoids the daemon entering its slow reconnect loop on cold boot).
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 60); do ss -ltn | grep -q ":4001 " && exit 0; sleep 2; done; echo "ibkr-daemon: port 4001 not listening after 120s" >&2; exit 1'
+ExecStart=/bin/bash -c '"/home/tianyizhang/opus trading/scripts/ibkr_daemon.sh"'
+
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=180
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=trading-desk.target

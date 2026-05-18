@@ -1,0 +1,9 @@
+# Allow the concierge to restart IB Gateway without a password prompt so the
+# Telegram /relogin command works. Scope is narrow: only the one systemctl
+# subcommand, only on this unit. The concierge (and the user shell) can fire it;
+# nothing else gets elevated.
+#
+# Install:
+#   sudo install -m 440 scripts/sudoers.d/ibgateway /etc/sudoers.d/ibgateway
+#   sudo visudo -c   # validate
+tianyizhang ALL=(root) NOPASSWD: /usr/bin/systemctl restart ibgateway.service
