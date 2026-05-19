@@ -1,2 +1,4 @@
 # ProjectCorvus
-Multi-Agent System to leverage Claude Code CLI + IBKR Gateway to for active trading
+- Multi-Agent System/Harness using local LLM to trade stocks via IBKR Gateway.
+- Include data/news integration via Massive/Benzinga API and telegram message handler
+- Agent self-maintained python quantitative models
