@@ -36,7 +36,7 @@ async def get_respond_bundle(agent_name: str) -> RespondBundle:
             active_views=[],
         )
 
-    workspace = read_workspace(agent_name)
+    workspace = await read_workspace(agent_name)
     views = await store.get_agent_active_convictions(agent_name)
     journal = await load_journal_split(agent_name)
 

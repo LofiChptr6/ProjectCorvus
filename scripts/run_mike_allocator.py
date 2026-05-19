@@ -41,8 +41,11 @@ except Exception:
 
 
 def _setup_logging() -> logging.Logger:
-    log_path = _REPO_ROOT / "logs" / "mike-allocator.log"
-    log_path.parent.mkdir(exist_ok=True)
+    # Honor LOG_DIR for test isolation — conftest sets this to a tmp path so
+    # importing the script during pytest doesn't pollute production logs.
+    log_dir = Path(os.environ.get("LOG_DIR") or (_REPO_ROOT / "logs"))
+    log_path = log_dir / "mike-allocator.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("mike_allocator")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
@@ -205,7 +208,14 @@ def _format_telegram(result: dict, n_symbols: int, n_agents: int, why: str) -> s
     )[:1000]
 
 
-async def main() -> int:
+# Postgres advisory-lock key for serializing allocator runs across the hourly
+# cron + queue-fired OCAP rebalance + manual invocations. Arbitrary stable
+# 32-bit int derived from "mikeal" (mike-allocator). pg_try_advisory_lock is
+# non-blocking; concurrent callers see it return false and exit 2 (skip).
+ALLOCATOR_LOCK_KEY = 0x6D696B65616C
+
+
+async def _main_locked() -> int:
     start = time.time()
     log.info("runner starting")
 
@@ -287,6 +297,31 @@ async def main() -> int:
 
     log.info("runner done in %.1fs (decision_id=%s)", time.time() - start, decision_id)
     return 0
+
+
+async def main() -> int:
+    """Run the allocator under a Postgres advisory lock so the hourly cron,
+    queue-fired ocap_rebalance jobs, and any manual invocations never race.
+    Concurrent callers see `pg_try_advisory_lock` return false and exit 2,
+    same semantic as `_guard_skip` ("nothing to do right now")."""
+    from db.schema import get_pool
+    pool = await get_pool()
+    lock_conn = await pool.acquire()
+    try:
+        got = await lock_conn.fetchval(
+            "SELECT pg_try_advisory_lock($1)", ALLOCATOR_LOCK_KEY,
+        )
+        if not got:
+            log.warning("allocator already running elsewhere; exit 2 (skip)")
+            return 2
+        try:
+            return await _main_locked()
+        finally:
+            await lock_conn.execute(
+                "SELECT pg_advisory_unlock($1)", ALLOCATOR_LOCK_KEY,
+            )
+    finally:
+        await pool.release(lock_conn)
 
 
 if __name__ == "__main__":

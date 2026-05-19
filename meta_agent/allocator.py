@@ -7,13 +7,24 @@ needs to place to move the desk from current to target.
 The math is deliberately simple — the LLM (mike-allocator) is expected to
 review the output before flipping to live mode, and the user can tune
 parameters via update_strategic_change proposals.
+
+OPTIONAL mixture-then-functional path (Phase E): when env
+`ALLOC_USE_MIXTURE=1`, `enrich_views_with_mixture` replaces per-agent scalar
+votes on symbols that have active distributions in agent_forecast with a
+single mixture-derived scalar (the conviction functional applied to the
+per-symbol weighted mixture of distributions). Symbols with no distributions
+stay on the legacy scalar-sum path. Disabled by default.
 """
 
 from __future__ import annotations
 
+import logging
 import math
+import os
 from dataclasses import dataclass, field
 from typing import Iterable, Optional
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -107,6 +118,125 @@ class TargetWeights:
     cash_weight: float = 0.0       # fraction of NAV to keep as cash (held back from deployment)
     cash_contributors: list[tuple[str, float]] = field(default_factory=list)
     # [(agent, weighted_conviction)] for the CASH bucket — surfaces who voted cash
+
+
+def use_mixture_enabled() -> bool:
+    """Phase-E flag: when ALLOC_USE_MIXTURE=1, the rebalance path runs
+    distribution-mixer per-symbol substitution. Default off until A/B has
+    validated the path against the legacy scalar-sum allocator."""
+    return os.environ.get("ALLOC_USE_MIXTURE", "0").lower() in {"1", "true", "yes", "on"}
+
+
+async def enrich_views_with_mixture(
+    views: list["ConvictionView"],
+    influence_weights: Optional[dict[str, float]] = None,
+    functional_name: Optional[str] = None,
+) -> tuple[list["ConvictionView"], dict[str, dict]]:
+    """For every symbol with active distributions in agent_forecast, replace
+    the per-agent scalar conviction rows with N synthetic rows (one per
+    contributor) whose convictions sum to the mixture-derived scalar.
+
+    Rationale: the mixture-then-functional path preserves orthogonal
+    distributional info across agents. Substituting at the ConvictionView
+    layer keeps downstream contributors / attribution working — each
+    contributing agent still sees a row, just with a scalar derived from the
+    mixture instead of their own LLM-emitted number.
+
+    Args:
+        views: raw per-agent conviction rows from get_active_convictions
+        influence_weights: per-agent multiplier passed through to the mixer's
+            weighting (calibration_skill × influence × 1/√t_days)
+        functional_name: which functional to apply to each mixture; defaults to
+            meta_agent.conviction_functionals.DEFAULT_FUNCTIONAL
+
+    Returns:
+        (new_views, report) — new_views is the substituted list, ready for
+        compute_target_weights. report is a per-symbol dict with the legacy
+        scalar sum and the mixture-derived scalar for A/B logging.
+
+    Symbols with no distributions are left untouched.
+    """
+    from db import store
+    from meta_agent import distribution_mixer
+
+    influence_weights = influence_weights or {}
+
+    # Pre-fetch all active distribution rows in one query; bucket by symbol.
+    dist_rows = await store.get_active_distributions(symbol=None)
+    by_symbol: dict[str, list[dict]] = {}
+    for r in dist_rows:
+        # Distribution may come back as JSON string from asyncpg if it's a
+        # JSONB column; the mixer expects a dict.
+        d = r.get("distribution")
+        if isinstance(d, str):
+            import json as _json
+            try:
+                r["distribution"] = _json.loads(d)
+            except _json.JSONDecodeError:
+                continue
+        by_symbol.setdefault(r["symbol"].upper(), []).append(r)
+
+    report: dict[str, dict] = {}
+    out_views: list[ConvictionView] = []
+    consumed_symbols: set[str] = set()
+
+    for sym, rows in by_symbol.items():
+        res = distribution_mixer.mixture_conviction(
+            rows, influence_by_agent=influence_weights,
+            functional_name=functional_name,
+        )
+        if res is None:
+            continue
+        direction, scalar, contributors = res
+        if scalar <= 0 or direction == "flat":
+            # Mixture says flat/zero — leave the original per-agent scalar views
+            # in place so the legacy scalar-sum path can still decide. Record
+            # the verdict for A/B reporting only.
+            report[sym] = {
+                "mixture_direction": direction,
+                "mixture_scalar":    scalar,
+                "contributors":      contributors,
+                "n_distributions":   len(rows),
+                "substituted":       False,
+                "reason":            "flat-or-zero",
+            }
+            continue
+        total_w = sum(w for _, w in contributors) or 1.0
+        for agent_name, w in contributors:
+            out_views.append(ConvictionView(
+                agent_name=agent_name, symbol=sym, direction=direction,
+                conviction=float(scalar * (w / total_w)),
+                expected_return_pct=None, time_to_target_days=None,
+                rationale=f"[mixture] {len(rows)} dists; functional applied",
+                momentum_confirmed=None, stop_pct=None,
+            ))
+        consumed_symbols.add(sym)
+        report[sym] = {
+            "mixture_direction": direction,
+            "mixture_scalar":    scalar,
+            "contributors":      contributors,
+            "n_distributions":   len(rows),
+            "substituted":       True,
+        }
+
+    # For symbols we substituted, drop the original per-agent scalar rows so
+    # they don't double-count alongside the mixture-derived rows.
+    for v in views:
+        sym = (v.symbol or "").upper()
+        if sym in consumed_symbols:
+            # Compute legacy scalar sum for A/B reporting before dropping.
+            entry = report.setdefault(sym, {})
+            legacy = entry.get("legacy_sum", 0.0)
+            sign = 1 if v.direction == "long" else (-1 if v.direction == "short" else 0)
+            legacy += sign * float(v.conviction)
+            entry["legacy_sum"] = legacy
+            continue
+        out_views.append(v)
+
+    log.info("mixture path: %d symbols substituted, %d untouched",
+             sum(1 for r in report.values() if r.get("substituted")),
+             len([v for v in views if (v.symbol or '').upper() not in consumed_symbols]))
+    return out_views, report
 
 
 def compute_target_weights(

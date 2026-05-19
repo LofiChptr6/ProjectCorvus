@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
-"""Hourly orchestrator — fans out sector reviews, mike-allocator, hourly heartbeat.
+"""Hourly orchestrator — primes the LLM-task queue, runs mike-allocator + heartbeat.
 
-Replaces scripts/run_hourly_orchestrator.sh (2026-05-12). Triggered every hour
-on the hour by trading-hourly-review.timer (user systemd). The AZ quiet window
-(22:00–05:00 MST) and weekends gate phases 1+2 internally; phase 3 always runs.
+Triggered every hour on the hour by trading-hourly-review.timer (user systemd).
+The AZ quiet window (22:00–05:00 MST) and weekends gate phases 1+2 internally;
+phase 3 always runs.
 
 Phases:
   0  guard       — AZ quiet or weekend → run phase 3 only
-  1a sectors     — 11 reviews via scripts/run_skill.py (asyncio.gather, concurrency=4)
+  1a queue prime — INSERT (1 sector_summary + N ticker_review) jobs per agent
+                   into agent_job; workers (trading-queue-worker@*.service)
+                   drain the queue continuously. Replaces the prior subprocess
+                   fan-out via asyncio.Semaphore.
   1b legacy      — harness skills list (currently empty; slot reserved)
   2  allocator   — scripts/run_mike_allocator.py (programmatic)
   3  heartbeat   — scripts/run_scheduled_skill.sh hourly-review (still harness)
 
-Per-skill stdout/stderr land in logs/<skill>.log (sectors: logs/<sector>-review.log).
-The orchestrator's coordination log lines go to its own stdout, which systemd's
-unit captures via StandardOutput=append:logs/hourly-orchestrator.log.
+The queue uses a routine `coalesce_key` per (agent, symbol) so repeated hourly
+primes don't stack unbounded if the workers fall behind — a new ticker_review
+job is suppressed if one with the same key is still queued/running. OCAP-
+triggered jobs (priority=5) preempt routine ticker_review (10) and
+sector_summary (20) — workers pick highest-priority first.
 """
 from __future__ import annotations
 
@@ -28,6 +33,8 @@ from typing import Awaitable, Callable
 from zoneinfo import ZoneInfo
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
 try:
     from dotenv import find_dotenv, load_dotenv
@@ -39,18 +46,21 @@ except Exception:
 
 
 PYTHON = os.environ.get("PYTHON_BIN") or str(_REPO_ROOT / ".venv" / "bin" / "python")
-CONCURRENCY = int(os.environ.get("ORCH_CONCURRENCY", "4"))
 SKILL_TIMEOUT_SEC = int(os.environ.get("SKILL_TIMEOUT_SEC", "900"))
 ALLOCATOR_TIMEOUT_SEC = int(os.environ.get("ALLOCATOR_TIMEOUT_SEC", "180"))
 HEARTBEAT_TIMEOUT_SEC = int(os.environ.get("HEARTBEAT_TIMEOUT_SEC", "900"))
 
 AZ = ZoneInfo("America/Phoenix")
 
-PIPELINE_SECTORS = ["atlas", "commodity", "energy", "fab", "fabless", "iron",
-                    "maya", "rex", "trump", "vera", "volt"]
+from meta_agent.queue_primer import (
+    PIPELINE_SECTORS,
+    prime_agent_queue as _prime_queue_for_agent,
+    prime_all_agent_queues,
+)
 
-# Legacy harness skills decommissioned (titan superseded by energy + commodity).
-# Keep slot for future additions.
+# Director skills (mike-morning/midday/allocator etc.) run on their own
+# systemd timers; sector reviews/evenings/model-tunes run via the Python
+# pipeline. Slot kept for future harness-routed additions.
 HARNESS_SKILLS: list[str] = []
 
 
@@ -108,17 +118,6 @@ async def _run_subprocess(args: list[str], log_path: Path, timeout_sec: int) -> 
 _run_subprocess_impl: Callable[[list[str], Path, int], Awaitable[dict]] = _run_subprocess
 
 
-async def _run_sector(sector: str, sem: asyncio.Semaphore) -> dict:
-    async with sem:
-        result = await _run_subprocess_impl(
-            [PYTHON, str(_REPO_ROOT / "scripts" / "run_skill.py"), sector, "review"],
-            _REPO_ROOT / "logs" / f"{sector}-review.log",
-            SKILL_TIMEOUT_SEC,
-        )
-        result["sector"] = sector
-        return result
-
-
 async def _run_allocator() -> dict:
     return await _run_subprocess_impl(
         [PYTHON, str(_REPO_ROOT / "scripts" / "run_mike_allocator.py")],
@@ -168,19 +167,29 @@ async def main() -> int:
         _log(f"orchestrator end (heartbeat-only path, {int((time.time()-start)*1000)}ms)")
         return 0
 
-    # Phase 1a: sector fan-out
-    _log(f"phase 1a: {len(PIPELINE_SECTORS)} sectors via Python pipeline "
-         f"(concurrency={CONCURRENCY})")
-    sem = asyncio.Semaphore(CONCURRENCY)
-    sector_results = await asyncio.gather(*(_run_sector(s, sem) for s in PIPELINE_SECTORS))
+    # Phase 1a: prime the LLM-task queue. Workers consume continuously; the
+    # orchestrator just lays down jobs (sector_summary + per-ticker reviews)
+    # and returns. Coalesced re-runs are a no-op when prior hour's jobs
+    # haven't drained yet.
+    _log(f"phase 1a: priming queue for {len(PIPELINE_SECTORS)} sectors")
+    result = await prime_all_agent_queues()
+    for row in result["per_agent"]:
+        if "error" in row:
+            _log(f"phase 1a/{row['agent']}: ERROR {row['error']}")
+        else:
+            _log(f"phase 1a/{row['agent']}: enqueued={row['enqueued']} "
+                 f"coalesced={row['coalesced']} (watchlist={row['watchlist_size']})")
+    _log(f"phase 1a: primed {result['total_enqueued']} jobs, "
+         f"{result['total_coalesced']} coalesced, "
+         f"{len(result['failed_agents'])} agents failed ({result['duration_ms']}ms)")
 
-    failed = [r["sector"] for r in sector_results
-              if r["exit_code"] != 0 or r["timed_out"]]
-    n_ok = len(sector_results) - len(failed)
-    if failed:
-        _log(f"phase 1a: {n_ok}/{len(sector_results)} ok; failed/timed_out: {failed}")
-    else:
-        _log(f"phase 1a: all {len(sector_results)} sectors ok")
+    # Queue health heartbeat — gives the operator a one-line read on backlog.
+    try:
+        from db import store as _store
+        stats = await _store.get_queue_stats()
+        _log(f"phase 1a: queue stats {stats}")
+    except Exception as e:
+        _log(f"phase 1a: queue stats failed: {type(e).__name__}: {e}")
 
     # Phase 1b: legacy harness skills
     if HARNESS_SKILLS:

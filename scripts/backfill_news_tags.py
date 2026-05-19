@@ -34,23 +34,15 @@ except ImportError:
 
 from db.schema import get_pool
 from scripts.ingest_news import (
-    categorize, importance_for, macro_tags_for,
-    _load_sector_map_tags, _watchlist_tags,
+    categorize, importance_for, macro_tags_for, collect_target_tickers,
 )
 
 log = logging.getLogger("backfill_news_tags")
 
 
 async def run(only_null: bool, dry_run: bool) -> int:
-    sm = _load_sector_map_tags()
-    wl = _watchlist_tags()
-    symbol_to_agents: dict[str, set[str]] = {}
-    for sym, agents in sm.items():
-        symbol_to_agents.setdefault(sym, set()).update(agents)
-    for sym, agents in wl.items():
-        symbol_to_agents.setdefault(sym, set()).update(agents)
-    log.info("loaded mappings: sector_map=%d watchlist=%d merged=%d symbols",
-             len(sm), len(wl), len(symbol_to_agents))
+    _all_symbols, symbol_to_agents = await collect_target_tickers()
+    log.info("loaded watchlist mapping: %d symbols", len(symbol_to_agents))
 
     pool = await get_pool()
     async with pool.acquire() as conn:

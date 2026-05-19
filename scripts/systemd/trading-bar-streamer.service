@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading bar streamer — Massive 5-min OHLCV → Postgres local_bars
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tianyizhang/opus trading
+EnvironmentFile=/home/tianyizhang/opus trading/.env
+Restart=on-failure
+RestartSec=15
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/python scripts/stream_bars.py'
+StandardOutput=append:/home/tianyizhang/opus trading/logs/bar-streamer.log
+StandardError=append:/home/tianyizhang/opus trading/logs/bar-streamer.log
+
+[Install]
+WantedBy=default.target

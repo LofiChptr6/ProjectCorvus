@@ -5,9 +5,12 @@ Two call sites use this:
   - pipelines.runner._apply_review_output  (batched per-review when a
     ConvictionView carries `from_model`)
 
-The helper does NOT write to the DB, NOT check rate-limits, NOT check sector
-ownership — callers handle those. It only handles model lifecycle: discover →
-import → run → validate output against MODEL_CONTRACT.md.
+The helper handles model lifecycle (discover → import → run → validate output
+against MODEL_CONTRACT.md) and — when the model emits `distributions` — also
+validates + persists them on agent_forecast with a fresh forecast_run_id
+shared with the returned scalar conviction. It does NOT write to
+agent_conviction, NOT check rate-limits, NOT check sector ownership — those
+remain caller responsibilities.
 
 See agents/MODEL_CONTRACT.md for the compute() output spec.
 """
@@ -16,6 +19,7 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -167,6 +171,38 @@ async def compute_conviction_payload(
     # Stamp provenance into the inputs payload.
     model_inputs = {**model_inputs, "_model": model_name, "_version": model_version}
 
+    # ── Probabilistic-forecast path ──────────────────────────────────────────
+    # When the model emits `distributions`, validate them, persist one row per
+    # horizon on agent_forecast under a fresh forecast_run_id, and (when a
+    # conviction functional is enabled) override the scalar conviction with
+    # the functional applied to the distributions. Models that do NOT emit
+    # distributions fall through to the legacy scalar-only path unchanged.
+    forecast_run_id: Optional[str] = None
+    functional_name: Optional[str] = None
+    distributions = result.get("distributions")
+    if distributions:
+        try:
+            forecast_run_id, functional_name, conviction_override = await _persist_distributions(
+                agent_name=agent_name,
+                symbol=symbol,
+                direction=direction,
+                expected_return_pct=expected_return_pct,
+                model_name=model_name,
+                model_version=model_version,
+                distributions=distributions,
+            )
+            if conviction_override is not None:
+                conviction = conviction_override
+        except ValueError as exc:
+            return {"status": "error", "error": f"distribution validation failed: {exc}"}
+        except Exception as exc:
+            log.warning(
+                "conviction_from_model: distribution persistence failed agent=%s model=%s symbol=%s err=%s",
+                agent_name, model_name, symbol, exc,
+            )
+            # Continue with legacy scalar conviction; do NOT silently drop
+            # the whole submission for a forecast-persist hiccup.
+
     return {
         "status": "ok",
         "payload": {
@@ -176,9 +212,99 @@ async def compute_conviction_payload(
             "time_to_target_days": time_to_target_days,
             "stop_pct": stop_pct,
             "model_inputs": model_inputs,
+            "forecast_run_id": forecast_run_id,
+            "functional_name": functional_name,
         },
         "model_version": model_version,
     }
+
+
+async def _persist_distributions(
+    agent_name: str,
+    symbol: str,
+    direction: str,
+    expected_return_pct: float,
+    model_name: str,
+    model_version: str,
+    distributions: list,
+) -> tuple[str, Optional[str], Optional[float]]:
+    """Validate + persist a list of per-horizon distributions on agent_forecast
+    under a single forecast_run_id. Return (run_id, functional_name,
+    conviction_override).
+
+    Each distribution must have anchor_price/anchor_ts/axis/horizon/bins/model/
+    model_version and pass meta_agent.distribution_validator. Caller is the
+    runner; symbol ownership + rate limits enforced upstream at the MCP layer.
+    """
+    from db import store
+    from meta_agent import conviction_functionals
+    from meta_agent.distribution_validator import (
+        horizon_to_ttd_days,
+        validate_distribution,
+    )
+
+    if not isinstance(distributions, list) or not distributions:
+        raise ValueError("distributions must be a non-empty list")
+
+    run_id = str(uuid.uuid4())
+    rows: list[dict] = []
+    horizon_pairs: list[tuple[dict, float]] = []
+    for i, dist in enumerate(distributions):
+        if not isinstance(dist, dict):
+            raise ValueError(f"distributions[{i}] not a dict")
+        ok, reason = validate_distribution(dist)
+        if not ok:
+            raise ValueError(f"distributions[{i}] invalid: {reason}")
+        horizon = dist["horizon"]
+        ttd_days = horizon_to_ttd_days(horizon)
+        # Mirror E[r] into the legacy expected_return_pct column for back-compat;
+        # likelihood = peak(p) gives consumers a usable scalar without parsing
+        # the full distribution.
+        bins = dist["bins"]
+        xs = [float(b["x"]) for b in bins]
+        ps = [float(b["p"]) for b in bins]
+        er = sum(x * p for x, p in zip(xs, ps))
+        lk = max(ps) if ps else 0.0
+        # Per-row expiration sized to the forecast horizon. Short horizons
+        # need rapid refresh; long horizons can persist. ttd_days is the
+        # horizon in trading days; allow ~1 trading session of TTL with a
+        # 2h floor (matches the prior batch default) and a 30-day ceiling.
+        ttl_hours = max(2.0, min(720.0, float(ttd_days) * 24.0 / 5.0))
+        rows.append({
+            "symbol": symbol,
+            "expected_return_pct": er,
+            "likelihood": lk,
+            "time_to_target_days": ttd_days,
+            "method": f"model:{model_name}@{model_version}",
+            "rationale": None,
+            "horizon": horizon,
+            "distribution": dist,
+            "forecast_run_id": run_id,
+            "expires_in_hours": ttl_hours,
+        })
+        horizon_pairs.append((dist, float(ttd_days)))
+
+    res = await store.upsert_forecasts_batch(
+        agent_name=agent_name,
+        rows=rows,
+    )
+    if res.get("errors"):
+        raise ValueError(f"forecast upsert errors: {res['errors']}")
+
+    # Per-agent functional choice (Phase G). Reads agents/<agent>.yaml's
+    # `conviction_functional` field; falls back to DEFAULT_FUNCTIONAL when
+    # unset or invalid. Allows data-driven A/B via
+    # scripts/suggest_functional_per_agent.py.
+    functional_name = conviction_functionals.functional_for_agent(agent_name)
+    try:
+        conviction_override = conviction_functionals.collapse_across_horizons(
+            functional_name, horizon_pairs,
+        )
+    except Exception as exc:  # registry mis-config; non-fatal
+        log.warning("conviction_functional %s failed: %s", functional_name, exc)
+        conviction_override = None
+
+    return run_id, functional_name, conviction_override
 
 
 def discover_agent_models(agent_name: str) -> list[dict[str, Any]]:

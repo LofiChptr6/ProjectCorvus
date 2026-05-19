@@ -8,13 +8,18 @@ clean: every snapshot row carries cumulative `realized_pnl + unrealized_pnl
 Public entry points:
 - `get_pnl_combined(agent_name=None)` — current latest snapshot per agent.
   Same shape as the old combined_pnl for backwards-compat callers.
-- `get_pnl_windows(agent_name=None)` — windowed deltas (1d / WTD / 1m / 3m).
+- `get_pnl_windows(agent_name=None)` — windowed deltas (today / 1d / WTD / 1m / 3m).
+  `today` anchors at today's 09:30 ET session open (fallback yesterday's 09:30
+  ET pre-open); `1d` is rolling 24h.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from zoneinfo import ZoneInfo
+
+_ET = ZoneInfo("America/New_York")
 
 
 # ── Current combined P&L (latest snapshot per agent) ────────────────────────
@@ -80,15 +85,26 @@ async def get_pnl_combined(
 
 def _window_starts(t_now: datetime) -> dict[str, datetime]:
     """Return {key: window_start_ts}. Anchored at the current snapshot's
-    timestamp so windows match data, not wall clock."""
+    timestamp so windows match data, not wall clock.
+
+    `today` anchors at today's 09:30 ET; if that's still in the future
+    (pre-open / weekend / holiday early hours) it falls back to yesterday's
+    09:30 ET so the anchor is never > t_now.
+    """
+    t_now_et = t_now.astimezone(_ET)
+    today_open_et = t_now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    if today_open_et > t_now_et:
+        today_open_et = today_open_et - timedelta(days=1)
+    today_anchor = today_open_et.astimezone(timezone.utc)
     week_start = (t_now - timedelta(days=t_now.weekday())).replace(
         hour=0, minute=0, second=0, microsecond=0,
     )
     return {
-        "1d":  t_now - timedelta(days=1),
-        "wtd": week_start,
-        "1m":  t_now - timedelta(days=30),
-        "3m":  t_now - timedelta(days=90),
+        "today": today_anchor,
+        "1d":    t_now - timedelta(days=1),
+        "wtd":   week_start,
+        "1m":    t_now - timedelta(days=30),
+        "3m":    t_now - timedelta(days=90),
     }
 
 
@@ -116,6 +132,9 @@ async def get_pnl_windows(
     For each window: pnl_usd = total_pnl(t_now) - total_pnl(t_window_start),
     where t_window_start resolves to the latest snapshot at-or-before the
     calendar window start. Windows with no snapshot returning None.
+
+    Windows: `today` (since 09:30 ET session open), `1d` (rolling 24h),
+    `wtd` (Monday 00:00 UTC), `1m`, `3m`.
 
     Because total_pnl is cumulative-since-inception, deltas are clean —
     no settlement noise, no cash-attribution artifacts, no qty-source drift.
@@ -156,13 +175,13 @@ async def get_pnl_windows(
     for agent in sorted(now_pnl.keys()):
         v_now = now_pnl[agent]
         row = {"total_pnl_now": v_now}
-        for key in ("1d", "wtd", "1m", "3m"):
+        for key in ("today", "1d", "wtd", "1m", "3m"):
             row[key] = _delta(v_now, then_pnl[key].get(agent)) if availability[key]["available"] else _delta(v_now, None)
         by_agent[agent] = row
 
     desk_now = sum(now_pnl.values())
     desk: dict = {"total_pnl_now": desk_now}
-    for key in ("1d", "wtd", "1m", "3m"):
+    for key in ("today", "1d", "wtd", "1m", "3m"):
         if not availability[key]["available"] or not then_pnl[key]:
             desk[key] = _delta(desk_now, None)
         else:

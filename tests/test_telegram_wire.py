@@ -148,10 +148,12 @@ def _final(text: str) -> _FakeResponse:
 
 def _review_json_with_summary(summary: str = "regime intact; long SPY 0.65") -> str:
     return json.dumps({
-        "convictions": [{"symbol": "SPY", "direction": "long", "conviction": 0.65}],
+        "convictions": [{"symbol": "SPY", "direction": "long", "conviction": 0.65,
+                         "expires_in_hours": 4}],
         "forecasts": [{
             "symbol": "SPY", "expected_return_pct": 0.5, "likelihood": 0.6,
             "time_to_target_days": 2, "method": "regime",
+            "expires_in_hours": 2,
         }],
         "telegram_summary": summary,
     })

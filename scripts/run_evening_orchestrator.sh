@@ -1,7 +1,6 @@
 #!/usr/bin/env bash
 # Evening orchestrator — fans out 11 sector evenings via the Python pipeline.
-# Called by trading-sector-evenings.timer at 20:00 AZ. Titan-evening was
-# decommissioned (energy + commodity supersede titan's scope).
+# Called by trading-sector-evenings.timer at 20:00 AZ.
 #
 # Cassidy is NOT fired from here anymore (was firing twice per evening —
 # once at 20:00 via this script's phase 2, again at 22:00 via its dedicated
@@ -28,7 +27,6 @@ CONCURRENCY="${EVENING_CONCURRENCY:-3}"
 SKILL_TIMEOUT_SEC="${SKILL_TIMEOUT_SEC:-1200}"
 
 PIPELINE_SECTORS=(atlas commodity energy fab fabless iron maya rex trump vera volt)
-# titan-evening decommissioned (superseded by energy + commodity).
 HARNESS_SKILLS=()
 
 log "phase 1a: ${#PIPELINE_SECTORS[@]} sector evenings via Python pipeline"

@@ -1,0 +1,40 @@
+# OCAP (out-of-control action plan) rules.
+#
+# On every 5-min bar close, analysis.indicators_ocap evaluates each enabled
+# rule against the latest indicators for every watchlisted symbol. If a rule
+# fires, an ocap_triggered_review job is enqueued (priority=5, ahead of
+# routine ticker_review and sector_summary) for every agent whose watchlist
+# contains that symbol.
+#
+# Coalescing: if a (agent, symbol) already has a queued/running OCAP job
+# whose enqueued_at is within `coalesce_window_s`, the new rule trigger is
+# appended to the existing job's `triggers_seen` JSONB instead of creating
+# a new row. Keeps storms of correlated breaches (e.g. SPY -3% morning)
+# from saturating the worker pool.
+
+coalesce_window_s: 60
+
+# Per-(symbol, rule) cooldown in seconds. Suppresses re-fires of the same
+# rule on the same symbol within this window — applied BEFORE per-(agent,
+# symbol) coalescing, so a 2σ breach on SPY at 14:00 won't refire on the
+# next 5-min bar at 14:05 even though the move is still printing. The
+# coalesce_window above is shorter-horizon (deduplicate this bar's storm);
+# this is the longer-horizon "you already woke the agents about this".
+# Set to 0 to disable.
+ocap_cooldown_s: 1800
+
+rules:
+  rolling_std_breach:
+    enabled: true
+    description: "Bar return exceeds ±k × rolling_std_20"
+    k: 2.0
+
+  bollinger_break:
+    enabled: true
+    description: "Close pierces the 20-bar / 2-sigma Bollinger band"
+
+  rsi_extreme:
+    enabled: true
+    description: "RSI_14 ≤ rsi_low or ≥ rsi_high"
+    rsi_low: 25
+    rsi_high: 75

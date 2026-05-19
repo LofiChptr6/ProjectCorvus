@@ -91,6 +91,25 @@ _RATE_LIMITS: dict[str, tuple[int, float]] = {
 _rate_calls: dict[str, list[float]] = {}
 
 
+def _err(message: str, code: str | None = None, **details) -> str:
+    """Standard MCP error envelope: returns a JSON string carrying
+    `{"error": <message>, "error_code": <code>, "details": {...}}`.
+
+    The `error` key is preserved as the human-readable summary so existing
+    callers reading `result["error"]` keep working. The optional
+    `error_code` classifies the failure ("validation", "rate_limit",
+    "permission", "internal", "not_found", "input", "external") so
+    downstream tooling and the LLM can route uniformly without parsing
+    free-form English.
+    """
+    payload: dict = {"error": message}
+    if code is not None:
+        payload["error_code"] = code
+    if details:
+        payload["details"] = details
+    return json.dumps(payload, default=str)
+
+
 def _rate_check(tool_name: str) -> tuple[bool, str]:
     """Return (allowed, reason). Records the call when allowed."""
     limit = _RATE_LIMITS.get(tool_name)
@@ -193,10 +212,10 @@ async def get_quote(symbol: str) -> str:
     await _ensure_init()
     ok, reason = _validate_symbol(symbol)
     if not ok:
-        return json.dumps({"error": f"validation: {reason}"})
+        return _err(f"validation: {reason}", code="validation")
     ok, reason = _rate_check("get_quote")
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
     from data.massive_client import get_quote as _get_quote
     return json.dumps(await _get_quote(symbol))
 
@@ -220,10 +239,10 @@ async def get_bars(
     await _ensure_init()
     ok, reason = _validate_symbol(symbol)
     if not ok:
-        return json.dumps({"error": f"validation: {reason}"})
+        return _err(f"validation: {reason}", code="validation")
     ok, reason = _rate_check("get_bars")
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
     from data.massive_client import get_bars as _get_bars
     return json.dumps(await _get_bars(symbol, bar_size, duration, what_to_show))
 
@@ -546,7 +565,7 @@ async def compute_technicals(symbol: str, indicators: list[str]) -> str:
     await _ensure_init()
     ok, reason = _validate_symbol(symbol)
     if not ok:
-        return json.dumps({"error": f"validation: {reason}"})
+        return _err(f"validation: {reason}", code="validation")
     from tools.analysis.compute_technicals import execute
     return await execute(symbol=symbol, indicators=indicators)
 
@@ -675,22 +694,69 @@ async def get_trade_blotter(
 
 @mcp.tool()
 async def get_kill_switch_status() -> str:
-    """Check whether the kill switch is active (globally or per agent)."""
+    """Check whether the kill switch is active (globally or per agent).
+
+    Semantics (post-2026-05 refactor):
+      - `global_kill`: when True, mike-allocator skips entirely (no rebalance,
+        no orders) and the order layer fails closed. Workers still run
+        sector reviews / OCAP-triggered reviews — agents publish convictions
+        as usual; mike just doesn't act on them.
+      - `per_agent` (pipeline sectors + mike): when True for sector X, mike
+        filters X's convictions out at the allocator load step
+        (`db.store.get_active_convictions`). X still analyzes and writes
+        convictions; X just doesn't influence orders. When True for `mike`,
+        the allocator itself skips.
+      - `non_pipeline_per_agent` (e.g. cassidy): kill state recorded but
+        inert — these agents don't participate in conviction publishing,
+        so their kill flag has no allocator-facing effect. Surfaced
+        separately so the UI doesn't suggest a control that does nothing.
+    """
     await _ensure_init_light()
     import db.store as store
+    from meta_agent.queue_primer import PIPELINE_SECTORS
     global_killed = await store.is_killed()
     from agent.agent_registry import list_agents
     agents = list_agents(enabled_only=False)
-    per_agent = {}
+    # Pipeline = the 11 sector agents that publish convictions + mike (the
+    # allocator). For these, per-agent kill changes desk behavior.
+    pipeline_set = set(PIPELINE_SECTORS) | {"mike"}
+    per_agent: dict[str, bool] = {}
+    non_pipeline_per_agent: dict[str, bool] = {}
     for a in agents:
-        per_agent[a["name"]] = await store.is_killed(agent_name=a["name"])
-    return json.dumps({"global_kill": global_killed, "per_agent": per_agent})
+        name = a["name"]
+        is_k = await store.is_killed(agent_name=name)
+        if name in pipeline_set:
+            per_agent[name] = is_k
+        else:
+            non_pipeline_per_agent[name] = is_k
+    return json.dumps({
+        "global_kill": global_killed,
+        "per_agent": per_agent,
+        "non_pipeline_per_agent": non_pipeline_per_agent,
+    })
 
 
 @mcp.tool()
 async def activate_kill_switch(reason: str, agent_name: Optional[str] = None) -> str:
     """
-    Activate the kill switch to halt trading.
+    Activate the kill switch.
+
+    Effect (post-2026-05 refactor): kill freezes the order flow, NOT the
+    analysis pipeline. Agents continue to run sector reviews and OCAP-fired
+    reviews; their convictions still write to `agent_conviction`. Mike's
+    allocator is what stops:
+      - `agent_name=None` (global) — mike-allocator's `_guard_skip` returns
+        early; no rebalance, no orders.
+      - `agent_name="mike"` — same effect; mike's own per-agent kill blocks
+        the allocator.
+      - `agent_name=<sector>` (atlas / energy / fab / ...) — that sector's
+        convictions get filtered out at mike's load step; sector's votes
+        are muted while it still analyzes.
+      - `agent_name=<non-pipeline>` (e.g. cassidy) — recorded but inert
+        (no allocator-facing effect).
+    Order layer (`risk/checks/kill_switch.py`) re-checks immediately before
+    IBKR submit, so a kill that fires during the approval window still
+    blocks the order.
 
     Args:
         reason: Why you are halting
@@ -772,6 +838,165 @@ async def get_market_status() -> str:
         "is_half_day": is_half_day,
         "next_open_et": next_open,
     })
+
+
+@mcp.tool()
+async def get_queue_health() -> str:
+    """Snapshot of the LLM-task queue. Reports counts by status, the oldest
+    queued job's age, recent throughput, and per-job-type breakdown so the
+    operator (or a sibling agent) can detect backlog before convictions
+    silently expire.
+
+    Returns: {
+      "by_status": {"queued": N, "running": N, ...},
+      "oldest_queued_age_s": float | null,
+      "queued_by_job_type": {"ticker_review": N, "sector_summary": N, ...},
+      "done_last_hour": int,
+      "failed_last_hour": int,
+      "skipped_last_hour": int,
+      "avg_duration_ms_last_hour": float | null,
+      "worker_ids_active": [str, ...]
+    }
+
+    Use when:
+      - Convictions look stale across multiple agents (check if queue is
+        backed up).
+      - Investigating why an OCAP-triggered review didn't land promptly.
+      - Capacity-planning: deciding whether to add more queue workers.
+    """
+    await _ensure_init_light()
+    from db.schema import get_pool
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        by_status_rows = await conn.fetch(
+            "SELECT status, COUNT(*) AS n FROM agent_job GROUP BY status"
+        )
+        oldest_queued = await conn.fetchval(
+            """SELECT EXTRACT(EPOCH FROM (NOW() - MIN(enqueued_at)))
+               FROM agent_job WHERE status='queued'"""
+        )
+        queued_by_type = await conn.fetch(
+            """SELECT job_type, COUNT(*) AS n FROM agent_job
+               WHERE status='queued' GROUP BY job_type"""
+        )
+        recent_window = await conn.fetch(
+            """SELECT status, COUNT(*) AS n,
+                      AVG(EXTRACT(EPOCH FROM (finished_at - started_at)) * 1000) AS avg_ms
+               FROM agent_job
+               WHERE finished_at > NOW() - INTERVAL '1 hour'
+               GROUP BY status"""
+        )
+        active_workers = await conn.fetch(
+            """SELECT DISTINCT worker_id FROM agent_job
+               WHERE status='running' AND worker_id IS NOT NULL"""
+        )
+
+    recent = {r["status"]: {"n": int(r["n"]),
+                            "avg_ms": float(r["avg_ms"]) if r["avg_ms"] else None}
+              for r in recent_window}
+    return json.dumps({
+        "by_status": {r["status"]: int(r["n"]) for r in by_status_rows},
+        "oldest_queued_age_s": float(oldest_queued) if oldest_queued else None,
+        "queued_by_job_type": {r["job_type"]: int(r["n"]) for r in queued_by_type},
+        "done_last_hour": recent.get("done", {}).get("n", 0),
+        "failed_last_hour": recent.get("failed", {}).get("n", 0),
+        "skipped_last_hour": recent.get("skipped", {}).get("n", 0),
+        "avg_duration_ms_last_hour": recent.get("done", {}).get("avg_ms"),
+        "worker_ids_active": [r["worker_id"] for r in active_workers],
+    })
+
+
+@mcp.tool()
+async def prime_sector_queues() -> str:
+    """Manually fire phase 1a of the hourly orchestrator — prime the LLM-task
+    queue with one sector_summary + N ticker_review job per sector agent.
+    Idempotent within the 1-hour coalesce window, so repeat calls are no-ops
+    on jobs already queued/running.
+
+    Same code path as the hourly cron (`meta_agent.queue_primer`). Workers
+    still gate execution on kill_switch and the AZ quiet window — priming
+    does NOT bypass any safety control. Use when you want the sector agents
+    to react to fresh data without waiting for the next hourly tick (e.g.
+    after a market event, after lifting kill_switch, after a watchlist
+    change).
+
+    Returns: {
+      "total_enqueued": int,
+      "total_coalesced": int,
+      "failed_agents": [agent, ...],
+      "duration_ms": int,
+      "per_agent": [
+        {"agent": str, "enqueued": int, "coalesced": int, "watchlist_size": int}
+        OR {"agent": str, "error": str},
+        ...
+      ],
+    }
+    """
+    await _ensure_init_light()
+    from meta_agent.queue_primer import prime_all_agent_queues
+    return json.dumps(await prime_all_agent_queues(), default=str)
+
+
+@mcp.tool()
+async def get_streamer_health() -> str:
+    """Health of the local market-data caches the streamer + daily ingestor
+    populate. Surfaces ingest lag so the operator notices if a daemon stalled.
+
+    Returns: {
+      "local_bars": {
+         "total_rows", "n_symbols", "newest_bar_time", "oldest_bar_time",
+         "newest_ingest_at", "newest_ingest_age_s"
+      },
+      "local_bars_daily": {
+         "total_rows", "n_symbols", "newest_bar_date", "newest_ingest_at",
+         "newest_ingest_age_s"
+      }
+    }
+
+    `newest_ingest_age_s` is the headline number: during RTH this should be
+    well under 300 (one streamer cycle). Outside RTH it grows naturally.
+    For local_bars_daily, expect ≤ 24h after each post-close ingest fire.
+    """
+    await _ensure_init_light()
+    from db.schema import get_pool
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        intraday = await conn.fetchrow(
+            """SELECT COUNT(*) AS total_rows,
+                      COUNT(DISTINCT symbol) AS n_symbols,
+                      MAX(bar_time) AS newest_bar_time,
+                      MIN(bar_time) AS oldest_bar_time,
+                      MAX(ingested_at) AS newest_ingest_at,
+                      EXTRACT(EPOCH FROM (NOW() - MAX(ingested_at))) AS newest_ingest_age_s
+               FROM local_bars"""
+        )
+        daily = await conn.fetchrow(
+            """SELECT COUNT(*) AS total_rows,
+                      COUNT(DISTINCT symbol) AS n_symbols,
+                      MAX(bar_date) AS newest_bar_date,
+                      MAX(ingested_at) AS newest_ingest_at,
+                      EXTRACT(EPOCH FROM (NOW() - MAX(ingested_at))) AS newest_ingest_age_s
+               FROM local_bars_daily"""
+        )
+    return json.dumps({
+        "local_bars": {
+            "total_rows": int(intraday["total_rows"] or 0),
+            "n_symbols": int(intraday["n_symbols"] or 0),
+            "newest_bar_time": intraday["newest_bar_time"],
+            "oldest_bar_time": intraday["oldest_bar_time"],
+            "newest_ingest_at": intraday["newest_ingest_at"],
+            "newest_ingest_age_s": float(intraday["newest_ingest_age_s"])
+                if intraday["newest_ingest_age_s"] is not None else None,
+        },
+        "local_bars_daily": {
+            "total_rows": int(daily["total_rows"] or 0),
+            "n_symbols": int(daily["n_symbols"] or 0),
+            "newest_bar_date": daily["newest_bar_date"],
+            "newest_ingest_at": daily["newest_ingest_at"],
+            "newest_ingest_age_s": float(daily["newest_ingest_age_s"])
+                if daily["newest_ingest_age_s"] is not None else None,
+        },
+    }, default=str)
 
 
 # ── Telegram / proposals ──────────────────────────────────────────────────────
@@ -1246,7 +1471,7 @@ async def get_all_journals(caller: str) -> str:
     """
     await _ensure_init_light()
     if caller != "mike":
-        return json.dumps({"error": "get_all_journals is mike-only", "journals": {}})
+        return json.dumps({"error": "get_all_journals is mike-only", "error_code": "permission", "journals": {}})
     from db import store
     return json.dumps({"journals": await store.get_all_open_theses()}, default=str)
 
@@ -1335,7 +1560,7 @@ async def list_open_tool_gaps(caller: str) -> str:
     """
     await _ensure_init_light()
     if caller != "mike":
-        return json.dumps({"error": "list_open_tool_gaps is mike-only", "gaps": []})
+        return json.dumps({"error": "list_open_tool_gaps is mike-only", "error_code": "permission", "gaps": []})
     from db import store
     return json.dumps({"gaps": await store.list_open_tool_gaps()}, default=str)
 
@@ -1359,7 +1584,7 @@ async def update_tool_gap_status(
     """
     await _ensure_init_light()
     if caller != "mike":
-        return json.dumps({"error": "update_tool_gap_status is mike-only", "updated": False})
+        return json.dumps({"error": "update_tool_gap_status is mike-only", "error_code": "permission", "updated": False})
     from db import store
     updated = await store.update_tool_gap_status(gap_id, status, mike_note)
     return json.dumps({"updated": updated})
@@ -1463,7 +1688,7 @@ async def generate_agent_chart(agent_name: str, date: Optional[str] = None) -> s
     )
     stdout, stderr = await proc.communicate()
     if proc.returncode != 0:
-        return json.dumps({"error": stderr.decode().strip()})
+        return _err(stderr.decode().strip())
     return json.dumps({"chart_path": stdout.decode().strip()})
 
 
@@ -1524,9 +1749,9 @@ async def generate_evening_slide(
             open_questions=list(open_questions or []),
         )
     except Exception as exc:
-        return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+        return _err(f"{type(exc).__name__}: {exc}", code="internal")
     if path is None:
-        return json.dumps({"error": "slide not produced (component charts missing)"})
+        return _err("slide not produced (component charts missing)")
     return json.dumps({"chart_path": str(path)})
 
 
@@ -1557,7 +1782,7 @@ async def generate_forecast_panel(agent_name: str) -> str:
     try:
         path = await render_forecast_panel(agent_name)
     except Exception as exc:
-        return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+        return _err(f"{type(exc).__name__}: {exc}", code="internal")
     if path is None:
         return json.dumps({"empty": True, "agent": agent_name})
     return json.dumps({"chart_path": str(path)})
@@ -1592,7 +1817,7 @@ async def generate_pnl_curve(
         else:
             path = await render_desk_curve(since=since)
     except Exception as exc:
-        return json.dumps({"error": f"{type(exc).__name__}: {exc}"})
+        return _err(f"{type(exc).__name__}: {exc}", code="internal")
     return json.dumps({"chart_path": str(path)})
 
 
@@ -1632,18 +1857,18 @@ async def compute_custom_indicator(
     # identifiers could load arbitrary Python from elsewhere on disk.
     _ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
     if not _ID_RE.match(agent_name or "") or not _ID_RE.match(model_name or ""):
-        return json.dumps({"error": "invalid agent_name or model_name (must match [a-z][a-z0-9_]{0,31})"})
+        return _err("invalid agent_name or model_name (must match [a-z][a-z0-9_]{0,31})", code="validation")
 
     module_path = Path("agents") / agent_name / "models" / f"{model_name}.py"
     try:
         agents_root = Path("agents").resolve()
         resolved = module_path.resolve()
         if agents_root not in resolved.parents:
-            return json.dumps({"error": "model path escapes agents/ tree"})
+            return _err("model path escapes agents/ tree")
     except (OSError, ValueError):
-        return json.dumps({"error": "invalid model path"})
+        return _err("invalid model path")
     if not module_path.exists():
-        return json.dumps({"error": f"model not found: {module_path}"})
+        return _err(f"model not found: {module_path}", code="not_found")
 
     bars_response = await _get_bars(symbol, bar_size, duration, "TRADES")
     # massive_client returns {symbol, bar_size, duration, bars: [...]}.
@@ -1667,7 +1892,7 @@ async def compute_custom_indicator(
         importlib.reload(module)  # pick up edits without restarting the server
         result = module.compute(symbol, bars, context)
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}", "model": model_name})
+        return _err(f"{type(e).__name__}: {e}", code="internal", model=model_name)
 
     return json.dumps({"model": model_name, "symbol": symbol, "result": result}, default=str)
 
@@ -1738,7 +1963,7 @@ async def compute_all_models(
 
     _ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
     if not _ID_RE.match(agent_name or ""):
-        return json.dumps({"error": "invalid agent_name (must match [a-z][a-z0-9_]{0,31})"})
+        return _err("invalid agent_name (must match [a-z][a-z0-9_]{0,31})", code="validation")
 
     bars_response = await _get_bars(symbol, bar_size, duration, "TRADES")
     bars = bars_response.get("bars", []) if isinstance(bars_response, dict) else bars_response
@@ -1783,23 +2008,26 @@ async def compute_all_models(
 # orders directly — see place_order's gate (Stage 3).
 
 _SECTOR_MAP_CACHE: Optional[dict] = None
-_SECTOR_MAP_MTIME: float = 0.0
+_SECTOR_MAP_CACHED_AT: float = 0.0
+_SECTOR_MAP_TTL_S: float = 30.0
 
 _INVERSE_MAP_CACHE: Optional[dict] = None
 _INVERSE_MAP_MTIME: float = 0.0
 
 
-def _load_sector_map() -> dict:
-    """Load agents/sector_map.yaml; cache by mtime so edits pick up without restart."""
-    global _SECTOR_MAP_CACHE, _SECTOR_MAP_MTIME
-    path = Path("agents") / "sector_map.yaml"
-    if not path.exists():
-        return {}
-    mtime = path.stat().st_mtime
-    if _SECTOR_MAP_CACHE is None or mtime != _SECTOR_MAP_MTIME:
-        with open(path, "r", encoding="utf-8") as f:
-            _SECTOR_MAP_CACHE = yaml.safe_load(f) or {}
-        _SECTOR_MAP_MTIME = mtime
+async def _load_sector_map() -> dict:
+    """Load the canonical sector map from agent_watchlist (SQL). Returns the
+    same shape sector_map.yaml exposed: {"agents": {<agent>: {"universe":
+    {<SYMBOL>: {"bearish_via": ...}}}}}. Cached 30s so hot callers (allocator
+    rebalance, conviction validation) don't hammer the DB."""
+    global _SECTOR_MAP_CACHE, _SECTOR_MAP_CACHED_AT
+    import time as _time
+    now = _time.time()
+    if _SECTOR_MAP_CACHE is not None and (now - _SECTOR_MAP_CACHED_AT) < _SECTOR_MAP_TTL_S:
+        return _SECTOR_MAP_CACHE
+    from db import store
+    _SECTOR_MAP_CACHE = await store.load_watchlist_as_sector_map()
+    _SECTOR_MAP_CACHED_AT = now
     return _SECTOR_MAP_CACHE
 
 
@@ -1846,32 +2074,29 @@ def _validate_rationale(rationale: str, max_len: int = 2048) -> tuple[bool, str]
     return True, ""
 
 
-def _agent_owns_symbol(agent_name: str, symbol: str) -> tuple[bool, str]:
+async def _agent_owns_symbol(agent_name: str, symbol: str) -> tuple[bool, str]:
     """Returns (allowed, reason). Mike may submit views on any symbol (tactical hedges).
-    Sector agents may submit on (a) any symbol in their universe or (b) any verified
+    Sector agents may submit on (a) any symbol in their watchlist or (b) any verified
     inverse ETF from agents/inverse_etf_map.yaml — the desk's NO-DIRECT-SHORTS policy
     routes bearish convictions through long-on-inverse, so the inverse catalog is
-    universe-agnostic."""
+    universe-agnostic. Canonical universe lives in the agent_watchlist table
+    (seeded once from sector_map.yaml; live edits via add_to_watchlist /
+    propose_watchlist_removal)."""
     if agent_name == "mike":
         return True, ""
     sym = symbol.upper()
     # CASH is a reserved pseudo-symbol — every agent may submit cash conviction.
     if sym == "CASH":
         return True, ""
-    smap = _load_sector_map()
-    agents = (smap or {}).get("agents") or {}
-    spec = agents.get(agent_name)
-    if spec is None:
-        return False, f"unknown agent: {agent_name}"
-    universe = spec.get("universe") or {}
-    if sym in {s.upper() for s in universe}:
+    from db import store
+    if await store.agent_owns_symbol_db(agent_name, sym):
         return True, ""
     inverse_map = _load_inverse_map() or {}
     inverses = inverse_map.get("inverses") or {}
     entry = inverses.get(sym) or inverses.get(symbol)
     if entry and entry.get("verified") is True:
         return True, ""
-    return False, f"{sym} is not in {agent_name}'s sector universe and not a verified inverse ETF (see agents/sector_map.yaml + agents/inverse_etf_map.yaml)"
+    return False, f"{sym} is not in {agent_name}'s watchlist and not a verified inverse ETF (see agent_watchlist table + agents/inverse_etf_map.yaml)"
 
 
 @mcp.tool()
@@ -1881,12 +2106,13 @@ async def submit_conviction_view(
     direction: str,
     conviction: float,
     rationale: str,
+    expires_in_hours: float,
     expected_return_pct: Optional[float] = None,
     time_to_target_days: Optional[int] = None,
     model_inputs: Optional[dict] = None,
-    expires_in_hours: int = 1,
     momentum_confirmed: Optional[bool] = None,
     stop_pct: Optional[float] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """
     Publish a signed conviction view on one symbol. Upserts on (agent_name, symbol)
@@ -1900,6 +2126,13 @@ async def submit_conviction_view(
                     Use your own forecast formula; Cassidy reviews calibration in evening.
         rationale: 1–2 sentence why (audit trail). For inverse-ETF symbols this is
                    what the user reads on the Telegram approval prompt — be concrete.
+        expires_in_hours: REQUIRED. Auto-expire after N hours. There is no default
+                          — you MUST pick a value matching your thesis horizon.
+                          Range: 0.0833 (5 minutes) to 720 (30 days).
+                          Sub-1 values are for scalp/intraday catalysts; <24 for
+                          single-session views; 24–168 for swing; 168–720 for
+                          multi-week regime calls. Off-hours expirations are
+                          no-ops (market_hours risk check blocks SELLs outside RTH).
         expected_return_pct: REQUIRED for direction != 'flat'. Your forecast as a
                              signed % move on this name (e.g. +8.5 = expect a 8.5%
                              rise; -6.0 = expect a 6% drop). Drives the evening
@@ -1908,13 +2141,6 @@ async def submit_conviction_view(
                              Your horizon in trading days. Sets the x-axis length
                              of the forecast line in your evening panel.
         model_inputs: Raw quant model output for replay (optional dict).
-        expires_in_hours: Auto-expire after N hours (default 1 — hour-to-hour
-                          reconciliation: if you don't re-publish in the next
-                          review cycle the position auto-closes). Override to
-                          18 for overnight holds, 72 for weekend, or longer for
-                          multi-day theses you've thought through. Off-hours
-                          expirations are no-ops (market_hours risk check blocks
-                          SELLs outside RTH).
         momentum_confirmed: For direction='long' on a verified inverse ETF, asserts
                             whether the underlying is already showing the bearish move
                             (True) vs. an early entry ahead of confirmation (False).
@@ -1930,15 +2156,15 @@ async def submit_conviction_view(
     await _ensure_init_light()
     ok, reason = _validate_symbol(symbol)
     if not ok:
-        return json.dumps({"error": f"validation: {reason}"})
+        return _err(f"validation: {reason}", code="validation")
     ok, reason = _validate_rationale(rationale)
     if not ok:
-        return json.dumps({"error": f"validation: {reason}"})
+        return _err(f"validation: {reason}", code="validation")
     ok, reason = _rate_check("submit_conviction_view")
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
     if symbol.upper() == "CASH" and direction != "long":
-        return json.dumps({"error": "CASH conviction must be direction='long' (cash reserve, not margin)"})
+        return _err("CASH conviction must be direction='long' (cash reserve, not margin)", code="validation")
     # Catch LLM-fabricated technical-indicator blobs slipping in as model_inputs
     # (the 2026-05-12 audit found 23/34 recent rows had keys no model emits).
     # Warn-only by default; the validator logs each hit to its dedicated log
@@ -1951,7 +2177,7 @@ async def submit_conviction_view(
         agent_name, model_inputs, symbol=symbol, direction=direction,
     )
     if not mi_ok and _mi_reject_mode():
-        return json.dumps({"error": f"model_inputs: {mi_reason}"})
+        return _err(f"model_inputs: {mi_reason}", code="validation")
     # Non-flat convictions MUST carry a forecast — without (expected_return_pct,
     # time_to_target_days) the evening forecast panel can't draw a line and
     # Mike's calibration tracker has nothing to score the call against. CASH
@@ -1959,12 +2185,12 @@ async def submit_conviction_view(
     # forecast metadata.
     if direction != "flat" and symbol.upper() != "CASH":
         if expected_return_pct is None:
-            return json.dumps({"error": "validation: expected_return_pct is required for direction != 'flat' (your forecast — % move you expect on this name)"})
+            return _err("validation: expected_return_pct is required for direction != 'flat' (your forecast — % move you expect on this name)")
         if time_to_target_days is None or int(time_to_target_days) <= 0:
-            return json.dumps({"error": "validation: time_to_target_days is required and must be > 0 for direction != 'flat' (your horizon in days)"})
-    allowed, reason = _agent_owns_symbol(agent_name, symbol)
+            return _err("validation: time_to_target_days is required and must be > 0 for direction != 'flat' (your horizon in days)")
+    allowed, reason = await _agent_owns_symbol(agent_name, symbol)
     if not allowed:
-        return json.dumps({"error": f"sector_map: {reason}"})
+        return _err(f"watchlist: {reason}", code="validation")
     from db import store
     try:
         view_id = await store.upsert_conviction(
@@ -1979,10 +2205,11 @@ async def submit_conviction_view(
             expires_in_hours=expires_in_hours,
             momentum_confirmed=momentum_confirmed,
             stop_pct=stop_pct,
+            session_id=session_id,
         )
         return json.dumps({"view_id": view_id, "symbol": symbol.upper(), "direction": direction})
     except (ValueError, AssertionError) as e:
-        return json.dumps({"error": f"validation: {e}"})
+        return _err(f"validation: {e}", code="validation")
 
 
 @mcp.tool()
@@ -1991,8 +2218,9 @@ async def submit_conviction_from_model(
     model_name: str,
     symbol: str,
     rationale: str,
-    expires_in_hours: int = 1,
+    expires_in_hours: float,
     momentum_confirmed: Optional[bool] = None,
+    session_id: Optional[str] = None,
 ) -> str:
     """
     Publish a conviction whose numeric fields come from running a server-side
@@ -2010,11 +2238,14 @@ async def submit_conviction_from_model(
     not a number).
 
     Args:
-        agent_name: Sector agent that owns the symbol per sector_map.yaml.
+        agent_name: Sector agent whose watchlist contains the symbol (agent_watchlist).
         model_name: File under agents/<agent_name>/models/ without .py.
         symbol: Ticker, will be uppercased.
         rationale: 1–2 sentence human gloss. The ONLY agent-authored content.
-        expires_in_hours: Auto-expire after N hours (default 1).
+        expires_in_hours: REQUIRED. Auto-expire after N hours; no default.
+                          Range: 0.0833 (5 min) to 720 (30 days). Pick to match
+                          your thesis horizon — a scalp and a swing should NOT
+                          get the same expiry.
         momentum_confirmed: Inverse-ETF longs only; see submit_conviction_view.
 
     Returns one of:
@@ -2028,27 +2259,27 @@ async def submit_conviction_from_model(
 
     _ID_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
     if not _ID_RE.match(agent_name or ""):
-        return json.dumps({"error": "invalid agent_name (must match [a-z][a-z0-9_]{0,31})"})
+        return _err("invalid agent_name (must match [a-z][a-z0-9_]{0,31})", code="validation")
     if not _ID_RE.match(model_name or ""):
-        return json.dumps({"error": "invalid model_name (must match [a-z][a-z0-9_]{0,31})"})
+        return _err("invalid model_name (must match [a-z][a-z0-9_]{0,31})", code="validation")
 
     ok, reason = _validate_symbol(symbol)
     if not ok:
-        return json.dumps({"error": f"validation: {reason}"})
+        return _err(f"validation: {reason}", code="validation")
     ok, reason = _validate_rationale(rationale)
     if not ok:
-        return json.dumps({"error": f"validation: {reason}"})
+        return _err(f"validation: {reason}", code="validation")
     ok, reason = _rate_check("submit_conviction_view")
     if not ok:
-        return json.dumps({"error": reason})
-    allowed, reason = _agent_owns_symbol(agent_name, symbol)
+        return _err(reason)
+    allowed, reason = await _agent_owns_symbol(agent_name, symbol)
     if not allowed:
-        return json.dumps({"error": f"sector_map: {reason}"})
+        return _err(f"watchlist: {reason}", code="validation")
 
     from meta_agent.conviction_from_model import compute_conviction_payload
     res = await compute_conviction_payload(agent_name, model_name, symbol)
     if res["status"] == "error":
-        return json.dumps({"error": res["error"]})
+        return _err(res["error"])
     if res["status"] == "skipped":
         return json.dumps({
             "skipped": True,
@@ -2072,9 +2303,12 @@ async def submit_conviction_from_model(
             expires_in_hours=expires_in_hours,
             momentum_confirmed=momentum_confirmed,
             stop_pct=payload["stop_pct"],
+            session_id=session_id,
+            forecast_run_id=payload.get("forecast_run_id"),
+            functional_name=payload.get("functional_name"),
         )
     except (ValueError, AssertionError) as exc:
-        return json.dumps({"error": f"validation: {exc}"})
+        return _err(f"validation: {exc}", code="validation")
 
     return json.dumps({
         "view_id": view_id,
@@ -2086,6 +2320,8 @@ async def submit_conviction_from_model(
         "stop_pct": payload["stop_pct"],
         "from_model": model_name,
         "model_version": res.get("model_version", "unset"),
+        "forecast_run_id": payload.get("forecast_run_id"),
+        "functional_name": payload.get("functional_name"),
     })
 
 
@@ -2107,35 +2343,45 @@ async def clear_my_views(agent_name: str) -> str:
 @mcp.tool()
 async def read_my_workspace(agent_name: str) -> str:
     """
-    Read the agent's workspace folder — `agents/<agent>/`. Returns a single
-    payload with three sections every hourly/evening review should consume
-    as context:
+    Read the agent's workspace — `agents/<agent>/` notes + data, plus the
+    SQL watchlist. Returns a single payload with three sections every
+    hourly/evening review should consume as context:
 
       - notes:     list of {filename, size, mtime, content} for every file
                    under agents/<agent>/notes/ (markdown freeform).
-      - watchlist: full text of agents/<agent>/watchlist.md — names the
-                   user or the agent has flagged as must-research this
-                   hour. Both can edit this file.
+      - watchlist: list of {symbol, bearish_via, source, added_at,
+                   added_reason, removal_pending} pulled from the
+                   agent_watchlist SQL table. The user or the agent can
+                   add via `add_to_watchlist`; removal goes through
+                   `propose_watchlist_removal` (Telegram approval).
       - data:      list of {filename, size, mtime} for every file under
                    agents/<agent>/data/ (saved snapshots / CSV exports).
                    Bodies omitted; agent reads specific data files via
                    the standard filesystem if needed.
 
     Call this at the start of every review so prior context (notes,
-    user-added watchlist entries, saved analyses) flows into your
-    analysis.
+    your current watchlist, saved analyses) flows into your analysis.
     """
     await _ensure_init_light()
     base = Path("agents") / agent_name
-    if not base.is_dir():
-        return json.dumps({"error": f"agents/{agent_name}/ does not exist"})
 
     notes_dir = base / "notes"
     data_dir = base / "data"
-    wl = base / "watchlist.md"
 
-    out: dict = {"agent_name": agent_name, "notes": [], "watchlist": "",
+    out: dict = {"agent_name": agent_name, "notes": [], "watchlist": [],
                  "data": []}
+
+    from db import store
+    try:
+        out["watchlist"] = await store.load_agent_watchlist(agent_name)
+    except Exception as e:
+        out["watchlist_error"] = f"{type(e).__name__}: {e}"
+
+    if not base.is_dir():
+        # The agent has no on-disk workspace yet, but the SQL watchlist is
+        # still meaningful — return what we have rather than 404'ing.
+        return json.dumps(out, default=str)
+
     if notes_dir.is_dir():
         for f in sorted(notes_dir.iterdir()):
             if not f.is_file() or f.suffix not in {".md", ".txt"}:
@@ -2151,11 +2397,6 @@ async def read_my_workspace(agent_name: str) -> str:
                 "content": body[:8000],   # cap each file to 8KB so the
                                           # combined payload stays reasonable
             })
-    if wl.is_file():
-        try:
-            out["watchlist"] = wl.read_text(encoding="utf-8")[:20000]
-        except Exception as e:
-            out["watchlist"] = f"(failed to read watchlist.md: {type(e).__name__}: {e})"
     if data_dir.is_dir():
         for f in sorted(data_dir.iterdir()):
             if not f.is_file():
@@ -2189,12 +2430,12 @@ async def write_my_note(
     """
     await _ensure_init_light()
     if "/" in filename or ".." in filename:
-        return json.dumps({"error": "filename must be a bare name; no path separators"})
+        return _err("filename must be a bare name; no path separators")
     if not filename.endswith((".md", ".txt")):
-        return json.dumps({"error": "filename must end in .md or .txt"})
+        return _err("filename must end in .md or .txt")
     base = Path("agents") / agent_name / "notes"
     if not base.is_dir():
-        return json.dumps({"error": f"agents/{agent_name}/notes/ does not exist"})
+        return _err(f"agents/{agent_name}/notes/ does not exist", code="not_found")
     path = base / filename
     if mode == "append" and path.exists():
         prior = path.read_text(encoding="utf-8")
@@ -2205,64 +2446,190 @@ async def write_my_note(
     return json.dumps({"path": str(path), "bytes": path.stat().st_size})
 
 
+async def _backfill_ticker_history(
+    symbol: str,
+    days_intraday: int = 14,
+    days_daily: int = 365,
+) -> dict:
+    """Pull historical OHLCV from Massive for a single symbol and UPSERT into
+    both local caches (local_bars 5-min, local_bars_daily). Idempotent —
+    repeat calls overwrite the same rows with the latest Massive aggregates.
+
+    Shared between the MCP tool `expand_ticker_history` and the auto-backfill
+    branch inside `add_to_watchlist`."""
+    from datetime import datetime, timezone
+    from data import massive_client
+    from db import store
+
+    sym = symbol.strip().upper()
+    started = datetime.now(timezone.utc)
+    result: dict = {"symbol": sym, "intraday_rows": 0, "daily_rows": 0,
+                    "errors": []}
+
+    # 5-min bars
+    if days_intraday > 0:
+        try:
+            data = await massive_client.get_bars(
+                sym, bar_size="5 mins", duration=f"{int(days_intraday)} D",
+            )
+            rows = []
+            for b in (data.get("bars") or []):
+                ts = b.get("t")
+                if not ts or b.get("o") is None or b.get("c") is None:
+                    continue
+                bt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if bt.tzinfo is None:
+                    bt = bt.replace(tzinfo=timezone.utc)
+                rows.append({
+                    "symbol": sym, "bar_time": bt, "interval": "5min",
+                    "open": b["o"], "high": b.get("h") or b["o"],
+                    "low": b.get("l") or b["o"], "close": b["c"],
+                    "volume": b.get("v") or 0.0,
+                })
+            result["intraday_rows"] = await store.upsert_local_bars(rows)
+        except Exception as e:
+            result["errors"].append(f"intraday: {type(e).__name__}: {e}")
+
+    # Daily bars
+    if days_daily > 0:
+        try:
+            data = await massive_client.get_bars(
+                sym, bar_size="1 day", duration=f"{int(days_daily)} D",
+            )
+            rows = []
+            for b in (data.get("bars") or []):
+                ts = b.get("t")
+                if not ts or b.get("o") is None or b.get("c") is None:
+                    continue
+                bt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if bt.tzinfo is None:
+                    bt = bt.replace(tzinfo=timezone.utc)
+                rows.append({
+                    "symbol": sym, "bar_date": bt.date(),
+                    "open": b["o"], "high": b.get("h") or b["o"],
+                    "low": b.get("l") or b["o"], "close": b["c"],
+                    "volume": b.get("v") or 0.0,
+                })
+            result["daily_rows"] = await store.upsert_local_bars_daily(rows)
+        except Exception as e:
+            result["errors"].append(f"daily: {type(e).__name__}: {e}")
+
+    result["duration_ms"] = int(
+        (datetime.now(timezone.utc) - started).total_seconds() * 1000
+    )
+    return result
+
+
+@mcp.tool()
+async def expand_ticker_history(
+    symbol: str,
+    days_intraday: int = 14,
+    days_daily: int = 365,
+) -> str:
+    """
+    Backfill local Postgres caches for one symbol so the dashboard and per-
+    ticker tools have history immediately — no waiting for the next streamer
+    cycle (5-min) or end-of-day daily ingest.
+
+    Fetches from Massive.com and UPSERTs into:
+      - `local_bars`        (5-min bars, default 14 days; matches retention)
+      - `local_bars_daily`  (daily bars, default 365 days; matches 1Y view)
+
+    Idempotent — repeat calls overwrite rows with the latest Massive numbers.
+    Call this if you've just added a ticker to your watchlist and want the
+    Live Trace chart to populate now, or to recover from a streamer gap.
+    `add_to_watchlist` calls this automatically when adding a brand-new
+    symbol that has no existing local bars, so manual invocation is rarely
+    needed.
+
+    Args:
+        symbol: Ticker, will be uppercased.
+        days_intraday: 5-min lookback in days (default 14; pass 0 to skip).
+        days_daily: Daily lookback in days (default 365; pass 0 to skip).
+
+    Returns: {"symbol", "intraday_rows", "daily_rows", "duration_ms",
+              "errors": [...]}.
+    """
+    await _ensure_init_light()
+    sym = symbol.strip().upper()
+    if not sym:
+        return _err("symbol is required")
+    if not os.environ.get("MASSIVE_API_KEY", "").strip():
+        return _err("MASSIVE_API_KEY missing — cannot fetch bars")
+    res = await _backfill_ticker_history(sym, days_intraday, days_daily)
+    return json.dumps(res, default=str)
+
+
 @mcp.tool()
 async def add_to_watchlist(agent_name: str, symbol: str, reason: str) -> str:
     """
-    Append a ticker to agents/<agent>/watchlist.md under the "Active"
-    heading with a short reason and today's date.
+    Insert a ticker into the agent_watchlist SQL table (or reactivate it
+    if it was previously soft-deleted). Auto-backfills local OHLCV caches
+    (`local_bars` 5-min, `local_bars_daily` 1Y) for brand-new symbols so
+    the Live Trace dashboard and per-ticker tools see history immediately.
 
-    Removing tickers from the watchlist requires user approval via Telegram
-    — call `propose_watchlist_removal` instead of editing the file
-    directly.
+    Removing tickers requires user approval via Telegram — call
+    `propose_watchlist_removal` instead of trying to delete directly.
 
     Args:
         agent_name: Your agent name.
-        symbol: Ticker to add (will be uppercased; ownership is NOT
-                validated against sector_map — the watchlist can include
-                anything you want to research).
+        symbol: Ticker to add (will be uppercased). Ownership is not
+                validated against sector_map — agents may track anything.
         reason: One short sentence on why this name needs attention.
     """
     await _ensure_init_light()
     sym = symbol.strip().upper()
     if not sym:
-        return json.dumps({"error": "symbol is required"})
+        return _err("symbol is required")
     if not (reason or "").strip():
-        return json.dumps({"error": "reason is required (≥1 sentence)"})
-    base = Path("agents") / agent_name
-    wl = base / "watchlist.md"
-    if not wl.is_file():
-        return json.dumps({"error": f"agents/{agent_name}/watchlist.md missing"})
-    text = wl.read_text(encoding="utf-8")
-    from datetime import datetime as _dt
-    today = _dt.now().date().isoformat()
-    new_line = f"- {sym} — {reason.strip()} | added {today}"
-    # Idempotent: don't add if a line for this symbol already exists in Active.
-    active_marker = "## Active"
-    if active_marker in text:
-        # Check if the symbol is already on the watchlist (any heading).
-        if any(line.lstrip("-").strip().startswith(sym + " ") or
-               line.lstrip("-").strip().startswith(sym + "—") or
-               line.lstrip("-").strip().startswith(sym + " —")
-               for line in text.splitlines()):
-            return json.dumps({
-                "skipped": True,
-                "reason": f"{sym} is already on the watchlist",
-            })
-        idx = text.index(active_marker) + len(active_marker)
-        # Insert the new line right after the heading + the blank line below
-        head = text[:idx]
-        rest = text[idx:]
-        # Find the first newline pair to insert after, otherwise just append
-        if "\n\n" in rest:
-            split_at = rest.index("\n\n") + 2
-            new_text = head + rest[:split_at] + new_line + "\n" + rest[split_at:]
-        else:
-            new_text = head + "\n" + new_line + rest
-    else:
-        # No "## Active" heading — append at end of file.
-        new_text = text.rstrip() + "\n\n" + new_line + "\n"
-    wl.write_text(new_text, encoding="utf-8")
-    return json.dumps({"added": True, "symbol": sym, "line": new_line})
+        return _err("reason is required (≥1 sentence)")
+    from db import store
+    try:
+        result = await store.add_watchlist_symbol(
+            agent_name=agent_name,
+            symbol=sym,
+            reason=reason.strip(),
+            source="agent_added",
+        )
+    except Exception as e:
+        return _err(f"{type(e).__name__}: {e}", code="internal")
+
+    # Bust the sector_map cache so the new symbol shows up immediately for
+    # downstream callers (conviction validation, allocator).
+    global _SECTOR_MAP_CACHE, _SECTOR_MAP_CACHED_AT
+    _SECTOR_MAP_CACHE = None
+    _SECTOR_MAP_CACHED_AT = 0.0
+
+    # Auto-backfill local OHLCV caches if this symbol isn't already on some
+    # other agent's active watchlist (no point re-fetching what the streamer
+    # is already polling). Best-effort: a Massive failure here doesn't roll
+    # back the watchlist insert — the streamer / daily ingest will fill it
+    # on the next cycle.
+    if os.environ.get("MASSIVE_API_KEY", "").strip():
+        try:
+            already_watched = await _already_watched_elsewhere(agent_name, sym)
+            if not already_watched:
+                bf = await _backfill_ticker_history(sym)
+                result["backfill"] = bf
+            else:
+                result["backfill"] = {"skipped": "already on another agent's watchlist"}
+        except Exception as e:
+            result["backfill"] = {"error": f"{type(e).__name__}: {e}"}
+
+    return json.dumps(result, default=str)
+
+
+async def _already_watched_elsewhere(agent_name: str, symbol: str) -> bool:
+    """Is this symbol active on some other agent's watchlist? If yes, the
+    streamer is already polling it — skip the backfill in add_to_watchlist."""
+    from db import store
+    grouped = await store.load_all_watchlists()
+    for a, rows in grouped.items():
+        if a == agent_name:
+            continue
+        if any(r["symbol"] == symbol for r in rows):
+            return True
+    return False
 
 
 @mcp.tool()
@@ -2272,38 +2639,35 @@ async def propose_watchlist_removal(
     reasoning: str,
 ) -> str:
     """
-    Propose removing a ticker from agents/<agent>/watchlist.md. Removal
+    Propose removing a ticker from the agent_watchlist SQL table. Removal
     requires user approval via Telegram — this tool creates a pending
-    proposal in the existing approval queue (kind="watchlist_removal").
+    proposal in the approval queue (kind="watchlist_removal") and stamps
+    the row's `removal_pending` field with the proposal id.
 
     The user sees a Telegram message with the ticker + your reasoning;
-    they reply `/y` to approve or `/n` to reject. On approval, the line
-    is moved from "## Active" to "## Removed (audit trail)" with the
-    approval timestamp on the next hourly/evening review.
+    they reply `/y` to approve or `/n` to reject. On approval, the SQL
+    row is soft-deleted (removed_at + removed_reason set) the next time
+    any watchlist loader runs — usually within seconds.
 
     Args:
         agent_name: Your agent name.
         symbol: Ticker to remove (will be uppercased).
         reasoning: WHY this name should drop off the watchlist. The user
-                   reads this reasoning to decide; be concrete.
+                   reads this reasoning to decide; be concrete (≥30 chars).
     """
     await _ensure_init_light()
     sym = symbol.strip().upper()
     if not sym:
-        return json.dumps({"error": "symbol is required"})
+        return _err("symbol is required")
     if not (reasoning or "").strip() or len((reasoning or "").strip()) < 30:
         return json.dumps({
             "error": "reasoning must be ≥30 chars — explain why this name "
                      "should drop off the watchlist",
         })
-    base = Path("agents") / agent_name
-    wl = base / "watchlist.md"
-    if not wl.is_file():
-        return json.dumps({"error": f"agents/{agent_name}/watchlist.md missing"})
-    text = wl.read_text(encoding="utf-8")
-    if sym not in text:
+    from db import store
+    if not await store.agent_owns_symbol_db(agent_name, sym):
         return json.dumps({
-            "error": f"{sym} not found in watchlist; nothing to remove",
+            "error": f"{sym} is not on {agent_name}'s active watchlist; nothing to remove",
         })
 
     from approval import proposals
@@ -2321,6 +2685,7 @@ async def propose_watchlist_removal(
             "reasoning": reasoning.strip(),
         },
     )
+    await store.mark_watchlist_removal_pending(agent_name, sym, proposal["id"])
     return json.dumps({
         "proposal_id": proposal["id"][:8],
         "status": proposal.get("status", "pending"),
@@ -2333,21 +2698,19 @@ async def propose_watchlist_removal(
 async def submit_forecast_batch(
     agent_name: str,
     forecasts: list,
-    expires_in_hours: int = 2,
 ) -> str:
     """
     Publish a batch of forecast rows on names from your sector universe.
     Forecasts are PROOF-OF-WORK — show your thinking across ≥20 names per
     hour, regardless of whether you take a conviction. Allocator does NOT
-    read this table; convictions remain the trade signal.
+    directly read this table for scalar trades; convictions remain that signal.
+    However, rows carrying a `distribution` payload feed the allocator's
+    mixture-then-functional path (Phase E onward) and the calibration scorer.
 
-    MULTI-HORIZON: Each symbol should appear up to 4 times with different
-    time_to_target_days — one row per horizon. The horizon is auto-derived:
-      intraday: time_to_target_days = 1      (≤ 1 trading day)
-      near:     time_to_target_days = 3–5    (2–5 days)
-      far:      time_to_target_days = 10–30  (6–30 days)
-      cycle:    time_to_target_days = 60–90  (31+ days)
-    The same symbol at different time horizons becomes 4 independent DB rows,
+    MULTI-HORIZON: Each symbol may appear in multiple rows under different
+    horizons. The horizon enum is now:
+      5m | 1h | intraday | near | far | cycle
+    The same symbol at different time horizons becomes independent DB rows,
     allowing you to express "bullish next hour, neutral next week, bearish
     next quarter" cleanly without conflict.
 
@@ -2356,8 +2719,7 @@ async def submit_forecast_batch(
         forecasts: list of dicts, each carrying:
             symbol               (required) — must be in your sector universe.
             expected_return_pct  (required) — signed % move you forecast at
-                                  this specific horizon (e.g. +2.5 for intraday,
-                                  +8.0 for far). May differ across horizons.
+                                  this specific horizon. May differ across horizons.
             likelihood           (required) — probability of hitting target, 0..1.
             time_to_target_days  (required) — horizon in days, > 0. Drives
                                   automatic horizon bucket assignment.
@@ -2366,11 +2728,27 @@ async def submit_forecast_batch(
                                   "sentiment + macro". May differ per horizon.
             rationale            (optional) — one-line note.
             horizon              (optional) — override auto-derived bucket;
-                                  one of: intraday, near, far, cycle.
-        expires_in_hours: Auto-expire after N hours (default 2). Re-submit
-            each hourly review with `clear_my_forecasts` (or
-            `clear_my_forecasts(horizon='intraday')` to preserve slower-
-            moving far/cycle views).
+                                  one of: 5m, 1h, intraday, near, far, cycle.
+            distribution         (optional) — full probabilistic forecast payload
+                                  (closed schema, see
+                                  meta_agent/distribution_validator.py:
+                                  anchor_price, anchor_ts, axis, horizon, bins,
+                                  model, model_version). Validated server-side:
+                                  3–20 uniform-spaced bins with p≥1e-4 summing
+                                  to 1. Required if you want this row scored by
+                                  the calibration loop / consumed by the
+                                  conviction-functional pipe.
+            forecast_run_id      (optional) — UUID joining rows from the same
+                                  model run; populated automatically when
+                                  submit_conviction_from_model emits a
+                                  multi-horizon batch.
+            expires_in_hours     (REQUIRED, per row) — auto-expire after N
+                                  hours. Range: 0.0833 (5 min) to 720
+                                  (30 days). Pick to match the horizon: a
+                                  5m forecast might carry 0.25h, a cycle
+                                  forecast 168h. No default — each row must
+                                  specify. Re-submit at each hourly review
+                                  with `clear_my_forecasts` to refresh.
 
     Returns: {inserted, skipped_validation, ownership_errors, soft_warning}.
     Soft-warns when unique_symbols < 20 — submission still succeeds.
@@ -2378,9 +2756,9 @@ async def submit_forecast_batch(
     await _ensure_init_light()
     ok, reason = _rate_check("submit_forecast_batch")
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
     if not isinstance(forecasts, list) or not forecasts:
-        return json.dumps({"error": "forecasts must be a non-empty list of dicts"})
+        return _err("forecasts must be a non-empty list of dicts")
 
     # Universe enforcement up front so the agent gets a clean rejection list
     # rather than partial inserts followed by surprise drops.
@@ -2395,9 +2773,9 @@ async def submit_forecast_batch(
         if not ok_sym:
             ownership_errors.append({"row": r, "error": f"validation: {reason}"})
             continue
-        allowed, reason = _agent_owns_symbol(agent_name, str(sym))
+        allowed, reason = await _agent_owns_symbol(agent_name, str(sym))
         if not allowed:
-            ownership_errors.append({"row": r, "error": f"sector_map: {reason}"})
+            ownership_errors.append({"row": r, "error": f"watchlist: {reason}"})
             continue
         cleaned.append(r)
 
@@ -2406,10 +2784,9 @@ async def submit_forecast_batch(
         result = await store.upsert_forecasts_batch(
             agent_name=agent_name,
             rows=cleaned,
-            expires_in_hours=expires_in_hours,
         )
     except Exception as e:
-        return json.dumps({"error": f"{type(e).__name__}: {e}"})
+        return _err(f"{type(e).__name__}: {e}", code="internal")
 
     unique_symbols = len({(r.get("symbol") or "").upper() for r in cleaned})
     payload = {
@@ -2427,15 +2804,17 @@ async def submit_forecast_batch(
 @mcp.tool()
 async def clear_my_forecasts(agent_name: str, horizon: str = "") -> str:
     """
-    Drop this agent's forecast rows. Call at the start of each hourly review
-    (before submit_forecast_batch) so the new batch fully replaces the prior
-    hour's slate.
+    Retract this agent's currently-active forecast rows by soft-deleting them
+    (sets expires_at = NOW()). Rows stay on disk so the calibration scorer can
+    still grade an already-passed forecast you've retracted. Call at the start
+    of each hourly review (before submit_forecast_batch) so the new batch fully
+    replaces the prior hour's slate.
 
     Args:
         agent_name: Your agent name.
-        horizon: Optional — clear only this horizon ('intraday', 'near', 'far',
-                 'cycle'). Leave empty to clear all horizons. Use
-                 horizon='intraday' when you want to preserve your weekly
+        horizon: Optional — clear only this horizon ('5m', '1h', 'intraday',
+                 'near', 'far', 'cycle'). Leave empty to clear all horizons.
+                 Use horizon='intraday' when you want to preserve your weekly
                  cycle forecasts while refreshing short-term views.
     """
     await _ensure_init_light()
@@ -2495,7 +2874,7 @@ async def get_consolidated_view(caller: str = "") -> str:
     """
     await _ensure_init_light()
     if caller != "mike":
-        return json.dumps({"error": "get_consolidated_view is mike-only", "view": {}})
+        return json.dumps({"error": "get_consolidated_view is mike-only", "error_code": "permission", "view": {}})
     from db import store
     view = await store.get_consolidated_view()
     return json.dumps({"view": view}, default=str)
@@ -2530,15 +2909,16 @@ async def rebalance_desk(
     """
     await _ensure_init_light()
     if caller != "mike":
-        return json.dumps({"error": "rebalance_desk is mike-only"})
+        return _err("rebalance_desk is mike-only")
     ok, reason = _rate_check("rebalance_desk")
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
 
     from db import store
     from meta_agent.allocator import (
         ConvictionView, compute_target_weights, diff_to_orders, net_inverse_pairs,
         classify_inverse_order_gate, apply_safety_brakes,
+        enrich_views_with_mixture, use_mixture_enabled,
     )
     from data.massive_client import get_quote as _get_quote
     from ibkr.account import get_account_summary
@@ -2600,6 +2980,22 @@ async def rebalance_desk(
         )
         for r in rows
     ]
+
+    # Phase-E flag-gated mixture path. When ALLOC_USE_MIXTURE=1, symbols with
+    # active distributions in agent_forecast get their per-agent scalar votes
+    # replaced with mixture-derived rows (one per contributor) summing to the
+    # functional-applied scalar. Symbols without distributions stay on the
+    # legacy scalar-sum path. mixture_report captures both for A/B logging.
+    mixture_report: dict[str, dict] = {}
+    if use_mixture_enabled():
+        try:
+            views, mixture_report = await enrich_views_with_mixture(
+                views, influence_weights=influence_weights or {},
+            )
+        except Exception as exc:
+            # Fail-open: any mixer failure falls back to scalar-sum so the desk
+            # keeps trading. The error is surfaced in the response payload.
+            mixture_report = {"_error": f"{type(exc).__name__}: {exc}"}
 
     tw = compute_target_weights(
         views,
@@ -2680,7 +3076,7 @@ async def rebalance_desk(
     # CASH is not present in tw.weights (compute_target_weights pops it); guard
     # anyway so any future pseudo-symbols don't try to fetch quotes or orders.
     needed_symbols = set(s for s in current_positions.keys() if s != "CASH")
-    sector_map = _load_sector_map()
+    sector_map = await _load_sector_map()
     from meta_agent.allocator import resolve_bearish_vehicle
     skipped_views: list[dict] = []
     for sym, w in tw.weights.items():
@@ -2698,7 +3094,7 @@ async def rebalance_desk(
             skipped_views.append({
                 "symbol": sym,
                 "weight": w,
-                "reason": "no inverse-ETF mapping in sector_map.yaml; desk policy prohibits direct shorts",
+                "reason": "no inverse-ETF mapping (agent_watchlist.bearish_via); desk policy prohibits direct shorts",
                 "contributors": [{"agent": a, "weight": cw} for (a, cw) in tw.contributors.get(sym, [])],
             })
 
@@ -2987,6 +3383,8 @@ async def rebalance_desk(
             "pending_inverse_approvals": pending_inverse_approvals_dump,
             "netted_pairs": netted_pairs_dump,
             "stop_pct_brakes_fired": brake_log,
+            "mixture_path_enabled": use_mixture_enabled(),
+            "mixture_report": mixture_report,
         })
 
     # Live mode: place orders. The IBKR daemon's _on_fill callback writes
@@ -3044,6 +3442,8 @@ async def rebalance_desk(
         "netted_pairs": netted_pairs_dump,
         "stop_pct_brakes_fired": brake_log,
         "agent_state": agent_state_summary,
+        "mixture_path_enabled": use_mixture_enabled(),
+        "mixture_report": mixture_report,
     }, default=str)
 
 
@@ -3337,7 +3737,7 @@ async def get_thread_posts(
     await _ensure_init_light()
     ok, reason = _rate_check("get_thread_posts")
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
     from db import store
     rows = await store.get_posts(
         thread_slug=thread_slug, limit=limit, before_id=before_id,
@@ -3374,10 +3774,10 @@ async def post_to_thread(
     await _ensure_init_light()
     ok, reason = _rate_check("post_to_thread")
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
     ok, reason = _validate_rationale(body, max_len=8000)
     if not ok:
-        return json.dumps({"error": f"validation: {reason}"})
+        return _err(f"validation: {reason}", code="validation")
     author_kind = _derive_author_kind(author)
     from db import store
     try:
@@ -3387,7 +3787,7 @@ async def post_to_thread(
             parent_post_id=parent_post_id, expires_in_hours=expires_in_hours,
         )
     except ValueError as e:
-        return json.dumps({"error": f"validation: {e}"})
+        return _err(f"validation: {e}", code="validation")
     return json.dumps({
         "post_id": post_id, "thread_slug": thread_slug,
         "author": author, "author_kind": author_kind,
@@ -3413,7 +3813,7 @@ async def create_thread(
     """
     await _ensure_init_light()
     if not slug or not title:
-        return json.dumps({"error": "slug and title are required"})
+        return _err("slug and title are required")
     from db import store
     thread_id = await store.create_thread(
         slug=slug, title=title, description=description, tags=tags or [],
@@ -3440,7 +3840,7 @@ async def search_posts(
     await _ensure_init_light()
     ok, reason = _rate_check("search_posts")
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
     from db import store
     rows = await store.search_posts(
         query=query, thread_slug=thread_slug, author=author, limit=limit,
@@ -3460,7 +3860,7 @@ async def get_trading_briefing() -> str:
     await _ensure_init()
     ok, reason = _rate_check("get_trading_briefing")
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
 
     from datetime import datetime
     from ibkr.account import get_account_summary, get_positions as _get_positions
@@ -3644,7 +4044,7 @@ async def get_position_dossier(symbol: str) -> str:
     await _ensure_init_light()
     ok, reason = _validate_symbol(symbol)
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
     import db.store as store
     from reporting.agent_pnl import get_symbol_unrealized
     sym = symbol.upper()
@@ -3944,7 +4344,7 @@ async def get_position_history(symbol: str, lookback_days: int = 30) -> str:
     await _ensure_init_light()
     ok, reason = _validate_symbol(symbol)
     if not ok:
-        return json.dumps({"error": reason})
+        return _err(reason)
     import db.store as store
     from reporting.agent_pnl import get_symbol_unrealized
     sym = symbol.upper()

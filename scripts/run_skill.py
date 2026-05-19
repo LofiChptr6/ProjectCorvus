@@ -62,9 +62,16 @@ async def _amain(agent: str, skill_type: str, dev_mode: bool, dry_run: bool) -> 
     skill_name = f"{agent}-{skill_type.replace('_', '-')}"
     _setup_logging(skill_name)
     log = logging.getLogger("run_skill")
-    log.info("starting agent=%s skill=%s dev=%s dry_run=%s", agent, skill_type, dev_mode, dry_run)
+    # JOB_ID is set by the queue worker (scripts/run_queue_worker.py) when
+    # this skill is spawned in response to a queued agent_job row. Lets the
+    # bundler render "you were woken by OCAP on SPY at 14:32 (rules: ...)".
+    job_id_env = os.environ.get("JOB_ID")
+    job_id = int(job_id_env) if job_id_env and job_id_env.isdigit() else None
+    log.info("starting agent=%s skill=%s dev=%s dry_run=%s job_id=%s",
+             agent, skill_type, dev_mode, dry_run, job_id)
     try:
-        result = await run_skill(agent, skill_type, dev_mode=dev_mode, dry_run=dry_run)
+        result = await run_skill(agent, skill_type, dev_mode=dev_mode,
+                                 dry_run=dry_run, job_id=job_id)
     except Exception as exc:
         log.exception("pipeline failed")
         sys.stderr.write(f"FAIL: {type(exc).__name__}: {exc}\n")

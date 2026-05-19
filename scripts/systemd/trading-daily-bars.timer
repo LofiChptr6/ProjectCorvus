@@ -1,0 +1,12 @@
+[Unit]
+Description=Run trading-daily-bars.service once per trading day after close
+
+[Timer]
+# 17:30 ET = 21:30 UTC standard / 22:30 UTC daylight. Use the local
+# America/New_York calendar so DST shifts handle themselves.
+OnCalendar=Mon..Fri 17:30 America/New_York
+Persistent=true
+Unit=trading-daily-bars.service
+
+[Install]
+WantedBy=timers.target

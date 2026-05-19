@@ -14,7 +14,7 @@ raise/approve changes without waiting for a scheduled run.
   language (plus the existing `y`/`n` fast path and inline-button taps)
 - Bulk-action every pending proposal at once (*"drop all pending approvals"*)
 - Raise new `propose_strategic_change` proposals on your behalf — e.g. *"pause
-  titan for tomorrow, VIX is too low"* — and ping you to confirm
+  energy for tomorrow, OPEC headline risk"* — and ping you to confirm
 - Re-nudge stale proposals every 60 s while it's running
 
 ## What it CANNOT do

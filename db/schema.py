@@ -137,6 +137,11 @@ SCHEMA_STATEMENTS = [
     "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS sentiment TEXT",
     "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS channels TEXT[]",
     "ALTER TABLE news_items ADD COLUMN IF NOT EXISTS published_at TIMESTAMPTZ",
+    # Speeds up `get_active_convictions` per-agent kill filter — its NOT
+    # EXISTS subquery looks up the latest active kill row per agent. Partial
+    # index on is_active=1 keeps it small (typical kill_switch table has 1-2
+    # active rows out of hundreds of lifetime events).
+    "CREATE INDEX IF NOT EXISTS idx_kill_switch_agent_active ON kill_switch (agent_name, id DESC) WHERE is_active = 1",
     # Dedup on Massive's article_id so the news ingestor can ON CONFLICT DO NOTHING.
     "CREATE UNIQUE INDEX IF NOT EXISTS news_items_article_id_uniq ON news_items (article_id) WHERE article_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS news_items_symbol_published_idx ON news_items (symbol, published_at DESC NULLS LAST)",
@@ -276,6 +281,12 @@ SCHEMA_STATEMENTS = [
     # or long↔short); preserved across upserts when direction is unchanged. So
     # `NOW() - first_held_since` gives "days I've been committed to this view."
     "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS first_held_since TIMESTAMPTZ",
+    # Originating audit_log session_id stamped at submit time so the Live Trace
+    # fill-context panel (and any future click-conviction → session view) can
+    # join directly instead of guessing via timestamp heuristic. NULL on rows
+    # written before this column existed.
+    "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS session_id TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_conv_session ON agent_conviction (session_id) WHERE session_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_conv_active ON agent_conviction (expires_at) WHERE conviction > 0",
     "CREATE INDEX IF NOT EXISTS idx_conv_symbol ON agent_conviction (symbol, expires_at)",
     # Forecast rows — proof-of-work research. Each agent publishes ≥20 rows per
@@ -325,6 +336,50 @@ END $$""",
     "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMPTZ",
     "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS resolution_source TEXT",
     "CREATE INDEX IF NOT EXISTS idx_forecast_unresolved ON agent_forecast (submitted_at, time_to_target_days) WHERE resolved_at IS NULL",
+    # ─────────────────────────────────────────────────────────────────────
+    # Probabilistic-forecast surface. `distribution` is the full discrete
+    # belief produced by a quant model: closed schema with anchor_price,
+    # anchor_ts (UTC ISO), axis ('return_pct'|'log_return'), bins (list of
+    # {x, p} pairs sorted by x with uniform spacing, p≥1e-4, sum≈1), model,
+    # model_version. NULL on legacy scalar-only forecast rows.
+    # `forecast_run_id` joins to the scalar conviction in agent_conviction
+    # produced from the same model run (stamped by conviction_from_model.py).
+    # score_* columns are filled by the resolver-scorer once outcome lands.
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS distribution     JSONB",
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS forecast_run_id  UUID",
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS score_logloss    NUMERIC",
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS score_brier      NUMERIC",
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS score_crps       NUMERIC",
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS score_pinball05  NUMERIC",
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS score_pinball95  NUMERIC",
+    "ALTER TABLE agent_forecast ADD COLUMN IF NOT EXISTS realized_bin_idx INTEGER",
+    "CREATE INDEX IF NOT EXISTS idx_forecast_run ON agent_forecast (forecast_run_id) WHERE forecast_run_id IS NOT NULL",
+    # Allow 5m/1h short-horizon rows alongside the existing intraday/near/far/cycle
+    # buckets. No DDL change needed — the enum lives in the application layer (see
+    # db/store.py _derive_horizon and submit_forecast_batch validation).
+    # ─────────────────────────────────────────────────────────────────────
+    # Conviction ↔ forecast join. The scalar conviction the allocator trades on
+    # may be derived from a multi-horizon distribution; forecast_run_id pairs
+    # them, functional_name records which conviction functional collapsed the
+    # distribution into the scalar.
+    "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS forecast_run_id UUID",
+    "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS functional_name TEXT",
+    "CREATE INDEX IF NOT EXISTS idx_conv_run ON agent_conviction (forecast_run_id) WHERE forecast_run_id IS NOT NULL",
+    # ─────────────────────────────────────────────────────────────────────
+    # Precomputed news features per symbol. Persisted hourly so models don't
+    # rescan news_items every call (10 agents × ~30 symbols × hourly = too many
+    # full table scans). Window keyed so a model can pull "last 4h" or "last
+    # 24h" cheaply. payload schema: {count_earnings, count_macro, count_guidance,
+    # count_mna, recency_weighted_sentiment, time_since_last_high_importance_min,
+    # max_importance_score}.
+    """CREATE TABLE IF NOT EXISTS news_features (
+        symbol           TEXT NOT NULL,
+        window_minutes   INTEGER NOT NULL,
+        snapshot_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        payload          JSONB NOT NULL,
+        PRIMARY KEY (symbol, window_minutes, snapshot_at)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_news_features_recent ON news_features (symbol, window_minutes, snapshot_at DESC)",
     # Mike's allocator decisions — one row per rebalance run.
     """CREATE TABLE IF NOT EXISTS allocation_decision (
         id                       BIGSERIAL PRIMARY KEY,
@@ -579,6 +634,131 @@ END $$""",
     )""",
     "CREATE INDEX IF NOT EXISTS idx_telegram_message_kind_id ON telegram_message (kind, id DESC)",
     "CREATE INDEX IF NOT EXISTS idx_telegram_message_chat_id_id ON telegram_message (chat_id, id DESC)",
+    # ─────────────────────────────────────────────────────────────────────
+    # Watchlist — replaces agents/sector_map.yaml as the canonical universe.
+    # Duplicates across agents are allowed: e.g. gold may live in both atlas
+    # and commodity. Within one agent, (agent_name, symbol) is unique.
+    # `bearish_via` carries the same metadata sector_map.yaml does (used by
+    # the allocator's resolve_bearish_vehicle for inverse-ETF routing).
+    # `source` distinguishes seed rows (mirrored from YAML at first boot)
+    # from agent/user additions, so we can tell what was hand-curated.
+    # Soft-delete: `removed_at` keeps the row for audit but excludes it
+    # from active universe queries. `removal_pending` carries the approval
+    # proposal_id while the user is being asked to confirm removal.
+    """CREATE TABLE IF NOT EXISTS agent_watchlist (
+        id              BIGSERIAL PRIMARY KEY,
+        agent_name      TEXT NOT NULL,
+        symbol          TEXT NOT NULL,
+        bearish_via     TEXT,
+        source          TEXT NOT NULL DEFAULT 'seed',
+        added_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        added_reason    TEXT,
+        removal_pending TEXT,
+        removed_at      TIMESTAMPTZ,
+        removed_reason  TEXT,
+        UNIQUE (agent_name, symbol)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_agent_watchlist_active ON agent_watchlist (agent_name) WHERE removed_at IS NULL",
+    "CREATE INDEX IF NOT EXISTS idx_agent_watchlist_symbol ON agent_watchlist (symbol) WHERE removed_at IS NULL",
+    # ─────────────────────────────────────────────────────────────────────
+    # Local OHLCV bar cache — populated by scripts/stream_bars.py every 5
+    # min during RTH for the union of watchlist symbols + currently-held
+    # positions. ~14-day rolling retention pruned by the streamer; longer
+    # ranges fall through to data.massive_client.get_bars(). IBKR is
+    # never consulted for data (see DESK_POLICY §7).
+    """CREATE TABLE IF NOT EXISTS local_bars (
+        symbol      TEXT NOT NULL,
+        bar_time    TIMESTAMPTZ NOT NULL,
+        interval    TEXT NOT NULL,
+        open        DOUBLE PRECISION NOT NULL,
+        high        DOUBLE PRECISION NOT NULL,
+        low         DOUBLE PRECISION NOT NULL,
+        close       DOUBLE PRECISION NOT NULL,
+        volume      DOUBLE PRECISION NOT NULL,
+        ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (symbol, interval, bar_time)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_local_bars_recent ON local_bars (symbol, bar_time DESC)",
+    # ─────────────────────────────────────────────────────────────────────
+    # Daily OHLCV cache for the longer-horizon dashboard view (1Y per ticker).
+    # 1 row per (symbol, trading day). Populated by scripts/ingest_daily_bars.py
+    # once per day after RTH close; backfill on first run loads 365 days.
+    # Lives alongside local_bars (5-min, 2-week intraday cache) — different
+    # use case, different retention.
+    """CREATE TABLE IF NOT EXISTS local_bars_daily (
+        symbol      TEXT NOT NULL,
+        bar_date    DATE NOT NULL,
+        open        DOUBLE PRECISION NOT NULL,
+        high        DOUBLE PRECISION NOT NULL,
+        low         DOUBLE PRECISION NOT NULL,
+        close       DOUBLE PRECISION NOT NULL,
+        volume      DOUBLE PRECISION NOT NULL,
+        ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (symbol, bar_date)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_local_bars_daily_recent ON local_bars_daily (symbol, bar_date DESC)",
+    # ─────────────────────────────────────────────────────────────────────
+    # Latest indicator snapshot per bar — written by analysis.indicators_ocap
+    # on every streamer cycle. One row per bar (symbol, bar_time). Drives the
+    # OCAP rule evaluator that wakes agents on statistical exceptions.
+    """CREATE TABLE IF NOT EXISTS local_bar_indicators (
+        symbol              TEXT NOT NULL,
+        bar_time            TIMESTAMPTZ NOT NULL,
+        rsi_14              DOUBLE PRECISION,
+        sma_20              DOUBLE PRECISION,
+        bb_upper            DOUBLE PRECISION,
+        bb_lower            DOUBLE PRECISION,
+        rolling_std_20      DOUBLE PRECISION,
+        rolling_return_1bar DOUBLE PRECISION,
+        PRIMARY KEY (symbol, bar_time)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_indicators_recent ON local_bar_indicators (symbol, bar_time DESC)",
+    # ─────────────────────────────────────────────────────────────────────
+    # Durable LLM-task queue. Replaces the asyncio.Semaphore(4) one-shot
+    # orchestrator fan-out. Workers (scripts/run_queue_worker.py) pull jobs
+    # ordered by (priority asc, enqueued_at asc) via SELECT FOR UPDATE
+    # SKIP LOCKED. Priority lanes: 5=OCAP-triggered (preempts), 10=routine
+    # ticker_review, 20=sector_summary. Gate checks (kill_switch, quiet
+    # window) are done at pick-time, not enqueue-time, so a job enqueued
+    # before a kill can still be skipped cleanly. `coalesce_key` lets the
+    # streamer collapse a storm of OCAP triggers for the same (agent,
+    # symbol) into one job with a growing `triggers_seen` JSONB.
+    """CREATE TABLE IF NOT EXISTS agent_job (
+        id            BIGSERIAL PRIMARY KEY,
+        agent_name    TEXT NOT NULL,
+        job_type      TEXT NOT NULL,
+        priority      INTEGER NOT NULL DEFAULT 10,
+        payload       JSONB NOT NULL DEFAULT '{}'::jsonb,
+        status        TEXT NOT NULL DEFAULT 'queued',
+        enqueued_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        started_at    TIMESTAMPTZ,
+        finished_at   TIMESTAMPTZ,
+        worker_id     TEXT,
+        error         TEXT,
+        triggers_seen JSONB,
+        coalesce_key  TEXT
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_agent_job_pull ON agent_job (priority, enqueued_at) WHERE status = 'queued'",
+    "CREATE INDEX IF NOT EXISTS idx_agent_job_coalesce ON agent_job (coalesce_key) WHERE status IN ('queued','running')",
+    "CREATE INDEX IF NOT EXISTS idx_agent_job_agent_recent ON agent_job (agent_name, enqueued_at DESC)",
+    # Rollup of what the spawned skill produced (parsed from run_skill.py's
+    # stdout JSON when the worker reaps the subprocess). Carries session_id,
+    # iterations, finish_reason, validation_errors, write_summary —
+    # everything you need to debug a queue-driven skill without grepping logs.
+    "ALTER TABLE agent_job ADD COLUMN IF NOT EXISTS skill_result JSONB",
+    # ─────────────────────────────────────────────────────────────────────
+    # Sector summaries — narrative per-agent context written by the
+    # `sector_summary` worker job. ticker_review jobs read the latest row
+    # (≤2h old = fresh) so per-ticker reasoning is grounded in shared
+    # sector context without each ticker_review re-running heavy reasoning.
+    """CREATE TABLE IF NOT EXISTS agent_sector_summary (
+        agent_name   TEXT NOT NULL,
+        summary_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        summary_text TEXT NOT NULL,
+        model_inputs JSONB,
+        PRIMARY KEY (agent_name, summary_at)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_sector_summary_recent ON agent_sector_summary (agent_name, summary_at DESC)",
 ]
 
 
@@ -660,6 +840,54 @@ async def get_pool() -> asyncpg.Pool:
     return _pool  # type: ignore[return-value]
 
 
+async def _seed_watchlist_from_yaml(conn: asyncpg.Connection) -> None:
+    """First-boot seed: mirror agents/sector_map.yaml into agent_watchlist.
+
+    Per-agent gated — if a target agent already has any rows (including
+    soft-deleted), we leave them alone. Idempotent across boots; safe to call
+    repeatedly. sector_map.yaml stays on disk as the factory-reset record."""
+    path = Path("agents") / "sector_map.yaml"
+    if not path.exists():
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except Exception as exc:
+        log.warning("seed_watchlist: sector_map.yaml unreadable: %s", exc)
+        return
+    agents = (data or {}).get("agents") or {}
+
+    # Gather every (target_agent, symbol, bearish_via) tuple the YAML implies.
+    seeds_by_agent: dict[str, list[tuple[str, str, Optional[str]]]] = {}
+    for agent_name, spec in agents.items():
+        universe = (spec or {}).get("universe") or {}
+        for sym, meta in universe.items():
+            sym_u = str(sym).upper()
+            bearish_via = (meta or {}).get("bearish_via")
+            seeds_by_agent.setdefault(agent_name, []).append((agent_name, sym_u, bearish_via))
+
+    seeded_agents = 0
+    seeded_rows = 0
+    for tgt_agent, rows in seeds_by_agent.items():
+        existing = await conn.fetchrow(
+            "SELECT 1 FROM agent_watchlist WHERE agent_name=$1 LIMIT 1",
+            tgt_agent,
+        )
+        if existing:
+            continue
+        await conn.executemany(
+            """INSERT INTO agent_watchlist (agent_name, symbol, bearish_via, source)
+               VALUES ($1, $2, $3, 'seed')
+               ON CONFLICT (agent_name, symbol) DO NOTHING""",
+            rows,
+        )
+        seeded_agents += 1
+        seeded_rows += len(rows)
+    if seeded_rows:
+        log.info("seed_watchlist: seeded %d rows across %d agents from sector_map.yaml",
+                 seeded_rows, seeded_agents)
+
+
 async def init_db(db_path: str = DB_PATH) -> None:
     """Create all tables and seed initial kill_switch row if empty.
     `db_path` is ignored (kept for backward compat with callers)."""
@@ -673,6 +901,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
             await conn.execute(
                 "INSERT INTO kill_switch (agent_name, is_active) VALUES (NULL, 0)"
             )
+        await _seed_watchlist_from_yaml(conn)
     log.info("Postgres schema ready (host=%s db=%s)", _pool_cfg.get("host"), _pool_cfg.get("database"))
 
 

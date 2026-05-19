@@ -13,8 +13,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
-import yaml
-
 from agent.bundlers.common import load_journal_split, read_workspace
 from db import store
 
@@ -62,23 +60,21 @@ def _read_text_safe(path: Path, default: str = "") -> str:
         return f"(failed to read: {type(e).__name__}: {e})"
 
 
-def _load_universe(agent_name: str) -> list[str]:
-    sector_map = Path("agents/sector_map.yaml")
-    if not sector_map.is_file():
-        return []
+async def _load_universe(agent_name: str) -> list[str]:
+    """Active watchlist symbols for one agent, from the agent_watchlist table."""
     try:
-        data = yaml.safe_load(sector_map.read_text(encoding="utf-8")) or {}
+        rows = await store.load_agent_watchlist(agent_name)
     except Exception:
         return []
-    return list(data.get("agents", {}).get(agent_name, {}).get("universe", []))
+    return [r["symbol"] for r in rows]
 
 
 async def get_model_tune_bundle(agent_name: str) -> ModelTuneBundle:
     warnings: list[str] = []
 
     sector_yaml = _read_text_safe(Path("agents") / f"{agent_name}.yaml")
-    universe = _load_universe(agent_name)
-    workspace = read_workspace(agent_name)
+    universe = await _load_universe(agent_name)
+    workspace = await read_workspace(agent_name)
 
     model_files = _read_models_dir(agent_name)
     hypothesis_log = _read_text_safe(

@@ -119,20 +119,6 @@ def _commentary_rex(m: dict) -> tuple[str, str]:
     return derivation, prose
 
 
-def _commentary_titan(m: dict) -> tuple[str, str]:
-    inp = m.get("inputs", {})
-    score = inp.get("score", 0)
-    lh = inp.get("lower_highs", 0)
-    derivation = f"distribution score {score:+.2f}  (lower-highs {lh}/9)"
-    if m["direction"] == "short":
-        prose = f"distribution heavy — bearish {m['conviction']:.3f}"
-    elif m["direction"] == "long":
-        prose = f"accumulation — long {m['conviction']:.3f}"
-    else:
-        prose = "no distribution signal — neutral"
-    return derivation, prose
-
-
 def _commentary_vera(m: dict) -> tuple[str, str]:
     inp = m.get("inputs", {})
     r5 = inp.get("range_5", 0)
@@ -225,15 +211,6 @@ AGENT_PLOT = {
         "plot_window_days": 45,
         "horizon_days": 7,
         "commentary": _commentary_rex,
-    },
-    "titan": {
-        "model_path": "agents.titan.models.distribution_score",
-        "model_summary": "10-bar lower-highs + closes-below-opens (distribution)",
-        "overlays": ["LAST_10_HIGHS"],
-        "history_window_days": 60,
-        "plot_window_days": 30,
-        "horizon_days": 10,
-        "commentary": _commentary_titan,
     },
     "vera": {
         "model_path": "agents.vera.models.iv_crush_setup",

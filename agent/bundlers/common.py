@@ -1,25 +1,32 @@
-"""Shared loaders for bundlers — workspace files, journal, sector config."""
+"""Shared loaders for bundlers — workspace files, journal, watchlist."""
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Any
 
 
-def read_workspace(agent_name: str) -> dict[str, Any]:
-    """Mirror of mcp_server.read_my_workspace — read agents/<agent>/{notes,watchlist.md,data}."""
+async def read_workspace(agent_name: str) -> dict[str, Any]:
+    """Mirror of mcp_server.read_my_workspace — agents/<agent>/notes + data on
+    disk, watchlist pulled from the agent_watchlist SQL table."""
     base = Path("agents") / agent_name
     out: dict[str, Any] = {
         "agent_name": agent_name,
         "notes": [],
-        "watchlist": "",
+        "watchlist": [],
         "data": [],
     }
+
+    try:
+        from db import store
+        out["watchlist"] = await store.load_agent_watchlist(agent_name)
+    except Exception as e:
+        out["watchlist_error"] = f"{type(e).__name__}: {e}"
+
     if not base.is_dir():
         return out
 
     notes_dir = base / "notes"
     data_dir = base / "data"
-    wl = base / "watchlist.md"
 
     if notes_dir.is_dir():
         for f in sorted(notes_dir.iterdir()):
@@ -35,11 +42,6 @@ def read_workspace(agent_name: str) -> dict[str, Any]:
                 "mtime": f.stat().st_mtime,
                 "content": body[:8000],
             })
-    if wl.is_file():
-        try:
-            out["watchlist"] = wl.read_text(encoding="utf-8")[:20000]
-        except Exception as e:
-            out["watchlist"] = f"(failed to read watchlist.md: {type(e).__name__}: {e})"
     if data_dir.is_dir():
         for f in sorted(data_dir.iterdir()):
             if not f.is_file():

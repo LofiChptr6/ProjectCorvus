@@ -15,10 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Any, Optional
-
-import yaml
 
 from agent.bundlers.common import load_journal_split, read_workspace
 from db import store
@@ -44,17 +41,21 @@ class ReviewBundle:
     kill_switch: Optional[dict[str, Any]] = None
     available_models: list[dict[str, Any]] = field(default_factory=list)
     bundle_warnings: list[str] = field(default_factory=list)
+    # Queue-driven invocations (queue_worker subprocess) carry job context
+    # so the agent knows what woke it — OCAP triggers, specific ticker focus,
+    # or just a routine hourly prime. None when invoked directly (e.g. legacy
+    # cron path or manual CLI).
+    job_context: Optional[dict[str, Any]] = None
+    pending_inbox: list[dict[str, Any]] = field(default_factory=list)
 
 
-def _load_universe(agent_name: str) -> list[str]:
-    sector_map = Path("agents/sector_map.yaml")
-    if not sector_map.is_file():
-        return []
+async def _load_universe(agent_name: str) -> list[str]:
+    """Active watchlist symbols for one agent, from the agent_watchlist table."""
     try:
-        data = yaml.safe_load(sector_map.read_text(encoding="utf-8")) or {}
+        rows = await store.load_agent_watchlist(agent_name)
     except Exception:
         return []
-    return list(data.get("agents", {}).get(agent_name, {}).get("universe", []))
+    return [r["symbol"] for r in rows]
 
 
 async def _safe(coro, default, warnings: list[str], label: str):
@@ -82,14 +83,51 @@ async def _agent_context_text(agent_name: str, warnings: list[str]) -> str:
         return ""
 
 
-async def get_review_bundle(agent_name: str) -> ReviewBundle:
+async def get_review_bundle(
+    agent_name: str, *, job_id: Optional[int] = None,
+) -> ReviewBundle:
+    """Build the hourly-review context bundle. `job_id` (when invoked from
+    the queue worker) loads `agent_job.triggers_seen` + `payload` so the
+    agent can see what woke this specific review (OCAP rule, routine prime,
+    one-shot manual request)."""
     warnings: list[str] = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    workspace = read_workspace(agent_name)
-    universe = _load_universe(agent_name)
+    workspace = await read_workspace(agent_name)
+    universe = await _load_universe(agent_name)
     journal = await _safe(load_journal_split(agent_name), {"open": [], "due_today_or_earlier": [], "recent_resolutions": []}, warnings, "journal")
     active_views = await _safe(store.get_agent_active_convictions(agent_name), [], warnings, "active_views")
+
+    # Pending inbox (user / OCAP / sibling-agent messages waiting for this
+    # agent). The respond skill drains these, but the review skill should
+    # see them too — otherwise dashboard questions sit until the next
+    # respond cycle, and OCAP wake-up notes never reach the review prompt.
+    pending_inbox: list[dict[str, Any]] = []
+    try:
+        if hasattr(store, "get_pending_inbox"):
+            pending_inbox = await store.get_pending_inbox(agent_name, limit=10)
+    except Exception as e:
+        warnings.append(f"pending_inbox: {type(e).__name__}: {e}")
+
+    # Queue-driven invocations carry job context. The worker sets JOB_ID env
+    # var (or callers pass job_id directly). When present, load the row so
+    # the agent can render "I was woken by OCAP on SPY tripping rolling_std_breach".
+    job_context: Optional[dict[str, Any]] = None
+    if job_id is not None:
+        try:
+            from db.schema import get_pool
+            pool = await get_pool()
+            async with pool.acquire() as conn:
+                jr = await conn.fetchrow(
+                    """SELECT id, job_type, priority, payload, triggers_seen,
+                              enqueued_at, started_at
+                       FROM agent_job WHERE id=$1""",
+                    int(job_id),
+                )
+                if jr:
+                    job_context = dict(jr)
+        except Exception as e:
+            warnings.append(f"job_context: {type(e).__name__}: {e}")
 
     # Optional / best-effort sections.
     sector_stories = []
@@ -151,4 +189,6 @@ async def get_review_bundle(agent_name: str) -> ReviewBundle:
         kill_switch=kill_switch,
         available_models=available_models,
         bundle_warnings=warnings,
+        job_context=job_context,
+        pending_inbox=pending_inbox,
     )

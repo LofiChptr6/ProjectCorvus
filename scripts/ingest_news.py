@@ -45,123 +45,29 @@ try:
 except ImportError:
     pass
 
-import yaml
-
 from data import embeddings, massive_client
 from db import store
 
 log = logging.getLogger("ingest_news")
 
-# ── Watchlist parsing (unchanged from previous version) ───────────────────────
+# ── Watchlist → agent tags ────────────────────────────────────────────────────
 
-_TICKER_RE = re.compile(r"^\s*-\s+([A-Z][A-Z0-9.\-]{0,9})\s+—")
-_ACTIVE_HEADER_RE = re.compile(r"^\s*##\s+Active\s*$", re.IGNORECASE)
-_ANY_H2_RE = re.compile(r"^\s*##\s+")
+async def collect_target_tickers() -> tuple[set[str], dict[str, set[str]]]:
+    """Returns (all_symbols, symbol_to_agents) from agent_watchlist (SQL).
 
-
-def _read_active_tickers(path: Path) -> set[str]:
-    """Parse the '## Active' section of an agent watchlist.md, return tickers."""
-    if not path.exists():
-        return set()
-    tickers: set[str] = set()
-    in_active = False
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if _ACTIVE_HEADER_RE.match(line):
-            in_active = True
-            continue
-        if in_active and _ANY_H2_RE.match(line):
-            break
-        if in_active:
-            m = _TICKER_RE.match(line)
-            if m:
-                tickers.add(m.group(1).upper())
-    return tickers
-
-
-# ── Sector-map → agent tags ───────────────────────────────────────────────────
-
-_SECTOR_MAP_PATH = ROOT / "agents" / "sector_map.yaml"
-
-# sector_map v2 still labels the energy/materials block "titan", but the live
-# orchestrator decommissioned titan and routes that universe to two agents:
-# `energy` (hydrocarbons) and `commodity` (metals + materials + chemicals).
-# See scripts/run_hourly_orchestrator.sh PIPELINE_SECTORS for the source of
-# truth. The split rule below mirrors the prose universe in agents/energy.yaml
-# and agents/commodity.yaml.
-_TITAN_TO_ENERGY = {
-    "XOM", "CVX", "COP", "OXY", "EOG", "PXD", "DVN", "HES",
-    "PSX", "MPC", "VLO", "SLB", "HAL", "BKR", "ET", "EPD", "OKE",
-    "XLE", "USO",
-}
-_TITAN_TO_COMMODITY = {
-    "LIN", "APD", "SHW",
-    "FCX", "NEM", "GOLD", "AEM", "FNV",
-    "SCCO", "TECK", "RIO", "BHP",
-}
-
-
-def _load_sector_map_tags() -> dict[str, set[str]]:
-    """Build {SYMBOL: {agent_name, ...}} from sector_map.yaml.
-
-    Applies the titan → {energy, commodity} split per the orchestrator's
-    canonical agent list. The original 'titan' tag is NOT preserved — that
-    persona was decommissioned.
+    The unified agent_watchlist table holds both seed rows (mirrored from
+    sector_map.yaml at first boot) and live agent/user additions; this
+    single read replaces the previous sector_map.yaml + per-agent
+    watchlist.md union.
     """
+    grouped = await store.load_all_watchlists()
     out: dict[str, set[str]] = {}
-    if not _SECTOR_MAP_PATH.exists():
-        return out
-    try:
-        data = yaml.safe_load(_SECTOR_MAP_PATH.read_text(encoding="utf-8")) or {}
-    except Exception as exc:
-        log.warning("sector_map.yaml unreadable: %s", exc)
-        return out
-    agents = (data or {}).get("agents", {}) or {}
-    for agent_name, body in agents.items():
-        universe = (body or {}).get("universe", {}) or {}
-        for sym in universe.keys():
-            sym_u = str(sym).upper()
-            if agent_name == "titan":
-                if sym_u in _TITAN_TO_ENERGY:
-                    out.setdefault(sym_u, set()).add("energy")
-                elif sym_u in _TITAN_TO_COMMODITY:
-                    out.setdefault(sym_u, set()).add("commodity")
-                else:
-                    # Unsplit titan symbol — route to both so we don't lose it.
-                    out.setdefault(sym_u, set()).update({"energy", "commodity"})
-            else:
-                out.setdefault(sym_u, set()).add(str(agent_name))
-    return out
-
-
-def _watchlist_tags() -> dict[str, set[str]]:
-    """Build {SYMBOL: {agent_name, ...}} from each agent's watchlist.md.
-
-    Watchlist tags are unioned on top of sector_map tags — an agent who adds a
-    catalyst name from outside their sector still sees it in their feed.
-    """
-    out: dict[str, set[str]] = {}
-    for wl in (ROOT / "agents").glob("*/watchlist.md"):
-        agent_name = wl.parent.name
-        for sym in _read_active_tickers(wl):
-            out.setdefault(sym, set()).add(agent_name)
-    return out
-
-
-def collect_target_tickers() -> tuple[set[str], dict[str, set[str]]]:
-    """Returns (all_symbols, symbol_to_agents).
-
-    - all_symbols = union(sector_map.universes) ∪ union(watchlists)
-    - symbol_to_agents = sector_map_tags(symbol) ∪ watchlist_tags(symbol)
-    """
-    sm = _load_sector_map_tags()
-    wl = _watchlist_tags()
-    merged: dict[str, set[str]] = {}
-    for sym, agents in sm.items():
-        merged.setdefault(sym, set()).update(agents)
-    for sym, agents in wl.items():
-        merged.setdefault(sym, set()).update(agents)
-    all_symbols = set(merged.keys())
-    return all_symbols, merged
+    for agent_name, rows in grouped.items():
+        for r in rows:
+            sym_u = str(r["symbol"]).upper()
+            out.setdefault(sym_u, set()).add(agent_name)
+    all_symbols = set(out.keys())
+    return all_symbols, out
 
 
 # ── Categorization ────────────────────────────────────────────────────────────
@@ -570,20 +476,21 @@ def main() -> int:
         log.error("MASSIVE_API_KEY missing — cannot fetch news")
         return 2
 
-    universe, symbol_to_agents = collect_target_tickers()
+    async def _entry() -> None:
+        universe, symbol_to_agents = await collect_target_tickers()
+        if args.symbols:
+            symbols = sorted({s.strip().upper() for s in args.symbols.split(",") if s.strip()})
+        else:
+            symbols = sorted(universe)
+        await run(
+            symbols=symbols,
+            max_items=args.max_items,
+            symbol_to_agents=symbol_to_agents,
+            skip_market_pull=args.skip_market_pull,
+            market_max=args.market_max,
+        )
 
-    if args.symbols:
-        symbols = sorted({s.strip().upper() for s in args.symbols.split(",") if s.strip()})
-    else:
-        symbols = sorted(universe)
-
-    asyncio.run(run(
-        symbols=symbols,
-        max_items=args.max_items,
-        symbol_to_agents=symbol_to_agents,
-        skip_market_pull=args.skip_market_pull,
-        market_max=args.market_max,
-    ))
+    asyncio.run(_entry())
     return 0
 
 

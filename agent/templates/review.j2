@@ -11,6 +11,26 @@ You are **{{ agent_name }}**, the sector analyst on a multi-agent quant trading 
 {% endif %}
 - Universe ({{ bundle.universe|length }}): {{ bundle.universe|join(", ") }}
 
+{% if bundle.job_context %}
+# What woke you up
+- job_id={{ bundle.job_context.id }} type={{ bundle.job_context.job_type }} priority={{ bundle.job_context.priority }}
+{% if bundle.job_context.triggers_seen %}- triggers_seen: {{ bundle.job_context.triggers_seen }}
+{% endif %}
+{% if bundle.job_context.payload %}- payload: {{ bundle.job_context.payload }}
+{% endif %}
+- enqueued_at: {{ bundle.job_context.enqueued_at }}{% if bundle.job_context.started_at %} · started_at: {{ bundle.job_context.started_at }}{% endif %}
+{% if bundle.job_context.priority|int <= 5 %}**This is an OCAP-priority wake-up — a statistical rule fired on a watchlisted symbol.** Inspect the payload's `symbol` first; the broader sector context is secondary.
+{% endif %}
+{% endif %}
+
+{% if bundle.pending_inbox %}
+# Pending inbox ({{ bundle.pending_inbox|length }})
+Messages waiting for you (user questions via dashboard, OCAP wake-up notes, sibling-agent posts). Address these where relevant in your review and any explicit Qs in your stdout_summary.
+{% for m in bundle.pending_inbox %}
+- [{{ m.sender or "user" }}] {{ m.created_at }} — {{ (m.body or "")[:300] }}{% if (m.body or "")|length > 300 %}…{% endif %}
+{% endfor %}
+{% endif %}
+
 {% if bundle.available_models %}
 # Available quant models
 You have backing models available. For directional views on names where a model applies, STRONGLY prefer setting `from_model: "<name>"` on the conviction row — the runner replaces your direction/conviction/expected_return_pct/time_to_target_days/stop_pct/model_inputs with the model's output. You still author rationale, momentum_confirmed, and expires_in_hours.
@@ -69,8 +89,11 @@ When using `from_model`, fill `direction` and `conviction` with placeholders (e.
 {% endif %}
 
 {% if bundle.workspace.watchlist %}
-# Watchlist (excerpt)
-{{ bundle.workspace.watchlist[:3000] }}{% if bundle.workspace.watchlist|length > 3000 %}…[truncated]{% endif %}
+# Watchlist ({{ bundle.workspace.watchlist|length }} active rows from agent_watchlist)
+{% for w in bundle.workspace.watchlist[:60] %}
+- {{ w.symbol }}{% if w.bearish_via %} (bearish via {{ w.bearish_via }}){% endif %} · src={{ w.source }} · added {{ w.added_at }}{% if w.added_reason %} — {{ w.added_reason }}{% endif %}
+{% endfor %}
+{% if bundle.workspace.watchlist|length > 60 %}…[{{ bundle.workspace.watchlist|length - 60 }} more rows truncated]{% endif %}
 {% endif %}
 
 {% if bundle.bundle_warnings %}

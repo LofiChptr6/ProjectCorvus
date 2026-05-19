@@ -137,7 +137,7 @@ Schedule (all America/Phoenix local):
 | Time | Days | Skill |
 |---|---|---|
 | 06:06 | Mon-Fri | mike-morning |
-| 06:30 | Mon-Fri | 10× sector-review (atlas/fab/fabless/rex/maya/titan/vera/trump/iron/volt) |
+| 06:30 | Mon-Fri | 11× sector-review (atlas/commodity/energy/fab/fabless/iron/maya/rex/trump/vera/volt) |
 | 06:30–13:30 hourly | Mon-Fri | mike-allocator (8 runs through market close) |
 | 08:00 | Mon-Fri | mike-midday |
 | 16:00 | Mon-Fri | 10× sector-evening |

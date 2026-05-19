@@ -22,16 +22,17 @@ from typing import Optional
 
 
 _SECTOR_LABEL: dict[str, str] = {
-    "atlas":   "Macro / Indices / Rates / FX",
-    "fab":     "Semiconductor Fabs & Equipment",
-    "fabless": "Semiconductor Designers & ETFs",
-    "iron":    "Industrials / Transports / Defense",
-    "maya":    "Financials & Rate-Sensitive Banks",
-    "rex":     "Mega-Cap Tech (Cloud/Ads/Software)",
-    "titan":   "Energy / Materials / Commodities",
-    "trump":   "Consumer Staples & Discretionary",
-    "vera":    "Healthcare / Biotech / Pharma",
-    "volt":    "Utilities / REITs / Infrastructure",
+    "atlas":     "Macro / Indices / Rates / FX",
+    "commodity": "Metals / Materials / Chemicals",
+    "energy":    "Oil & Gas / Refiners / Services / Midstream",
+    "fab":       "Semiconductor Fabs & Equipment",
+    "fabless":   "Semiconductor Designers & ETFs",
+    "iron":      "Industrials / Transports / Defense",
+    "maya":      "Financials & Rate-Sensitive Banks",
+    "rex":       "Mega-Cap Tech (Cloud/Ads/Software)",
+    "trump":     "Consumer Staples & Discretionary",
+    "vera":      "Healthcare / Biotech / Pharma",
+    "volt":      "Utilities / REITs / Infrastructure",
 }
 
 

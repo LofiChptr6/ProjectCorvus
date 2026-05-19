@@ -63,13 +63,17 @@ class SkillResult:
 # ── Bundler dispatch ─────────────────────────────────────────────────────────
 
 
-async def _build_bundle(agent_name: str, skill_type: str) -> Any:
+async def _build_bundle(
+    agent_name: str, skill_type: str, *, job_id: Optional[int] = None,
+) -> Any:
     if skill_type == "respond":
         from agent.bundlers.respond import get_respond_bundle
         return await get_respond_bundle(agent_name)
     if skill_type == "review":
         from agent.bundlers.review import get_review_bundle
-        return await get_review_bundle(agent_name)
+        # Review bundler accepts job_id so OCAP-triggered reviews can render
+        # "what woke me up" (triggers_seen + payload from agent_job).
+        return await get_review_bundle(agent_name, job_id=job_id)
     if skill_type == "evening":
         from agent.bundlers.evening import get_evening_bundle
         return await get_evening_bundle(agent_name)
@@ -204,6 +208,12 @@ async def _resolve_conviction_fields(
         "time_to_target_days": p["time_to_target_days"],
         "stop_pct": p["stop_pct"],
         "model_inputs": p["model_inputs"],  # already stamped with _model/_version
+        # Phase A join keys — populated only when the model emitted distributions
+        # (compute_conviction_payload allocates the UUID + records the functional).
+        # NULL otherwise; callers that don't accept these args (shadow upsert)
+        # ignore them.
+        "forecast_run_id": p.get("forecast_run_id"),
+        "functional_name": p.get("functional_name"),
     }
 
 
@@ -271,6 +281,11 @@ async def _apply_review_output(
             r["symbol"]: (r["direction"], r.get("first_held_since"))
             for r in prior_rows
         }
+        # Capture resolved new payloads BEFORE upsert so the materiality
+        # diff sees prior-vs-new without DB round-trips. The worker reads
+        # convictions_materially_changed from the rollup to decide whether
+        # to fire ocap_rebalance.
+        new_resolved_payloads: list[dict] = []
         await store.clear_agent_convictions(agent_name)
         for c in parsed.convictions:
             resolved = await _resolve_conviction_fields(c, agent_name)
@@ -291,8 +306,28 @@ async def _apply_review_output(
                 momentum_confirmed=c.momentum_confirmed,
                 stop_pct=resolved["stop_pct"],
                 first_held_since=preserved,
+                session_id=session_id,
+                forecast_run_id=resolved.get("forecast_run_id"),
+                functional_name=resolved.get("functional_name"),
             )
+            new_resolved_payloads.append({
+                "symbol": c.symbol.upper(),
+                "direction": resolved["direction"],
+                "conviction": resolved["conviction"],
+                "expected_return_pct": resolved["expected_return_pct"],
+                "stop_pct": resolved["stop_pct"],
+            })
             summary["convictions_inserted"] += 1
+
+        # Materiality: count how many of these convictions actually changed
+        # vs what the agent already had. Used downstream by the worker to
+        # decide whether to enqueue ocap_rebalance.
+        from meta_agent.conviction_diff import count_material_changes
+        n_material, material_reasons = count_material_changes(
+            prior_rows, new_resolved_payloads,
+        )
+        summary["convictions_materially_changed"] = n_material
+        summary["material_change_reasons"] = material_reasons[:10]  # cap for log size
 
         await store.clear_agent_forecasts(agent_name)
         result = await store.upsert_forecasts_batch(
@@ -342,9 +377,13 @@ async def run_skill(
     dev_mode: bool = False,
     dry_run: bool = False,
     session_id: Optional[str] = None,
+    job_id: Optional[int] = None,
 ) -> SkillResult:
+    """Run one skill turn. `job_id` (when invoked from the queue worker)
+    plumbs the agent_job context (triggers_seen, payload) into the review
+    bundle so the agent sees what woke it."""
     started = time.time()
-    bundle = await _build_bundle(agent_name, skill_type)
+    bundle = await _build_bundle(agent_name, skill_type, job_id=job_id)
 
     # Skip-fast for respond: empty inbox → exit silently.
     if skill_type == "respond" and not getattr(bundle, "pending_inbox", []):

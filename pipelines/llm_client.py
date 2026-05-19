@@ -9,6 +9,7 @@ and pipeline path land in the same audit stream.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from dataclasses import dataclass
@@ -20,6 +21,32 @@ from openai import AsyncOpenAI
 PROXY_BASE_DEFAULT = "http://localhost:8001"
 VLLM_BASE_DEFAULT = "http://localhost:8000"
 PROXY_HEALTHZ_TIMEOUT_SEC = 1.0
+
+
+# Process-local throttle for vLLM-bound calls. The vLLM server has a finite
+# --max-num-seqs; without a cap, hourly orchestrator fan-out + concierge +
+# Claude Code sessions can all queue behind one another inside vLLM's KV
+# cache, causing per-call latency to balloon non-linearly under load (the
+# real perf cliff is KV eviction + re-prefill, not API queueing). Defaults
+# to 6 in-flight; raise via VLLM_MAX_INFLIGHT and leave headroom for the
+# concierge / Claude Code sessions which call vLLM outside this codepath.
+#
+# Cross-process throttling (e.g. multiple worker daemons + harness skills
+# all hitting the same vLLM) needs a shared mechanism (Postgres advisory
+# lock, Redis) — that's a v2. For now, callers in this process can opt in
+# via `async with vllm_semaphore(): ...`.
+_VLLM_SEM: asyncio.Semaphore | None = None
+
+
+def vllm_semaphore() -> asyncio.Semaphore:
+    """Module-level semaphore guarding vLLM-bound calls within this process.
+    Lazily constructed on first use because asyncio.Semaphore must bind to a
+    running loop."""
+    global _VLLM_SEM
+    if _VLLM_SEM is None:
+        n = int(os.environ.get("VLLM_MAX_INFLIGHT", "6"))
+        _VLLM_SEM = asyncio.Semaphore(max(1, n))
+    return _VLLM_SEM
 
 
 @dataclass

@@ -164,13 +164,8 @@ async def _contributors_for_held_symbol(
     # `held_symbol`.
     try:
         from meta_agent.allocator import resolve_bearish_vehicle
-        from pathlib import Path
-        import yaml
-        sector_map = {}
-        sm_path = Path("agents/sector_map.yaml")
-        if sm_path.exists():
-            with open(sm_path) as f:
-                sector_map = yaml.safe_load(f) or {}
+        from db import store
+        sector_map = await store.load_watchlist_as_sector_map()
         for orig, views in cv.items():
             if not views:
                 continue

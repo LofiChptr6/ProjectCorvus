@@ -1,0 +1,17 @@
+[Unit]
+Description=Trading LLM-task queue worker #%i
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/tianyizhang/opus trading
+EnvironmentFile=/home/tianyizhang/opus trading/.env
+Restart=on-failure
+RestartSec=10
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/python scripts/run_queue_worker.py'
+StandardOutput=append:/home/tianyizhang/opus trading/logs/queue-worker-%i.log
+StandardError=append:/home/tianyizhang/opus trading/logs/queue-worker-%i.log
+
+[Install]
+WantedBy=default.target

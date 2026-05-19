@@ -33,7 +33,10 @@ class ConvictionView(BaseModel):
     model_inputs: Optional[dict[str, Any]] = None
     momentum_confirmed: Optional[bool] = None
     stop_pct: Optional[float] = None  # see _coerce_stop_pct: must be POSITIVE magnitude
-    expires_in_hours: int = Field(default=1, ge=1, le=336)  # 14d max
+    # REQUIRED — no default. Must match the thesis horizon.
+    # Bounds: 5 min (0.0833h) to 30 days (720h). See db.store.upsert_conviction
+    # for the canonical range constants.
+    expires_in_hours: float = Field(..., ge=5/60, le=24*30)
     from_model: Optional[str] = None  # name under agents/<agent>/models/; when
                                       # set, runner overrides direction/conviction/
                                       # expected_return_pct/time_to_target_days/
@@ -66,6 +69,10 @@ class ForecastRow(BaseModel):
     method: str = "model"
     rationale: Optional[str] = None
     horizon: Optional[Literal["intraday", "near", "far", "cycle"]] = None
+    # REQUIRED per-row — same contract as ConvictionView. Match the thesis
+    # horizon (5m forecast ≠ cycle forecast). Range: 5 min (0.0833h) to
+    # 30 days (720h).
+    expires_in_hours: float = Field(..., ge=5/60, le=24*30)
 
     @field_validator("symbol")
     @classmethod

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < 200:
         return {
@@ -40,7 +39,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         e_return = 0.0
 
     # Adjust horizon to 45 days for defense/industrial names (slow to reversion)
-    time_to_target_days = 45
+    time_to_target_days = 45 if symbol in ["RTX", "LMT", "BA"] else 30
     conviction = (e_return / time_to_target_days) if time_to_target_days else 0.0
 
     # Add volatility-weighted conviction scaling for better calibration
@@ -66,4 +65,4 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         },
     }
 
-MODEL_VERSION = "1.1"
+MODEL_VERSION = "1.2"

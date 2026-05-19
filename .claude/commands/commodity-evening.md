@@ -103,7 +103,7 @@ Note the returned `chart_path`. The slide carries the P&L chart on the left, the
 
 ## STEP 6 — Send Telegram (single message)
 
-`send_telegram_chart(image_path=<slide_path from STEP 5>, caption="TITAN | Energy / Materials / Commodities | {YYYY-MM-DD} EOD")`
+`send_telegram_chart(image_path=<slide_path from STEP 5>, caption="COMMODITY | Metals / Materials / Chemicals | {YYYY-MM-DD} EOD")`
 
 ONE caption line is enough — the slide image carries the body content.
 

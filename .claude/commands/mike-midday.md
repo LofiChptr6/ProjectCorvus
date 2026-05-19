@@ -11,7 +11,10 @@ into the trading session. Run a midday position and thesis check.
 
 If `get_market_status.now_et` is outside 10–13 ET, warn once via Telegram and continue.
 
-Your traders: Rex (momentum), Maya (mean reversion), Atlas (macro long), Titan (macro short).
+Your traders (the 11 sector agents that publish convictions to the allocator):
+Atlas (macro/indices/rates/FX), Energy (oil/gas/refiners), Commodity (metals/materials),
+Fab (semi mfg/equipment), Fabless (semi designers), Rex (mega-cap tech ex-semi),
+Maya (financials), Vera (healthcare), Trump (consumer), Iron (industrials), Volt (utilities/REITs).
 
 ---
 
@@ -84,7 +87,7 @@ Updated guidance should address:
 - The specific regime change and what triggered it
 - Any agent pivots (e.g., "Atlas: consider tightening stops — SPY broke the morning low at $X")
 - Any agent whose morning thesis has been invalidated by midday price action
-- Titan: if a short opportunity has emerged that wasn't present at open, note it explicitly
+- New inverse-ETF opportunities surfaced by midday price action (note explicitly which sector should consider them)
 
 Only write a midday update if something meaningful changed. If the thesis is intact, state that and move on.
 
@@ -95,7 +98,7 @@ Only write a midday update if something meaningful changed. If the thesis is int
 Review each agent's morning performance against their allocation:
 - Any agent near 50% of daily loss limit → consider proposing a size reduction or pause
 - Any agent consistently profitable this morning → note (no change needed, but log it)
-- Any regime shift that warrants a reallocation (bearish pivot → reduce Atlas, increase Titan)?
+- Any regime shift that warrants a reallocation (bearish pivot → suggest inverse-ETF tilt across affected sectors)?
 
 For ANY allocation change: call `propose_strategic_change(title, details)`.
 Mike does NOT self-execute allocation changes.
@@ -111,11 +114,10 @@ Send a concise Telegram update via `send_telegram_update` (max ~1200 chars):
 
 *Morning thesis:* {INTACT / MODIFIED — one sentence explaining what changed if anything}
 
-*P&L so far:*
-• Rex: ${pnl} ({+/-%})
-• Maya: ${pnl}
-• Atlas: ${pnl}
-• Titan: ${pnl}
+*P&L so far (top contributors / detractors — pull from get_pnl_summary):*
+• {agent_1}: ${pnl} ({+/-%})
+• {agent_2}: ${pnl}
+• {agent_3}: ${pnl}
 • Desk total: ${total_pnl}
 
 *Open positions:* {symbol, agent, unrealized P&L for each — or "none"}

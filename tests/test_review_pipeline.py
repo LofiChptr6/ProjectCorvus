@@ -118,6 +118,7 @@ def test_review_output_full_valid():
             "expected_return_pct": 1.2,
             "time_to_target_days": 3,
             "rationale": "trend intact",
+            "expires_in_hours": 4,
         }],
         "forecasts": [{
             "symbol": "tlt",
@@ -125,6 +126,7 @@ def test_review_output_full_valid():
             "likelihood": 0.6,
             "time_to_target_days": 2,
             "method": "regime",
+            "expires_in_hours": 2,
         }],
         "theses_to_record": [{
             "kind": "prediction",
@@ -151,7 +153,7 @@ def test_conviction_view_coerces_negative_stop_pct():
     convention is positive magnitude. Take abs() rather than reject."""
     parsed = schemas.ConvictionView.model_validate({
         "symbol": "SPY", "direction": "long", "conviction": 0.5,
-        "stop_pct": -0.05,
+        "stop_pct": -0.05, "expires_in_hours": 4,
     })
     assert parsed.stop_pct == 0.05
 
@@ -159,7 +161,7 @@ def test_conviction_view_coerces_negative_stop_pct():
 def test_conviction_view_preserves_positive_stop_pct():
     parsed = schemas.ConvictionView.model_validate({
         "symbol": "SPY", "direction": "long", "conviction": 0.5,
-        "stop_pct": 0.07,
+        "stop_pct": 0.07, "expires_in_hours": 4,
     })
     assert parsed.stop_pct == 0.07
 
@@ -167,6 +169,7 @@ def test_conviction_view_preserves_positive_stop_pct():
 def test_conviction_view_stop_pct_none_passes_through():
     parsed = schemas.ConvictionView.model_validate({
         "symbol": "SPY", "direction": "long", "conviction": 0.5,
+        "expires_in_hours": 4,
     })
     assert parsed.stop_pct is None
 
@@ -254,15 +257,16 @@ def _review_json_for(test_agent: str) -> str:
         "convictions": [
             {"symbol": "SPY", "direction": "long", "conviction": 0.6,
              "expected_return_pct": 0.8, "time_to_target_days": 2,
-             "rationale": "trend intact"},
+             "rationale": "trend intact", "expires_in_hours": 4},
             {"symbol": "TLT", "direction": "flat", "conviction": 0.0,
-             "rationale": "no edge"},
+             "rationale": "no edge", "expires_in_hours": 4},
         ],
         "forecasts": [
             {"symbol": "SPY", "expected_return_pct": 0.8, "likelihood": 0.6,
-             "time_to_target_days": 2, "method": "regime"},
+             "time_to_target_days": 2, "method": "regime", "expires_in_hours": 2},
             {"symbol": "QQQ", "expected_return_pct": 1.0, "likelihood": 0.5,
-             "time_to_target_days": 5, "method": "momentum", "horizon": "near"},
+             "time_to_target_days": 5, "method": "momentum", "horizon": "near",
+             "expires_in_hours": 24},
         ],
         "theses_to_record": [
             {"kind": "prediction", "title": "SPY > 700", "body": "details",

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import date, datetime, timezone
 from typing import Any, Optional
 
@@ -229,7 +230,22 @@ async def get_fills(
 # ── Kill switch ───────────────────────────────────────────────────────────────
 
 async def is_killed(agent_name: Optional[str] = None, db_path: str = DB_PATH) -> bool:
-    """Return True if the global kill switch OR agent-specific kill switch is active."""
+    """Return True if the global kill switch OR agent-specific kill switch is active.
+
+    Enforcement boundary (post-2026-05 refactor):
+      - **Allocator** (`scripts/run_mike_allocator._guard_skip`) — global +
+        mike-per-agent kill blocks the rebalance entirely.
+      - **Order layer** (`risk/checks/kill_switch.py`,
+        `tools/execution/place_order.py`) — fails closed; even an in-flight
+        order won't submit if kill trips during the approval window.
+      - **Conviction load** (`get_active_convictions`) — per-agent kill
+        filters that agent's rows out of mike's view, muting its votes
+        without halting its analysis.
+
+    **Workers do NOT consult this** — sector_summary / ticker_review /
+    ocap_triggered_review jobs run regardless. The semantic is "kill
+    freezes order flow", not "kill freezes the desk".
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -803,15 +819,17 @@ async def insert_conviction_shadow(
     symbol: str,
     direction: str,
     conviction: float,
+    expires_in_hours: float,
     expected_return_pct: Optional[float] = None,
     time_to_target_days: Optional[int] = None,
     rationale: Optional[str] = None,
     model_inputs: Optional[dict] = None,
-    expires_in_hours: int = 1,
     momentum_confirmed: Optional[bool] = None,
     stop_pct: Optional[float] = None,
     run_session_id: Optional[str] = None,
 ) -> int:
+    """Shadow-table sibling of upsert_conviction. expires_in_hours required
+    (caller has already passed Pydantic validation in pipelines/schemas.py)."""
     from datetime import datetime, timedelta, timezone
     expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)
     pool = await get_pool()
@@ -1216,29 +1234,36 @@ async def mark_digest_telegram_sent(agent_name: str, trading_date: str) -> None:
 _VALID_CONVICTION_DIRECTIONS = {"long", "short", "flat"}
 
 
+CONVICTION_EXPIRY_MIN_HOURS = 5 / 60   # 5 minutes = 0.08333... hours
+CONVICTION_EXPIRY_MAX_HOURS = 24 * 30  # 30 days = 720 hours
+
+
 async def upsert_conviction(
     agent_name: str,
     symbol: str,
     direction: str,
     conviction: float,
+    expires_in_hours: float,
     expected_return_pct: Optional[float] = None,
     time_to_target_days: Optional[int] = None,
     rationale: Optional[str] = None,
     model_inputs: Optional[dict] = None,
-    expires_in_hours: int = 1,
     momentum_confirmed: Optional[bool] = None,
     stop_pct: Optional[float] = None,
     first_held_since: Optional[datetime] = None,
+    session_id: Optional[str] = None,
+    forecast_run_id: Optional[str] = None,
+    functional_name: Optional[str] = None,
 ) -> int:
     """Upsert one conviction row keyed on (agent_name, symbol). Most recent wins.
     direction='flat' with conviction=0 is the canonical 'I have no view' submission.
 
-    Default TTL is 1 hour: hour-to-hour reconciliation. If the agent doesn't
-    re-publish in the next review cycle, the conviction expires and the
-    allocator closes the position. Agents wanting multi-session holds (overnight,
-    weekend) must override with a larger expires_in_hours (e.g., 18 for overnight,
-    72 for weekend). The market_hours risk check blocks SELLs outside RTH so
-    premature off-hours expirations don't execute as actual trades.
+    expires_in_hours is REQUIRED — no default. Agents must pick a value that
+    matches the thesis horizon: a scalp and a multi-day swing should not get
+    the same expiry. Bounds: 5 min (≈0.0833h) ≤ expires_in_hours ≤ 720h
+    (30 days). Values outside this range raise ValueError. The
+    market_hours risk check blocks SELLs outside RTH so premature off-hours
+    expirations don't execute as actual trades.
 
     momentum_confirmed: agent's self-assertion for inverse-ETF buys. True ⇒ the
     underlying is already trending bearish (allocator auto-places). False ⇒ early
@@ -1256,6 +1281,17 @@ async def upsert_conviction(
         raise ValueError(f"conviction must be >= 0, got {conviction}")
     if direction == "flat" and conviction != 0:
         raise ValueError("flat direction requires conviction == 0")
+    if expires_in_hours < CONVICTION_EXPIRY_MIN_HOURS:
+        raise ValueError(
+            f"expires_in_hours={expires_in_hours} below minimum "
+            f"{CONVICTION_EXPIRY_MIN_HOURS:.4f} (5 minutes); set a thesis-relevant horizon"
+        )
+    if expires_in_hours > CONVICTION_EXPIRY_MAX_HOURS:
+        raise ValueError(
+            f"expires_in_hours={expires_in_hours} above maximum "
+            f"{CONVICTION_EXPIRY_MAX_HOURS} (30 days); long convictions "
+            "belong in agent_thesis, not the active conviction stack"
+        )
     # first_held_since: caller (pipelines/runner.py) passes a snapshotted value
     # when the same direction is being re-published, so this acts as the anchor
     # for "days since you first took this view." Defaults to NOW() when caller
@@ -1268,10 +1304,11 @@ async def upsert_conviction(
                  (agent_name, symbol, direction, conviction,
                   expected_return_pct, time_to_target_days,
                   rationale, model_inputs, momentum_confirmed, expires_at,
-                  stop_pct, first_held_since)
+                  stop_pct, first_held_since, session_id,
+                  forecast_run_id, functional_name)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,
                        NOW() + ($10 || ' hours')::interval,
-                       $11, $12)
+                       $11, $12, $13, $14::uuid, $15)
                ON CONFLICT (agent_name, symbol) DO UPDATE SET
                  direction           = EXCLUDED.direction,
                  conviction          = EXCLUDED.conviction,
@@ -1283,6 +1320,10 @@ async def upsert_conviction(
                  stop_pct            = EXCLUDED.stop_pct,
                  submitted_at        = NOW(),
                  expires_at          = NOW() + ($10 || ' hours')::interval,
+                 -- session_id reflects whoever just re-published; NULL stays NULL.
+                 session_id          = EXCLUDED.session_id,
+                 forecast_run_id     = EXCLUDED.forecast_run_id,
+                 functional_name     = EXCLUDED.functional_name,
                  -- preserve original anchor when direction is unchanged across
                  -- re-publications; reset to the caller-supplied value when
                  -- direction flipped.
@@ -1297,7 +1338,8 @@ async def upsert_conviction(
             json.dumps(model_inputs) if model_inputs is not None else None,
             momentum_confirmed,
             str(expires_in_hours),
-            stop_pct, held_since,
+            stop_pct, held_since, session_id,
+            forecast_run_id, functional_name,
         )
         return int(row["id"])
 
@@ -1407,17 +1449,36 @@ async def get_agent_active_convictions(agent_name: str) -> list[dict]:
 
 
 async def get_active_convictions() -> list[dict]:
-    """All non-expired non-zero conviction rows across all agents.
-    Mike-only consumer (the allocator)."""
+    """All non-expired non-zero conviction rows across all agents,
+    EXCLUDING rows from agents whose per-agent kill switch is active.
+    Mike-only consumer (the allocator).
+
+    Per-agent kill semantic ("don't trade based on this agent's view")
+    is enforced here, not at the worker, since workers no longer pre-skip
+    on kill (`run_queue_worker._one_iteration`). Mike's own per-agent kill
+    and the global kill are enforced upstream by
+    `run_mike_allocator._guard_skip`.
+    """
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
-            """SELECT id, agent_name, symbol, direction, conviction,
-                      expected_return_pct, time_to_target_days, rationale,
-                      momentum_confirmed, stop_pct, submitted_at, expires_at
-               FROM agent_conviction
-               WHERE expires_at > NOW() AND conviction > 0
-               ORDER BY symbol, conviction DESC"""
+            """SELECT ac.id, ac.agent_name, ac.symbol, ac.direction,
+                      ac.conviction, ac.expected_return_pct,
+                      ac.time_to_target_days, ac.rationale,
+                      ac.momentum_confirmed, ac.stop_pct,
+                      ac.submitted_at, ac.expires_at
+               FROM agent_conviction ac
+               WHERE ac.expires_at > NOW() AND ac.conviction > 0
+                 AND NOT EXISTS (
+                     SELECT 1 FROM kill_switch ks
+                     WHERE ks.agent_name = ac.agent_name
+                       AND ks.is_active = 1
+                       AND ks.id = (
+                           SELECT MAX(id) FROM kill_switch
+                           WHERE agent_name = ac.agent_name
+                       )
+                 )
+               ORDER BY ac.symbol, ac.conviction DESC"""
         )
         return [dict(r) for r in rows]
 
@@ -1437,29 +1498,44 @@ def _derive_horizon(time_to_target_days: int) -> str:
     return "cycle"
 
 
+_VALID_HORIZONS = {"5m", "1h", "intraday", "near", "far", "cycle"}
+
+
 async def upsert_forecasts_batch(
     agent_name: str,
     rows: list[dict],
-    expires_in_hours: int = 2,
 ) -> dict:
     """Bulk-upsert forecasts per (agent_name, symbol, horizon). Each row dict
     carries `symbol`, `expected_return_pct`, `likelihood`, `time_to_target_days`,
-    `method`, and optional `rationale` and `horizon`. `forecast_score` is
-    computed server-side as expected_return_pct * likelihood / time_to_target_days.
+    `method`, `expires_in_hours`, and optional `rationale`, `horizon`,
+    `distribution`, `forecast_run_id`. `forecast_score` is computed server-side as
+    expected_return_pct * likelihood / time_to_target_days.
 
-    Multi-horizon: the same symbol may appear up to 4 times with different
-    `time_to_target_days` (≤1d → 'intraday', 2-5d → 'near', 6-30d → 'far',
-    31+d → 'cycle'). Each (agent, symbol, horizon) triple is an independent row.
-    Pass `horizon` explicitly to override the auto-derived bucket.
+    Multi-horizon: the same symbol may appear in multiple rows under different
+    horizons (5m, 1h, intraday, near, far, cycle). Each (agent, symbol, horizon)
+    triple is an independent row. Pass `horizon` explicitly to override the
+    auto-derived bucket from `time_to_target_days`.
 
-    Default expires_in_hours is 2 — intraday forecasts should be refreshed
-    every hourly review cycle; longer-horizon rows auto-expire if not re-submitted.
+    `distribution` is the full probabilistic belief (closed schema validated
+    by meta_agent.distribution_validator). Optional — legacy scalar-only
+    forecasts keep working with NULL distribution.
+
+    `forecast_run_id` is a UUID stamped by conviction_from_model when a single
+    model run produces multiple horizon rows + a scalar conviction. All rows
+    from the same run share the id; allocator + scorer use it to trace.
+
+    `expires_in_hours` is REQUIRED per row — same bounds as convictions
+    (5min ≤ x ≤ 720h). Multi-horizon submissions can mix expiries: a 5m
+    forecast can carry expires_in_hours=0.5, a cycle forecast 168.
 
     Returns {inserted, errors[]}. Per-row failures (validation, type errors)
     are collected and returned alongside the success count rather than aborting
     the whole batch — partial inserts are fine since each upsert is atomic."""
     if not rows:
         return {"inserted": 0, "errors": []}
+
+    # Lazy import — avoids circular when validator imports nothing from store.
+    from meta_agent.distribution_validator import validate_distribution
 
     prepared: list[tuple] = []
     errors: list[dict] = []
@@ -1477,11 +1553,40 @@ async def upsert_forecasts_batch(
                 raise ValueError(f"time_to_target_days must be > 0, got {ttd}")
             if not method:
                 raise ValueError("method is required (free-text describing source)")
+            if "expires_in_hours" not in r or r["expires_in_hours"] is None:
+                raise ValueError(
+                    "expires_in_hours is required per forecast row (no default); "
+                    "set a thesis-relevant horizon"
+                )
+            row_ttl = float(r["expires_in_hours"])
+            if row_ttl < CONVICTION_EXPIRY_MIN_HOURS:
+                raise ValueError(
+                    f"expires_in_hours={row_ttl} below minimum "
+                    f"{CONVICTION_EXPIRY_MIN_HOURS:.4f} (5 min)"
+                )
+            if row_ttl > CONVICTION_EXPIRY_MAX_HOURS:
+                raise ValueError(
+                    f"expires_in_hours={row_ttl} above maximum "
+                    f"{CONVICTION_EXPIRY_MAX_HOURS} (30 days)"
+                )
             score = (er * lk) / ttd
             horizon = str(r.get("horizon") or _derive_horizon(ttd))
-            if horizon not in {"intraday", "near", "far", "cycle"}:
-                raise ValueError(f"horizon must be one of intraday/near/far/cycle, got {horizon!r}")
-            prepared.append((agent_name, sym, horizon, er, lk, ttd, score, method, rationale))
+            if horizon not in _VALID_HORIZONS:
+                raise ValueError(f"horizon must be one of {sorted(_VALID_HORIZONS)}, got {horizon!r}")
+
+            distribution = r.get("distribution")
+            if distribution is not None:
+                ok, reason = validate_distribution(distribution)
+                if not ok:
+                    raise ValueError(f"distribution invalid: {reason}")
+
+            forecast_run_id = r.get("forecast_run_id")  # caller may pass UUID str or None
+            prepared.append((
+                agent_name, sym, horizon, er, lk, ttd, score, method, rationale,
+                json.dumps(distribution) if distribution is not None else None,
+                forecast_run_id,
+                str(row_ttl),  # $12 — interval text, casted to interval in SQL
+            ))
         except (KeyError, ValueError, TypeError) as exc:
             errors.append({"row": r, "error": f"{type(exc).__name__}: {exc}"})
 
@@ -1495,9 +1600,10 @@ async def upsert_forecasts_batch(
                 """INSERT INTO agent_forecast
                      (agent_name, symbol, horizon, expected_return_pct, likelihood,
                       time_to_target_days, forecast_score, method, rationale,
-                      expires_at)
+                      distribution, forecast_run_id, expires_at)
                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
-                           NOW() + ($10 || ' hours')::interval)
+                           $10::jsonb, $11::uuid,
+                           NOW() + ($12 || ' hours')::interval)
                    ON CONFLICT (agent_name, symbol, horizon) DO UPDATE SET
                      expected_return_pct = EXCLUDED.expected_return_pct,
                      likelihood          = EXCLUDED.likelihood,
@@ -1505,43 +1611,124 @@ async def upsert_forecasts_batch(
                      forecast_score      = EXCLUDED.forecast_score,
                      method              = EXCLUDED.method,
                      rationale           = EXCLUDED.rationale,
+                     distribution        = EXCLUDED.distribution,
+                     forecast_run_id     = EXCLUDED.forecast_run_id,
                      submitted_at        = NOW(),
-                     expires_at          = NOW() + ($10 || ' hours')::interval,
+                     expires_at          = NOW() + ($12 || ' hours')::interval,
                      realized_return_pct = NULL,
                      resolved_at         = NULL,
-                     resolution_source   = NULL""",
-                [(*t, str(expires_in_hours)) for t in prepared],
+                     resolution_source   = NULL,
+                     score_logloss       = NULL,
+                     score_brier         = NULL,
+                     score_crps          = NULL,
+                     score_pinball05     = NULL,
+                     score_pinball95     = NULL,
+                     realized_bin_idx    = NULL""",
+                prepared,
             )
     return {"inserted": len(prepared), "errors": errors}
 
 
 async def clear_agent_forecasts(agent_name: str, horizon: str | None = None) -> int:
-    """Delete forecast rows for this agent. Called at start of every
-    hourly review so the new batch fully replaces the prior hour's slate.
+    """Soft-delete (set expires_at = NOW()) forecast rows for this agent. Called
+    at start of every hourly review so the new batch fully replaces the prior
+    hour's slate, but the row stays on disk so the resolver-scorer can still
+    grade an already-passed forecast that the agent retracted.
+
+    Only affects currently-active (non-expired) rows; resolved/expired rows
+    remain untouched.
 
     Args:
         agent_name: The agent whose forecasts to clear.
-        horizon: Optional — clear only this horizon ('intraday', 'near', 'far',
-                 'cycle'). If None (default), clears all horizons. Useful when
-                 an agent refreshes only their intraday forecasts each hour but
-                 wants to preserve weekly cycle forecasts.
+        horizon: Optional — clear only this horizon. If None (default), clears
+                 all horizons. Useful when an agent refreshes only their
+                 intraday/5m forecasts each hour but wants to preserve weekly
+                 cycle forecasts.
     """
     pool = await get_pool()
     async with pool.acquire() as conn:
         if horizon:
             result = await conn.execute(
-                "DELETE FROM agent_forecast WHERE agent_name=$1 AND horizon=$2",
+                """UPDATE agent_forecast SET expires_at = NOW()
+                   WHERE agent_name=$1 AND horizon=$2 AND expires_at > NOW()""",
                 agent_name, horizon,
             )
         else:
             result = await conn.execute(
-                "DELETE FROM agent_forecast WHERE agent_name=$1",
+                """UPDATE agent_forecast SET expires_at = NOW()
+                   WHERE agent_name=$1 AND expires_at > NOW()""",
                 agent_name,
             )
         try:
             return int(result.split()[-1])
         except (ValueError, IndexError):
             return 0
+
+
+async def get_active_distributions(symbol: str | None = None) -> list[dict]:
+    """Active forecast rows that carry a distribution JSONB. Used by the
+    allocator's mixture-distribution step.
+
+    Args:
+        symbol: Optional — restrict to one symbol. None = all symbols.
+
+    Returns rows with id, agent_name, symbol, horizon, distribution,
+    forecast_run_id, time_to_target_days, expected_return_pct, submitted_at,
+    expires_at.
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        if symbol:
+            rows = await conn.fetch(
+                """SELECT id, agent_name, symbol, horizon, distribution,
+                          forecast_run_id, time_to_target_days,
+                          expected_return_pct, submitted_at, expires_at
+                   FROM agent_forecast
+                   WHERE symbol=$1 AND expires_at > NOW()
+                     AND distribution IS NOT NULL""",
+                symbol.upper(),
+            )
+        else:
+            rows = await conn.fetch(
+                """SELECT id, agent_name, symbol, horizon, distribution,
+                          forecast_run_id, time_to_target_days,
+                          expected_return_pct, submitted_at, expires_at
+                   FROM agent_forecast
+                   WHERE expires_at > NOW() AND distribution IS NOT NULL"""
+            )
+        return [dict(r) for r in rows]
+
+
+async def upsert_news_features(symbol: str, window_minutes: int, payload: dict) -> None:
+    """Persist a precomputed news-feature snapshot. Insert-only (snapshot_at
+    is part of the PK); callers periodically prune old rows."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO news_features (symbol, window_minutes, snapshot_at, payload)
+               VALUES ($1, $2, NOW(), $3::jsonb)
+               ON CONFLICT (symbol, window_minutes, snapshot_at) DO NOTHING""",
+            symbol.upper(), int(window_minutes), json.dumps(payload),
+        )
+
+
+async def get_latest_news_features(symbol: str, window_minutes: int) -> Optional[dict]:
+    """Most recent news-features payload for a symbol/window. None if no
+    snapshot has been written."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT payload, snapshot_at FROM news_features
+               WHERE symbol=$1 AND window_minutes=$2
+               ORDER BY snapshot_at DESC LIMIT 1""",
+            symbol.upper(), int(window_minutes),
+        )
+        if not row:
+            return None
+        payload = row["payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        return {**payload, "snapshot_at": row["snapshot_at"]}
 
 
 async def get_agent_active_forecasts(agent_name: str, horizon: str | None = None) -> list[dict]:
@@ -1558,6 +1745,7 @@ async def get_agent_active_forecasts(agent_name: str, horizon: str | None = None
             rows = await conn.fetch(
                 """SELECT id, symbol, horizon, expected_return_pct, likelihood,
                           time_to_target_days, forecast_score, method, rationale,
+                          distribution, forecast_run_id,
                           submitted_at, expires_at
                    FROM agent_forecast
                    WHERE agent_name=$1 AND horizon=$2 AND expires_at > NOW()
@@ -1568,14 +1756,18 @@ async def get_agent_active_forecasts(agent_name: str, horizon: str | None = None
             rows = await conn.fetch(
                 """SELECT id, symbol, horizon, expected_return_pct, likelihood,
                           time_to_target_days, forecast_score, method, rationale,
+                          distribution, forecast_run_id,
                           submitted_at, expires_at
                    FROM agent_forecast
                    WHERE agent_name=$1 AND expires_at > NOW()
                    ORDER BY
-                       CASE horizon WHEN 'intraday' THEN 0
-                                    WHEN 'near'     THEN 1
-                                    WHEN 'far'      THEN 2
-                                    ELSE                 3 END,
+                       CASE horizon
+                            WHEN '5m'       THEN 0
+                            WHEN '1h'       THEN 1
+                            WHEN 'intraday' THEN 2
+                            WHEN 'near'     THEN 3
+                            WHEN 'far'      THEN 4
+                            ELSE                 5 END,
                        abs(forecast_score) DESC""",
                 agent_name,
             )
@@ -1671,7 +1863,13 @@ async def update_allocation_orders(decision_id: int, orders_placed: dict) -> Non
 async def get_decision_id_for_order(order_id: int) -> Optional[int]:
     """Reverse-lookup the allocation_decision that produced a given order_id,
     by scanning orders_placed_json. Returns None if the order wasn't placed
-    by the allocator (e.g. manual orders predating the sector-shard era)."""
+    by the allocator (e.g. manual orders predating the sector-shard era).
+
+    Diagnostic mode (Phase 2): when the primary containment misses, log the
+    most-recent allocation_decision's `orders_placed_json` shape so we can
+    confirm whether the bug is (a) malformed placed JSON, (b) sector agents
+    bypassing mike, or (c) a structural mismatch needing a real fix. Strip
+    these log lines once the root cause is confirmed in production."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -1680,7 +1878,39 @@ async def get_decision_id_for_order(order_id: int) -> Optional[int]:
                ORDER BY id DESC LIMIT 1""",
             json.dumps([{"result": {"order_id": order_id}}]),
         )
-        return int(row["id"]) if row else None
+        if row:
+            return int(row["id"])
+        # Miss — log a sample of what IS in the most-recent decision so the
+        # operator can diff the structure against what the writer stamped.
+        sample = await conn.fetchrow(
+            """SELECT id, decided_at,
+                      jsonb_typeof(orders_placed_json) AS top_type,
+                      jsonb_array_length(
+                        CASE WHEN jsonb_typeof(orders_placed_json)='array'
+                             THEN orders_placed_json ELSE '[]'::jsonb END
+                      ) AS n_orders,
+                      orders_placed_json -> 0 AS first_order
+               FROM allocation_decision
+               WHERE orders_placed_json IS NOT NULL
+               ORDER BY id DESC LIMIT 1"""
+        )
+        if sample:
+            try:
+                first = sample["first_order"]
+                if isinstance(first, str):
+                    first = json.loads(first)
+            except Exception:
+                first = None
+            logger = logging.getLogger("get_decision_id_for_order")
+            logger.warning(
+                "MISS order_id=%s — most-recent decision id=%s top_type=%s "
+                "n_orders=%s first_order_keys=%s first_order_result_keys=%s",
+                order_id, sample["id"], sample["top_type"], sample["n_orders"],
+                sorted((first or {}).keys()) if isinstance(first, dict) else None,
+                sorted(((first or {}).get("result") or {}).keys())
+                if isinstance(first, dict) and isinstance(first.get("result"), dict) else None,
+            )
+        return None
 
 
 # ── Per-agent ledger writers + readers ───────────────────────────────────────
@@ -2814,3 +3044,485 @@ async def load_concierge_history(chat_id: Optional[str], limit: int = 30) -> lis
             msg["tool_call_id"] = r["tool_call_id"]
         out.append(msg)
     return out
+
+
+# ── Watchlist (agent_watchlist) ──────────────────────────────────────────────
+# Canonical universe lives in agent_watchlist (seeded from agents/sector_map.yaml
+# at first boot; see db.schema._seed_watchlist_from_yaml). The YAML stays on
+# disk for diff-able history but SQL is authoritative — agents and the user add
+# names via add_to_watchlist / propose_watchlist_removal at runtime.
+
+async def load_agent_watchlist(agent_name: str) -> list[dict]:
+    """Active watchlist rows for one agent, ordered by added_at desc."""
+    await drain_approved_watchlist_removals()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT agent_name, symbol, bearish_via, source, added_at,
+                      added_reason, removal_pending
+               FROM agent_watchlist
+               WHERE agent_name=$1 AND removed_at IS NULL
+               ORDER BY added_at DESC""",
+            agent_name,
+        )
+    return [dict(r) for r in rows]
+
+
+async def load_all_watchlists() -> dict[str, list[dict]]:
+    """All active rows grouped by agent_name. Used by streamers/ingestors that
+    need the union of every agent's universe in one read."""
+    await drain_approved_watchlist_removals()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT agent_name, symbol, bearish_via
+               FROM agent_watchlist
+               WHERE removed_at IS NULL
+               ORDER BY agent_name, symbol"""
+        )
+    out: dict[str, list[dict]] = {}
+    for r in rows:
+        out.setdefault(r["agent_name"], []).append(dict(r))
+    return out
+
+
+async def load_watchlist_as_sector_map() -> dict:
+    """Build the legacy sector_map.yaml-shape dict from SQL:
+        {"agents": {<agent>: {"universe": {<SYMBOL>: {"bearish_via": ...}}}}}
+    Allocator's resolve_bearish_vehicle and existing consumers keep working
+    against this shape unchanged."""
+    grouped = await load_all_watchlists()
+    agents: dict[str, dict] = {}
+    for agent_name, rows in grouped.items():
+        universe: dict[str, dict] = {}
+        for r in rows:
+            universe[r["symbol"]] = {"bearish_via": r["bearish_via"]}
+        agents[agent_name] = {"universe": universe}
+    return {"agents": agents}
+
+
+async def agent_owns_symbol_db(agent_name: str, symbol: str) -> bool:
+    """SQL EXISTS on agent_watchlist. Inverse-ETF fallback stays in the caller
+    so this function only answers "is this symbol in the agent's watchlist."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT 1 FROM agent_watchlist
+               WHERE agent_name=$1 AND symbol=$2 AND removed_at IS NULL""",
+            agent_name, symbol.upper(),
+        )
+    return row is not None
+
+
+async def add_watchlist_symbol(
+    agent_name: str,
+    symbol: str,
+    reason: str,
+    source: str = "agent_added",
+    bearish_via: Optional[str] = None,
+) -> dict:
+    """Insert (or reactivate) a watchlist row. Returns {added, reactivated,
+    skipped, symbol}. If the row exists and is active, returns skipped=True.
+    If the row exists soft-deleted, clears removed_at and updates the source."""
+    sym = symbol.strip().upper()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        existing = await conn.fetchrow(
+            """SELECT id, removed_at FROM agent_watchlist
+               WHERE agent_name=$1 AND symbol=$2""",
+            agent_name, sym,
+        )
+        if existing and existing["removed_at"] is None:
+            return {"skipped": True, "reason": "already active", "symbol": sym}
+        if existing:
+            await conn.execute(
+                """UPDATE agent_watchlist
+                   SET removed_at=NULL, removed_reason=NULL, removal_pending=NULL,
+                       added_at=NOW(), added_reason=$3, source=$4,
+                       bearish_via=COALESCE($5, bearish_via)
+                   WHERE id=$1 AND agent_name=$2""",
+                existing["id"], agent_name, reason, source, bearish_via,
+            )
+            return {"reactivated": True, "symbol": sym}
+        await conn.execute(
+            """INSERT INTO agent_watchlist
+               (agent_name, symbol, bearish_via, source, added_reason)
+               VALUES ($1, $2, $3, $4, $5)""",
+            agent_name, sym, bearish_via, source, reason,
+        )
+    return {"added": True, "symbol": sym}
+
+
+async def mark_watchlist_removal_pending(
+    agent_name: str, symbol: str, proposal_id: str,
+) -> bool:
+    """Stamp removal_pending=<proposal_id> on the active row. Returns True if
+    a row was found and stamped, False if no active row for this (agent, sym)."""
+    sym = symbol.strip().upper()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE agent_watchlist
+               SET removal_pending=$3
+               WHERE agent_name=$1 AND symbol=$2 AND removed_at IS NULL""",
+            agent_name, sym, proposal_id,
+        )
+    return result.endswith(" 1") or result.endswith(" 1\x00")
+
+
+async def apply_watchlist_removal(
+    agent_name: str, symbol: str, reason: str = "approved",
+) -> bool:
+    """Soft-delete: set removed_at + removed_reason. Idempotent."""
+    sym = symbol.strip().upper()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """UPDATE agent_watchlist
+               SET removed_at=NOW(), removed_reason=$3, removal_pending=NULL
+               WHERE agent_name=$1 AND symbol=$2 AND removed_at IS NULL""",
+            agent_name, sym, reason,
+        )
+    return result.endswith(" 1")
+
+
+async def list_streamer_symbols() -> list[str]:
+    """Union of active watchlist symbols and any currently-held position. The
+    bar streamer drives its poll set from this — positions ride along even if
+    they've fallen off every agent's watchlist, so the dashboard's live-trace
+    tab always has a fresh chart for what we own."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        wl_rows = await conn.fetch(
+            "SELECT DISTINCT symbol FROM agent_watchlist WHERE removed_at IS NULL"
+        )
+        anchor = await conn.fetchrow(
+            "SELECT snapshot_json FROM positions_anchor ORDER BY recorded_at DESC LIMIT 1"
+        )
+    syms: set[str] = {r["symbol"].upper() for r in wl_rows}
+    if anchor and anchor["snapshot_json"]:
+        snap = anchor["snapshot_json"]
+        if isinstance(snap, str):
+            snap = json.loads(snap)
+        for sym, qty in (snap or {}).items():
+            try:
+                if abs(float(qty)) > 1e-9:
+                    syms.add(str(sym).upper())
+            except (TypeError, ValueError):
+                continue
+    return sorted(syms)
+
+
+async def upsert_local_bars(rows: list[dict]) -> int:
+    """Bulk UPSERT into local_bars. Each row: {symbol, bar_time (datetime),
+    interval, open, high, low, close, volume}. Returns rows attempted."""
+    if not rows:
+        return 0
+    pool = await get_pool()
+    payload = [
+        (r["symbol"].upper(), r["bar_time"], r["interval"],
+         float(r["open"]), float(r["high"]), float(r["low"]),
+         float(r["close"]), float(r["volume"]))
+        for r in rows
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """INSERT INTO local_bars
+               (symbol, bar_time, interval, open, high, low, close, volume)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (symbol, interval, bar_time) DO UPDATE
+               SET open=EXCLUDED.open,
+                   high=EXCLUDED.high,
+                   low=EXCLUDED.low,
+                   close=EXCLUDED.close,
+                   volume=EXCLUDED.volume,
+                   ingested_at=NOW()""",
+            payload,
+        )
+    return len(payload)
+
+
+async def upsert_local_bars_daily(rows: list[dict]) -> int:
+    """Bulk UPSERT into local_bars_daily. Each row: {symbol, bar_date (date),
+    open, high, low, close, volume}. Idempotent — Massive sometimes restates
+    a recent day."""
+    if not rows:
+        return 0
+    pool = await get_pool()
+    payload = [
+        (r["symbol"].upper(), r["bar_date"],
+         float(r["open"]), float(r["high"]), float(r["low"]),
+         float(r["close"]), float(r["volume"]))
+        for r in rows
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """INSERT INTO local_bars_daily
+               (symbol, bar_date, open, high, low, close, volume)
+               VALUES ($1, $2, $3, $4, $5, $6, $7)
+               ON CONFLICT (symbol, bar_date) DO UPDATE
+               SET open=EXCLUDED.open,
+                   high=EXCLUDED.high,
+                   low=EXCLUDED.low,
+                   close=EXCLUDED.close,
+                   volume=EXCLUDED.volume,
+                   ingested_at=NOW()""",
+            payload,
+        )
+    return len(payload)
+
+
+async def get_recent_daily_bars(symbol: str, days: int = 365) -> list[dict]:
+    """Last N days of daily bars, oldest-first. Used by the dashboard's
+    per-ticker chart for the 1Y view. No fallback to Massive — the daily
+    ingestor (scripts/ingest_daily_bars.py) keeps this current."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            f"""SELECT bar_date, open, high, low, close, volume
+                FROM local_bars_daily
+                WHERE symbol=$1
+                  AND bar_date > (CURRENT_DATE - INTERVAL '{int(days)} days')
+                ORDER BY bar_date ASC""",
+            symbol.upper(),
+        )
+    return [dict(r) for r in rows]
+
+
+async def prune_local_bars(retention_days: int = 14) -> int:
+    """Delete local_bars rows older than retention_days. Returns rows deleted."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            f"DELETE FROM local_bars WHERE bar_time < NOW() - INTERVAL '{int(retention_days)} days'"
+        )
+    # asyncpg returns 'DELETE <n>'
+    try:
+        return int(result.split()[-1])
+    except (ValueError, IndexError):
+        return 0
+
+
+async def upsert_local_bar_indicators(rows: list[dict]) -> int:
+    """Bulk UPSERT into local_bar_indicators. Each row: {symbol, bar_time,
+    rsi_14, sma_20, bb_upper, bb_lower, rolling_std_20, rolling_return_1bar}.
+    Any indicator can be None when there's not enough history yet."""
+    if not rows:
+        return 0
+    pool = await get_pool()
+    payload = [
+        (r["symbol"].upper(), r["bar_time"],
+         r.get("rsi_14"), r.get("sma_20"),
+         r.get("bb_upper"), r.get("bb_lower"),
+         r.get("rolling_std_20"), r.get("rolling_return_1bar"))
+        for r in rows
+    ]
+    async with pool.acquire() as conn:
+        await conn.executemany(
+            """INSERT INTO local_bar_indicators
+               (symbol, bar_time, rsi_14, sma_20, bb_upper, bb_lower,
+                rolling_std_20, rolling_return_1bar)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (symbol, bar_time) DO UPDATE
+               SET rsi_14=EXCLUDED.rsi_14,
+                   sma_20=EXCLUDED.sma_20,
+                   bb_upper=EXCLUDED.bb_upper,
+                   bb_lower=EXCLUDED.bb_lower,
+                   rolling_std_20=EXCLUDED.rolling_std_20,
+                   rolling_return_1bar=EXCLUDED.rolling_return_1bar""",
+            payload,
+        )
+    return len(payload)
+
+
+async def enqueue_job_coalesced(
+    agent_name: str,
+    job_type: str,
+    payload: dict,
+    *,
+    priority: int = 10,
+    coalesce_key: Optional[str] = None,
+    coalesce_window_s: int = 60,
+    triggers_seen: Optional[list] = None,
+) -> dict:
+    """Insert an agent_job row, or merge into an existing queued/running job
+    sharing the same coalesce_key inside the window. Returns {action,
+    job_id}; action ∈ {"enqueued","coalesced"}.
+
+    Coalescing protects OCAP from storms — a SPY -3% bar that breaches three
+    rules in one cycle fires one job whose `triggers_seen` JSONB captures
+    all three, instead of three separate jobs racing through the queue."""
+    pool = await get_pool()
+    payload_json = json.dumps(payload, default=str)
+    async with pool.acquire() as conn:
+        if coalesce_key:
+            existing = await conn.fetchrow(
+                """SELECT id, triggers_seen FROM agent_job
+                   WHERE coalesce_key=$1 AND status IN ('queued','running')
+                     AND enqueued_at > NOW() - ($2 || ' seconds')::interval
+                   ORDER BY enqueued_at DESC LIMIT 1""",
+                coalesce_key, str(int(coalesce_window_s)),
+            )
+            if existing:
+                prior = existing["triggers_seen"]
+                if isinstance(prior, str):
+                    prior = json.loads(prior)
+                merged = list(prior or [])
+                for t in (triggers_seen or []):
+                    if t not in merged:
+                        merged.append(t)
+                await conn.execute(
+                    "UPDATE agent_job SET triggers_seen=$2::jsonb WHERE id=$1",
+                    existing["id"], json.dumps(merged),
+                )
+                return {"action": "coalesced", "job_id": existing["id"]}
+        row = await conn.fetchrow(
+            """INSERT INTO agent_job
+                 (agent_name, job_type, priority, payload,
+                  coalesce_key, triggers_seen)
+               VALUES ($1, $2, $3, $4::jsonb, $5, $6::jsonb)
+               RETURNING id""",
+            agent_name, job_type, int(priority), payload_json,
+            coalesce_key,
+            json.dumps(triggers_seen) if triggers_seen else None,
+        )
+    return {"action": "enqueued", "job_id": row["id"]}
+
+
+async def pick_next_job(worker_id: str) -> Optional[dict]:
+    """Atomically claim the next queued job. Returns the row dict, or None if
+    nothing is ready. Workers should loop on this with a small sleep.
+
+    Lock-free across multiple workers via FOR UPDATE SKIP LOCKED — each worker
+    sees a different row even when several pull simultaneously."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                """SELECT id, agent_name, job_type, priority, payload,
+                          triggers_seen, coalesce_key, enqueued_at
+                   FROM agent_job
+                   WHERE status='queued'
+                   ORDER BY priority ASC, enqueued_at ASC
+                   FOR UPDATE SKIP LOCKED
+                   LIMIT 1"""
+            )
+            if not row:
+                return None
+            await conn.execute(
+                """UPDATE agent_job
+                   SET status='running', started_at=NOW(), worker_id=$2
+                   WHERE id=$1""",
+                row["id"], worker_id,
+            )
+    return dict(row)
+
+
+async def mark_job_done(job_id: int) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_job SET status='done', finished_at=NOW() WHERE id=$1",
+            job_id,
+        )
+
+
+async def set_job_skill_result(job_id: int, skill_result: dict) -> None:
+    """Persist the run_skill.py rollup JSON (session_id, iterations, finish,
+    validation_errors, write_summary) onto the job row so operators can
+    debug queue-driven skills without log-grepping. Called by the worker
+    after the subprocess returns, before marking done/failed."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE agent_job SET skill_result=$2::jsonb WHERE id=$1",
+            job_id, json.dumps(skill_result, default=str),
+        )
+
+
+async def mark_job_failed(job_id: int, error: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE agent_job
+               SET status='failed', finished_at=NOW(), error=$2
+               WHERE id=$1""",
+            job_id, error[:8000],
+        )
+
+
+async def mark_job_skipped(job_id: int, reason: str) -> None:
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE agent_job
+               SET status='skipped', finished_at=NOW(), error=$2
+               WHERE id=$1""",
+            job_id, reason[:8000],
+        )
+
+
+async def get_queue_stats() -> dict:
+    """Snapshot of queue health — used by the worker daemon's heartbeat log
+    and (later) by an MCP observability tool."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT status, COUNT(*) AS n FROM agent_job GROUP BY status"""
+        )
+        oldest = await conn.fetchval(
+            "SELECT MIN(enqueued_at) FROM agent_job WHERE status='queued'"
+        )
+    by_status = {r["status"]: r["n"] for r in rows}
+    return {
+        "queued": by_status.get("queued", 0),
+        "running": by_status.get("running", 0),
+        "done_lifetime": by_status.get("done", 0),
+        "failed_lifetime": by_status.get("failed", 0),
+        "skipped_lifetime": by_status.get("skipped", 0),
+        "oldest_queued_at": oldest,
+    }
+
+
+async def get_recent_local_bars(
+    symbol: str, n: int = 78, interval: str = "5min",
+) -> list[dict]:
+    """Latest N bars for one symbol, oldest-first. Used by the dashboard +
+    indicator compute. Returns [{bar_time, open, high, low, close, volume}]."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT bar_time, open, high, low, close, volume
+               FROM local_bars
+               WHERE symbol=$1 AND interval=$2
+               ORDER BY bar_time DESC
+               LIMIT $3""",
+            symbol.upper(), interval, int(n),
+        )
+    return [dict(r) for r in reversed(rows)]
+
+
+async def drain_approved_watchlist_removals() -> int:
+    """Find approval proposals with kind='watchlist_removal' and status='approved'
+    that haven't been applied yet (status != 'placed'); apply the soft-delete
+    and flip the proposal to 'placed'. Lazily invoked from the watchlist
+    loaders so approved removals materialize within seconds of approval without
+    a separate cron. Returns count applied."""
+    from approval import proposals as _proposals
+    approved = _proposals.list_by("watchlist_removal", ("approved",))
+    if not approved:
+        return 0
+    applied = 0
+    for p in approved:
+        payload = p.get("payload") or {}
+        agent_name = payload.get("agent_name")
+        symbol = payload.get("symbol")
+        if not (agent_name and symbol):
+            continue
+        ok = await apply_watchlist_removal(
+            agent_name, symbol, reason=f"approved {p['id'][:8]}",
+        )
+        if ok:
+            _proposals.mark_placed(p["id"])
+            applied += 1
+    return applied

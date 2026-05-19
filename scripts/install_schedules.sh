@@ -13,8 +13,8 @@
 #
 # Sector review/evening/model_tune skills run via the Python pipeline
 # (scripts/run_skill.py). Director skills (mike-{morning,midday,allocator},
-# cassidy-evening, hourly-review heartbeat, titan legacy) still go through
-# the Claude Code harness via scripts/run_scheduled_skill.sh.
+# cassidy-evening, hourly-review heartbeat) still go through the Claude
+# Code harness via scripts/run_scheduled_skill.sh.
 #
 # Idempotent: re-running this script just refreshes the unit files, then
 # re-enables the timers. Safe to run on every deploy / config change.

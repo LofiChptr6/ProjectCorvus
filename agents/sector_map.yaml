@@ -190,8 +190,14 @@ agents:
       KRE:   {bearish_via: skip}
       IAI:   {bearish_via: skip}
 
-  titan:
-    description: Energy + materials + commodities — integrated, refining, services, midstream, metals, chemicals
+  # NOTE: The legacy `titan` block was decommissioned 2026-04; its
+  # energy/materials/commodities universe was split into two specialist
+  # agents below. The titan persona + skill files were fully removed in
+  # the 2026-05-19 cleanup. See agents/AGENT_LIFECYCLE.md for the
+  # split-or-delete protocol.
+
+  energy:
+    description: Oil & gas / refiners / services / midstream — integrated majors, E&P, refining, oilfield services, pipelines + energy ETFs
     universe:
       XOM:   {bearish_via: skip}
       CVX:   {bearish_via: skip}
@@ -210,6 +216,12 @@ agents:
       ET:    {bearish_via: skip}
       EPD:   {bearish_via: skip}
       OKE:   {bearish_via: skip}
+      XLE:   {bearish_via: 'inverse_etf:DUG'}
+      USO:   {bearish_via: 'inverse_etf:SCO'}
+
+  commodity:
+    description: Metals + materials + chemicals — precious metals, base metals, miners, industrial gases, specialty chemicals
+    universe:
       LIN:   {bearish_via: skip}
       APD:   {bearish_via: skip}
       SHW:   {bearish_via: skip}
@@ -222,8 +234,6 @@ agents:
       TECK:  {bearish_via: skip}
       RIO:   {bearish_via: skip}
       BHP:   {bearish_via: skip}
-      XLE:   {bearish_via: 'inverse_etf:DUG'}
-      USO:   {bearish_via: 'inverse_etf:SCO'}
 
   vera:
     description: Healthcare — pharma, biotech, med devices, tools, insurers, hospitals

@@ -2,6 +2,8 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
+import pandas as pd
+from datetime import datetime, timedelta
 
 def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < 60:
@@ -59,4 +61,4 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         },
     }
 
-MODEL_VERSION = "1.1"
+MODEL_VERSION = "1.2"

@@ -495,30 +495,33 @@ def _build_desk_policy_text() -> str:
     catalog = _format_inverse_catalog()
     return f"""
 
-[DESK POLICY: WORKSPACE — agents/<you>/notes /watchlist /data]
+[DESK POLICY: WORKSPACE — notes /watchlist /data]
 
-You have a per-agent workspace folder at `agents/<your-name>/` that
-persists across sessions:
+You have a per-agent workspace that persists across sessions:
 
-  - `notes/` — free-form markdown the agent writes to itself: partial
-    theses, framework drafts, catalyst calendars, "things to check
-    tomorrow." The user can also drop files here.
-  - `watchlist.md` — a list of names that demand your attention this
-    hour. Both you AND the user edit this file; you're expected to
-    research every entry on each review.
-  - `data/` — saved snapshots, CSV exports, computed signals you want
-    to read across sessions without going back through Massive.
+  - `notes/` (on disk at `agents/<your-name>/notes/`) — free-form markdown
+    the agent writes to itself: partial theses, framework drafts, catalyst
+    calendars, "things to check tomorrow." The user can also drop files here.
+  - watchlist (in the `agent_watchlist` SQL table) — the names you currently
+    track. Each row is `(agent_name, symbol, bearish_via, source, added_at,
+    added_reason)`. Both you AND the user can add via tools; you're expected
+    to research every active entry on each review. Cross-agent overlap is
+    allowed — gold may sit in both atlas and commodity watchlists.
+  - `data/` (on disk at `agents/<your-name>/data/`) — saved snapshots, CSV
+    exports, computed signals you want to read across sessions without
+    going back through Massive.
 
 WORKFLOW EVERY REVIEW (hourly + evening):
 
   1. STEP 1 of your review must call `read_my_workspace(agent_name="<you>")`
-     and incorporate the contents into your analysis. If the user dropped
-     a name into `watchlist.md`, research it. If a previous note flagged
-     "verify on Monday open," verify it.
+     and incorporate the contents into your analysis. The response carries
+     a `watchlist` list (SQL rows) and a `notes` list (markdown files).
 
   2. To add a name to your watchlist (because you want to track it but
      it's not yet conviction-grade), call
      `add_to_watchlist(agent_name="<you>", symbol="XYZ", reason="...")`.
+     This inserts a row in `agent_watchlist` (or reactivates a soft-deleted
+     one).
 
   3. To DROP a name from your watchlist (because the thesis no longer
      applies, the catalyst passed, or it's no longer in your sector
@@ -526,8 +529,8 @@ WORKFLOW EVERY REVIEW (hourly + evening):
      `propose_watchlist_removal(agent_name="<you>", symbol="XYZ",
                                   reasoning="...")`.
      This creates a Telegram-approval proposal — the user must confirm
-     before the line is removed from the file. Reasoning must be ≥30
-     chars and concrete; the user reads it on their phone to decide.
+     before the row is soft-deleted. Reasoning must be ≥30 chars and
+     concrete; the user reads it on their phone to decide.
 
   4. To save a note for next session, call
      `write_my_note(agent_name="<you>", filename="<short>.md",
@@ -685,6 +688,29 @@ Your quant models already compute both. Pass them through directly:
 
 direction='flat' with conviction=0 is the only path that may omit them — it's
 the canonical "I have no view on this name today" submission.
+
+
+[DESK POLICY: EVERY CONVICTION MUST CARRY A CUSTOM expires_in_hours]
+
+submit_conviction_view and submit_conviction_from_model both REQUIRE
+`expires_in_hours` per call — there is no default. The value must match
+the thesis horizon: a scalp and a multi-day swing should NOT get the same
+expiry. The MCP tool rejects values outside [0.0833, 720] (5 min to 30 days).
+
+Pick by catalyst type:
+  - intraday momentum / scalp / pre-earnings drift  → 0.25 – 4 hours
+  - overnight position / next-session catalyst      → 4 – 24 hours
+  - 1-day to 1-week swing                           → 24 – 168 hours
+  - multi-week macro / regime call (rare)           → 168 – 720 hours
+
+The allocator drops convictions once they expire; you must re-publish
+before then to stay in the stack. Short expiries mean tighter
+re-publication discipline; long expiries mean you're committing to a
+view for that long.
+
+direction='flat' submissions still require expires_in_hours — a flat
+publication is itself a "no view for this horizon" statement and the
+allocator uses the expiry to know when to revisit.
 
 
 [DESK POLICY: COMMITMENT VS DRIFT — DON'T FLAT JUST BECAUSE PRICE WENT AGAINST YOU]

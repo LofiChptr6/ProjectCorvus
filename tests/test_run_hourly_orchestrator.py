@@ -1,8 +1,10 @@
 """Unit tests for scripts/run_hourly_orchestrator.py.
 
 Pure-function tests for guard + outcome-line formatting are offline.
-Async main()/_run_sector/_run_allocator tests stub _run_subprocess_impl so
-no real processes spawn; runtime is sub-second.
+Async main() tests stub both `_run_subprocess_impl` (allocator + heartbeat
+still subprocess) and `_prime_queue_for_agent` (the queue-prime path that
+replaced the per-sector subprocess fan-out), so no real processes spawn
+and no DB writes happen; runtime is sub-second.
 """
 from __future__ import annotations
 
@@ -154,6 +156,37 @@ def _make_subprocess_stub(orch, monkeypatch, results_by_skill: dict[str, dict]):
     return calls_log
 
 
+def _stub_queue_prime(orch, monkeypatch, watchlist_size: int = 30,
+                      exception_for: set[str] | None = None):
+    """Replace `prime_agent_queue` so we don't need a live DB. Returns the
+    list of agents the stub was called for so tests can assert fan-out."""
+    calls: list[str] = []
+
+    async def _stub(agent: str) -> dict:
+        calls.append(agent)
+        if exception_for and agent in exception_for:
+            raise RuntimeError(f"forced for {agent}")
+        return {
+            "agent": agent,
+            "sector_summary_enqueued": 1,
+            "sector_summary_coalesced": 0,
+            "ticker_review_enqueued": watchlist_size,
+            "ticker_review_coalesced": 0,
+            "watchlist_size": watchlist_size,
+        }
+
+    import meta_agent.queue_primer as _primer
+    monkeypatch.setattr(_primer, "prime_agent_queue", _stub)
+    # Also stub the queue-stats heartbeat at the end of phase 1a.
+    async def _fake_stats():
+        return {"queued": watchlist_size * len(orch.PIPELINE_SECTORS), "running": 0,
+                "done_lifetime": 0, "failed_lifetime": 0, "skipped_lifetime": 0,
+                "oldest_queued_at": None}
+    import db.store as _store
+    monkeypatch.setattr(_store, "get_queue_stats", _fake_stats)
+    return calls
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # main() guard path — heartbeat only
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,39 +218,39 @@ async def test_main_weekend_runs_heartbeat_only(orch, monkeypatch):
 async def test_main_full_pipeline_happy_path(orch, monkeypatch):
     monkeypatch.setattr(orch, "_is_quiet_or_weekend",
                         lambda *a, **kw: (False, False))
-    calls = _make_subprocess_stub(orch, monkeypatch, {})
+    primed = _stub_queue_prime(orch, monkeypatch)
+    sub_calls = _make_subprocess_stub(orch, monkeypatch, {})
 
     rc = await orch.main()
     assert rc == 0
 
-    keys = [c["key"] for c in calls]
-    # All 11 sectors + allocator + heartbeat in order
-    assert set(keys[: len(orch.PIPELINE_SECTORS)]) == set(orch.PIPELINE_SECTORS)
-    assert keys[-2] == "mike-allocator"
-    assert keys[-1] == "hourly-review"
-    assert len(keys) == len(orch.PIPELINE_SECTORS) + 2
+    # Phase 1a: queue primed for every sector
+    assert set(primed) == set(orch.PIPELINE_SECTORS)
+    # Phase 2 + 3: allocator + heartbeat subprocesses still run
+    sub_keys = [c["key"] for c in sub_calls]
+    assert sub_keys == ["mike-allocator", "hourly-review"]
 
 
-async def test_main_continues_when_sectors_fail(orch, monkeypatch):
-    """If sectors fail, phase 2+3 must still run."""
+async def test_main_continues_when_a_sector_prime_fails(orch, monkeypatch):
+    """If one agent's queue prime raises, the rest still prime and phase 2+3 run."""
     monkeypatch.setattr(orch, "_is_quiet_or_weekend",
                         lambda *a, **kw: (False, False))
-    calls = _make_subprocess_stub(orch, monkeypatch, {
-        "atlas": {"exit_code": 1, "duration_ms": 50},
-        "maya":  {"exit_code": -9, "duration_ms": 900000, "timed_out": True},
-    })
+    primed = _stub_queue_prime(orch, monkeypatch, exception_for={"atlas", "maya"})
+    sub_calls = _make_subprocess_stub(orch, monkeypatch, {})
 
     rc = await orch.main()
     assert rc == 0
-    keys = [c["key"] for c in calls]
-    assert "mike-allocator" in keys
-    assert "hourly-review" in keys
+    # Every agent was attempted (asyncio.gather with return_exceptions=True).
+    assert set(primed) == set(orch.PIPELINE_SECTORS)
+    sub_keys = [c["key"] for c in sub_calls]
+    assert sub_keys == ["mike-allocator", "hourly-review"]
 
 
 async def test_main_continues_when_allocator_times_out(orch, monkeypatch):
     """Allocator timeout doesn't block phase 3 heartbeat."""
     monkeypatch.setattr(orch, "_is_quiet_or_weekend",
                         lambda *a, **kw: (False, False))
+    _stub_queue_prime(orch, monkeypatch)
     calls = _make_subprocess_stub(orch, monkeypatch, {
         "mike-allocator": {"exit_code": -9, "duration_ms": 180000, "timed_out": True},
     })
@@ -232,6 +265,7 @@ async def test_main_continues_when_allocator_guard_skip(orch, monkeypatch):
     """Allocator exit=2 (guard skip) is normal; heartbeat still runs."""
     monkeypatch.setattr(orch, "_is_quiet_or_weekend",
                         lambda *a, **kw: (False, False))
+    _stub_queue_prime(orch, monkeypatch)
     calls = _make_subprocess_stub(orch, monkeypatch, {
         "mike-allocator": {"exit_code": 2, "duration_ms": 1200},
     })
@@ -243,44 +277,16 @@ async def test_main_continues_when_allocator_guard_skip(orch, monkeypatch):
 
 
 async def test_main_passes_correct_timeouts(orch, monkeypatch):
-    """Per-skill timeouts must match the constants."""
+    """Allocator + heartbeat timeouts must still match the constants."""
     monkeypatch.setattr(orch, "_is_quiet_or_weekend",
                         lambda *a, **kw: (False, False))
+    _stub_queue_prime(orch, monkeypatch)
     calls = _make_subprocess_stub(orch, monkeypatch, {})
 
     await orch.main()
     by_key = {c["key"]: c for c in calls}
-    assert by_key["atlas"]["timeout_sec"] == orch.SKILL_TIMEOUT_SEC
     assert by_key["mike-allocator"]["timeout_sec"] == orch.ALLOCATOR_TIMEOUT_SEC
     assert by_key["hourly-review"]["timeout_sec"] == orch.HEARTBEAT_TIMEOUT_SEC
-
-
-async def test_main_sector_concurrency_respected(orch, monkeypatch):
-    """Concurrency limit (CONCURRENCY=4) must be honored — never >N in flight."""
-    monkeypatch.setattr(orch, "_is_quiet_or_weekend",
-                        lambda *a, **kw: (False, False))
-    monkeypatch.setattr(orch, "CONCURRENCY", 3)
-
-    in_flight = 0
-    max_in_flight = 0
-    lock = asyncio.Lock()
-
-    async def _slow_stub(args, log_path, timeout_sec):
-        nonlocal in_flight, max_in_flight
-        async with lock:
-            in_flight += 1
-            max_in_flight = max(max_in_flight, in_flight)
-        try:
-            await asyncio.sleep(0.05)
-        finally:
-            async with lock:
-                in_flight -= 1
-        return {"args": args, "exit_code": 0, "duration_ms": 50, "timed_out": False}
-
-    monkeypatch.setattr(orch, "_run_subprocess_impl", _slow_stub)
-
-    await orch.main()
-    assert max_in_flight <= 3
 
 
 # ─────────────────────────────────────────────────────────────────────────────

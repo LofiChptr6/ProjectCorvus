@@ -52,7 +52,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         parts["sma20_slope_up"] = slope_up
 
     direction = "long" if score > 0.5 else "flat"
-    e_return = round(score * 6.0, 3) if direction != "flat" else 0.0
+    e_return = round(score * 4.0, 3) if direction != "flat" else 0.0
     horizon = 60
     conviction = round(abs(e_return) / horizon, 4) if horizon else 0.0
 
@@ -77,4 +77,4 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         },
     }
 
-MODEL_VERSION = "1.1"
+MODEL_VERSION = "1.2"

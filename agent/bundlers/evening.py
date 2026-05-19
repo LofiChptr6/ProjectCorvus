@@ -44,7 +44,7 @@ async def get_evening_bundle(agent_name: str) -> EveningBundle:
     warnings: list[str] = []
     today_iso = _date.today().isoformat()
 
-    workspace = read_workspace(agent_name)
+    workspace = await read_workspace(agent_name)
 
     # Combined P&L (realized + unrealized) — best-effort.
     pnl_today: Optional[dict[str, Any]] = None

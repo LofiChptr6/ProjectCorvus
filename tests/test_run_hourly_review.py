@@ -202,7 +202,7 @@ def full_state():
         "balances": {"nav": 50000, "cash": 5000},
         "positions": [{"symbol": "A", "quantity": 10}, {"symbol": "B", "quantity": 0}, {"symbol": "C", "quantity": 5}],
         "open_orders": [{"symbol": "X", "id": 1}, {"symbol": "Y", "id": 2}],
-        "pnl": {"totals": {"total_pnl": 123.45}},
+        "pnl_windows": {"desk": {"today": {"pnl_usd": 123.45}, "wtd": {"pnl_usd": 200.0}}},
         "proposals": [{"id": "p1"}],
         "fills": [{"action": "BOT", "symbol": "NVDA", "order_id": 100},
                   {"action": "SLD", "symbol": "VOO", "order_id": 101}],
@@ -212,7 +212,7 @@ def full_state():
 def test_compose_heartbeat_full_layout(runner, full_state):
     out = runner._compose_heartbeat(
         full_state["market"], full_state["ks"], full_state["balances"],
-        full_state["positions"], full_state["open_orders"], full_state["pnl"],
+        full_state["positions"], full_state["open_orders"], full_state["pnl_windows"],
         full_state["proposals"], full_state["fills"], "monitor NVDA earnings AH",
     )
     assert "*Heartbeat" in out
@@ -221,7 +221,7 @@ def test_compose_heartbeat_full_layout(runner, full_state):
     assert "2 working orders" in out
     assert "1 approval-gated" in out
     assert "kill=ok" in out
-    assert "$123" in out
+    assert "day P&L=$123" in out
     assert "monitor NVDA earnings AH" in out
     assert "NAV $50,000" in out and "cash 10%" in out and "2 positions" in out
 
@@ -229,7 +229,7 @@ def test_compose_heartbeat_full_layout(runner, full_state):
 def test_compose_heartbeat_truncated_to_700(runner, full_state):
     out = runner._compose_heartbeat(
         full_state["market"], full_state["ks"], full_state["balances"],
-        full_state["positions"], full_state["open_orders"], full_state["pnl"],
+        full_state["positions"], full_state["open_orders"], full_state["pnl_windows"],
         full_state["proposals"], full_state["fills"], "X" * 2000,
     )
     assert len(out) <= 700
@@ -239,10 +239,47 @@ def test_compose_heartbeat_kill_active(runner, full_state):
     full_state["ks"]["global_kill"] = True
     out = runner._compose_heartbeat(
         full_state["market"], full_state["ks"], full_state["balances"],
-        full_state["positions"], full_state["open_orders"], full_state["pnl"],
+        full_state["positions"], full_state["open_orders"], full_state["pnl_windows"],
         full_state["proposals"], full_state["fills"], "watch",
     )
     assert "kill=active" in out
+
+
+def test_compose_heartbeat_uses_windowed_day_pnl_not_cumulative(runner, full_state):
+    """Regression: day P&L must read desk.today.pnl_usd, not a cumulative-since-
+    inception number. Pre-fix the heartbeat read totals.total_pnl from
+    get_pnl_summary, which was cumulative."""
+    pnl_windows = {"desk": {"today": {"pnl_usd": -73.30}, "wtd": {"pnl_usd": -55.62}}}
+    out = runner._compose_heartbeat(
+        full_state["market"], full_state["ks"], full_state["balances"],
+        full_state["positions"], full_state["open_orders"], pnl_windows,
+        full_state["proposals"], full_state["fills"], "w",
+    )
+    assert "day P&L=$-73" in out
+    assert "$-650" not in out and "$-745" not in out  # the broken cumulative values
+
+
+def test_compose_heartbeat_day_pnl_none_renders_na(runner, full_state):
+    """If the today window has no snapshot (e.g. agent_state empty), the
+    heartbeat must render n/a — not silently substitute 0."""
+    pnl_windows = {"desk": {"today": {"pnl_usd": None}, "wtd": {"pnl_usd": None}}}
+    out = runner._compose_heartbeat(
+        full_state["market"], full_state["ks"], full_state["balances"],
+        full_state["positions"], full_state["open_orders"], pnl_windows,
+        full_state["proposals"], full_state["fills"], "w",
+    )
+    assert "day P&L=n/a" in out
+
+
+def test_compose_heartbeat_empty_pnl_windows_renders_na(runner, full_state):
+    """If the pnl_windows fetch failed entirely (empty dict), still render n/a
+    without crashing."""
+    out = runner._compose_heartbeat(
+        full_state["market"], full_state["ks"], full_state["balances"],
+        full_state["positions"], full_state["open_orders"], {},
+        full_state["proposals"], full_state["fills"], "w",
+    )
+    assert "day P&L=n/a" in out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,7 +308,7 @@ def _install_fake_llm(monkeypatch, content: str):
 async def test_llm_watch_clean_sentence(runner, monkeypatch, full_state):
     _install_fake_llm(monkeypatch, "Monitor NVDA earnings AH.")
     out = await runner._llm_watch_sentence(
-        full_state["market"], full_state["fills"], full_state["pnl"],
+        full_state["market"], full_state["fills"], full_state["pnl_windows"],
         full_state["proposals"], full_state["ks"],
     )
     assert out == "Monitor NVDA earnings AH."
@@ -280,7 +317,7 @@ async def test_llm_watch_clean_sentence(runner, monkeypatch, full_state):
 async def test_llm_watch_strips_think(runner, monkeypatch, full_state):
     _install_fake_llm(monkeypatch, "<think>thinking</think>Watch the close.")
     out = await runner._llm_watch_sentence(
-        full_state["market"], full_state["fills"], full_state["pnl"],
+        full_state["market"], full_state["fills"], full_state["pnl_windows"],
         full_state["proposals"], full_state["ks"],
     )
     assert out == "Watch the close."
@@ -289,7 +326,7 @@ async def test_llm_watch_strips_think(runner, monkeypatch, full_state):
 async def test_llm_watch_empty_falls_back(runner, monkeypatch, full_state):
     _install_fake_llm(monkeypatch, "   ")
     out = await runner._llm_watch_sentence(
-        full_state["market"], full_state["fills"], full_state["pnl"],
+        full_state["market"], full_state["fills"], full_state["pnl_windows"],
         full_state["proposals"], full_state["ks"],
     )
     assert out == "nothing concerning"
@@ -298,7 +335,7 @@ async def test_llm_watch_empty_falls_back(runner, monkeypatch, full_state):
 async def test_llm_watch_truncated_to_200(runner, monkeypatch, full_state):
     _install_fake_llm(monkeypatch, "a" * 1000)
     out = await runner._llm_watch_sentence(
-        full_state["market"], full_state["fills"], full_state["pnl"],
+        full_state["market"], full_state["fills"], full_state["pnl_windows"],
         full_state["proposals"], full_state["ks"],
     )
     assert len(out) <= 200
@@ -307,7 +344,7 @@ async def test_llm_watch_truncated_to_200(runner, monkeypatch, full_state):
 async def test_llm_watch_prompt_uses_no_think(runner, monkeypatch, full_state):
     completions = _install_fake_llm(monkeypatch, "ok")
     await runner._llm_watch_sentence(
-        full_state["market"], full_state["fills"], full_state["pnl"],
+        full_state["market"], full_state["fills"], full_state["pnl_windows"],
         full_state["proposals"], full_state["ks"],
     )
     user_msg = next(m["content"] for m in completions.last_kwargs["messages"] if m["role"] == "user")
@@ -329,7 +366,7 @@ def _install_state_mocks(monkeypatch, **overrides):
         "balances": {"nav": 50000, "cash": 5000},
         "positions": {"positions": []},
         "open_orders": {"orders": []},
-        "pnl": {"totals": {"total_pnl": 0}, "by_agent": []},
+        "pnl_windows": {"desk": {"today": {"pnl_usd": 0.0}, "wtd": {"pnl_usd": 0.0}}},
         "proposals": {"pending": []},
         "fills": [],
     }
@@ -340,7 +377,7 @@ def _install_state_mocks(monkeypatch, **overrides):
     async def _bal(): return json.dumps(state["balances"])
     async def _pos(): return json.dumps(state["positions"])
     async def _oo(): return json.dumps(state["open_orders"])
-    async def _pnl(): return json.dumps(state["pnl"])
+    async def _pnlw(**_): return json.dumps(state["pnl_windows"])
     async def _props(): return json.dumps(state["proposals"])
     async def _fills(**_): return state["fills"]
 
@@ -349,7 +386,7 @@ def _install_state_mocks(monkeypatch, **overrides):
     monkeypatch.setattr(mcp_server, "get_balances", _bal)
     monkeypatch.setattr(mcp_server, "get_positions", _pos)
     monkeypatch.setattr(mcp_server, "get_open_orders", _oo)
-    monkeypatch.setattr(mcp_server, "get_pnl_summary", _pnl)
+    monkeypatch.setattr(mcp_server, "get_agent_pnl_windows", _pnlw)
     monkeypatch.setattr(mcp_server, "list_pending_proposals", _props)
     monkeypatch.setattr(store, "get_fills_window", _fills)
 

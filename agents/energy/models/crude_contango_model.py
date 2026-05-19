@@ -1,14 +1,8 @@
-"""Energy crude_contango_model: backwardation/contango regime via USO vs USL.
-
-USO ~ front-month crude; USL ~ 12-month-average crude. USO outperforming USL
-over a 30-bar window proxies a backwardated curve (tight supply, bullish energy).
-USL outperforming proxies contango (oversupply, bearish energy → emit flat).
-"""
 from __future__ import annotations
 
 from typing import Any
 
-MODEL_VERSION = "1.1"
+MODEL_VERSION = "1.2"
 BAR_FREQUENCY = "1d"
 MIN_BARS = 2
 LOOKBACK_DAYS = 60

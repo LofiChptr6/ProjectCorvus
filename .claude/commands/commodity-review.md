@@ -180,8 +180,13 @@ Convictions in STEP 4 are independent — submit only the names you'd put money 
 ## STEP 4 — Publish
 
 1. `clear_my_views(agent_name="commodity")` — wipe last hour's slate so the new submission fully replaces it.
-2. For each non-flat call: `submit_conviction_view(agent_name="commodity", symbol, direction, conviction, expected_return_pct, time_to_target_days, rationale, model_inputs?)`.
-   - Conviction views auto-expire in 4 hours — you must refresh hourly to keep your views in the allocator's stack.
+2. For each non-flat call: `submit_conviction_view(agent_name="commodity", symbol, direction, conviction, expected_return_pct, time_to_target_days, rationale, expires_in_hours, model_inputs?)`.
+   - **`expires_in_hours` is REQUIRED per conviction — there is no default.** Pick a value (0.0833 to 720; i.e. 5 min to 30 days) that matches the *thesis horizon*: a scalp and a swing must NOT get the same expiry. Suggested mapping:
+     - intraday momentum / scalp / pre-earnings drift → `0.25–4`
+     - overnight position / next-session trade        → `4–24`
+     - 1-day to 1-week swing                          → `24–168`
+     - multi-week macro/regime call (rare)            → `168–720`
+     The allocator drops convictions once they expire; you must re-publish before then to stay in the stack.
 
 ## STEP 5 — Journal continuity
 

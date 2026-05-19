@@ -40,8 +40,10 @@ except Exception:
 
 
 def _setup_logging() -> logging.Logger:
-    log_path = _REPO_ROOT / "logs" / "hourly-review.log"
-    log_path.parent.mkdir(exist_ok=True)
+    # Honor LOG_DIR for test isolation (conftest redirects to tmp).
+    log_dir = Path(os.environ.get("LOG_DIR") or (_REPO_ROOT / "logs"))
+    log_path = log_dir / "hourly-review.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     logger = logging.getLogger("hourly_review")
     logger.setLevel(logging.INFO)
     if not logger.handlers:
@@ -125,10 +127,14 @@ def _short_heartbeat_if_quiet(
 
 def _compose_heartbeat(
     market: dict, ks: dict, balances: dict, positions: list[dict],
-    open_orders: list[dict], pnl: dict, proposals: list[dict],
+    open_orders: list[dict], pnl_windows: dict, proposals: list[dict],
     fills_last_hour: list[dict], watch: str,
 ) -> str:
-    """Full heartbeat body, ≤700 chars, Markdown per the skill spec."""
+    """Full heartbeat body, ≤700 chars, Markdown per the skill spec.
+
+    `pnl_windows` is the get_agent_pnl_windows payload — day P&L is the
+    `desk.today.pnl_usd` delta (since today's 09:30 ET open).
+    """
     n_fills, fill_summary = _summarize_fills(fills_last_hour)
     n_orders_placed_this_hour = len({f.get("order_id") for f in fills_last_hour if f.get("order_id")})
     n_open_orders = len(open_orders or [])
@@ -139,16 +145,16 @@ def _compose_heartbeat(
     cash = float(balances.get("cash") or 0.0)
     cash_pct = (cash / nav * 100) if nav > 0 else 0
 
-    totals = pnl.get("totals") or {}
-    today_pnl = float(totals.get("total_pnl") or 0.0)
-    week_pnl = float(totals.get("total_pnl") or 0.0)  # window=week not available here; reuse total
+    desk_w = (pnl_windows.get("desk") or {})
+    today_d = (desk_w.get("today") or {}).get("pnl_usd")
+    today_str = f"${today_d:,.0f}" if today_d is not None else "n/a"
     kill_str = "active" if (ks.get("global_kill") or ks.get("per_agent", {}).get("mike")) else "ok"
 
     body = (
         f"{_market_mode_emoji(market)} *Heartbeat — {_now_et_str()}*\n"
         f"*New this hour:* {n_fills} fills · {fill_summary}\n"
         f"*Pending:* {n_open_orders} working orders · {n_pending} approval-gated\n"
-        f"*Risk:* kill={kill_str} · day P&L=${today_pnl:,.0f}\n"
+        f"*Risk:* kill={kill_str} · day P&L={today_str}\n"
         f"*Watch:* {watch}\n"
         f"NAV ${nav:,.0f} · cash {cash_pct:.0f}% · {n_positions} positions"
     )
@@ -167,14 +173,19 @@ def _template_watch(fills: list[dict], proposals: list[dict], ks: dict) -> str:
 
 
 async def _llm_watch_sentence(
-    market: dict, fills: list[dict], pnl: dict, proposals: list[dict], ks: dict,
+    market: dict, fills: list[dict], pnl_windows: dict, proposals: list[dict], ks: dict,
 ) -> str:
-    """Ask the local vLLM for the 'Watch:' sentence. Hard timeout 25s."""
+    """Ask the local vLLM for the 'Watch:' sentence. Hard timeout 25s.
+
+    `pnl_windows` is the get_agent_pnl_windows payload — day P&L is the
+    `desk.today.pnl_usd` delta (since today's 09:30 ET open).
+    """
     from pipelines.llm_client import make_client
 
     n_fills, fill_summary = _summarize_fills(fills)
-    totals = pnl.get("totals") or {}
-    today_pnl = float(totals.get("total_pnl") or 0.0)
+    desk_w = (pnl_windows.get("desk") or {})
+    today_d = (desk_w.get("today") or {}).get("pnl_usd")
+    today_str = f"${today_d:,.0f}" if today_d is not None else "n/a"
     kill_active = ks.get("global_kill") or ks.get("per_agent", {}).get("mike")
     pending_count = len(proposals or [])
 
@@ -185,7 +196,7 @@ async def _llm_watch_sentence(
         "earnings, risk flag, regime shift, or 'nothing concerning' if quiet.\n\n"
         f"Market: open={market.get('is_open')} mode={market.get('mode')}\n"
         f"Fills this hour: {n_fills} ({fill_summary})\n"
-        f"Day P&L: ${today_pnl:,.0f}\n"
+        f"Day P&L: {today_str}\n"
         f"Kill switch active: {kill_active}\n"
         f"Pending approvals: {pending_count}\n"
     )
@@ -229,7 +240,7 @@ async def _load_state() -> dict:
     await _safe("balances", mcp_server.get_balances)
     await _safe("positions_raw", mcp_server.get_positions)
     await _safe("open_orders_raw", mcp_server.get_open_orders)
-    await _safe("pnl", mcp_server.get_pnl_summary)
+    await _safe("pnl_windows", mcp_server.get_agent_pnl_windows)
     await _safe("proposals_raw", mcp_server.list_pending_proposals)
 
     # Normalise list-shapes — MCP tools return JSON objects, not bare arrays.
@@ -263,7 +274,7 @@ async def main() -> int:
     balances = state.get("balances") or {}
     positions = state.get("positions") or []
     open_orders = state.get("open_orders") or []
-    pnl = state.get("pnl") or {}
+    pnl_windows = state.get("pnl_windows") or {}
     proposals = state.get("proposals") or []
     fills = state.get("fills_last_hour") or []
 
@@ -275,13 +286,13 @@ async def main() -> int:
         log.info("no activity — sending short heartbeat")
     else:
         try:
-            watch = await _llm_watch_sentence(market, fills, pnl, proposals, ks)
+            watch = await _llm_watch_sentence(market, fills, pnl_windows, proposals, ks)
             log.info("watch (LLM): %s", watch)
         except Exception as exc:
             log.warning("LLM watch-sentence failed: %s — using template", exc)
             watch = _template_watch(fills, proposals, ks)
         body = _compose_heartbeat(market, ks, balances, positions, open_orders,
-                                  pnl, proposals, fills, watch)
+                                  pnl_windows, proposals, fills, watch)
         log.info("composed heartbeat (%d chars, %d fills, %d open orders)",
                  len(body), len(fills), len(open_orders))
 

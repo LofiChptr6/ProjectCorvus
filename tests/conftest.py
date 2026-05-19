@@ -23,6 +23,14 @@ if str(_REPO_ROOT) not in sys.path:
 # Tests should NEVER place real orders, send Telegrams, or hit IBKR live data.
 os.environ.setdefault("TRADING_TEST_MODE", "1")
 
+# Test-log isolation: redirect scripts' file logs to a per-session tmp dir
+# so importing entry-point scripts (run_mike_allocator.py / run_hourly_review.py
+# / run_queue_worker.py) during pytest doesn't append to production logs.
+# Each entry point reads `LOG_DIR` env with fallback to repo logs/.
+import tempfile as _tempfile
+_TEST_LOG_DIR = _tempfile.mkdtemp(prefix="trading-test-logs-")
+os.environ.setdefault("LOG_DIR", _TEST_LOG_DIR)
+
 TEST_AGENT_PREFIX = "__test_"
 
 

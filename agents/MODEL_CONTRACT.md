@@ -88,6 +88,53 @@ never from `context` echoing, never hardcoded "plausible" defaults.
 | `inputs` | `dict[str, float]` | Features the model actually used. The **replay payload** — must be recomputable from `bars` alone. Used by `model_inputs_validator` to detect fabrication. |
 | `rationale` | `str` (optional) | One-sentence human gloss. Fine to omit. |
 | `interpretation` | `str` (optional) | Short label ("strong breakout", "weak setup"). Fine to omit. |
+| `distributions` | `list[dict]` (optional) | Probabilistic per-horizon forecasts; see "Probabilistic distributions" below. When present, persisted to `agent_forecast` with a fresh `forecast_run_id` and the registered conviction functional collapses them into the scalar conviction (overrides `conviction` if set). |
+
+## Probabilistic distributions
+
+The optional `distributions` field is the **richer, replacing** belief format —
+a list of discrete probability vectors per horizon. When a model emits
+distributions:
+
+1. The runner validates each entry against `meta_agent/distribution_validator.py`.
+2. A fresh `forecast_run_id` (UUID) is allocated and stamped on every
+   resulting row in `agent_forecast` plus the scalar in `agent_conviction`.
+3. The registered conviction functional
+   (`meta_agent/conviction_functionals/`) collapses the per-horizon
+   distributions into a single scalar conviction in `[0, 1]`, which
+   overrides the model's own `conviction` field (the model can omit it).
+
+Each distribution entry:
+
+```python
+{
+    "anchor_price":  195.50,           # current price the bins are anchored to
+    "anchor_ts":     "2026-05-16T17:30:00+00:00",
+    "axis":          "return_pct",     # "return_pct" | "log_return"
+    "horizon":       "5m",             # "5m" | "1h" | "1d" | "1w"
+    "bins": [
+        {"x": -2.0, "p": 0.05},        # x in axis units (here, percent return)
+        {"x": -1.0, "p": 0.20},
+        {"x":  0.0, "p": 0.50},
+        {"x":  1.0, "p": 0.20},
+        {"x":  2.0, "p": 0.05},
+    ],
+    "model":         "ou_mean_revert",
+    "model_version": "0.1.0",
+}
+```
+
+Validation rules (enforced at submit):
+- bins length in `[3, 20]`
+- x strictly increasing AND uniformly spaced (required for CRPS calibration)
+- each `p ≥ 1e-4` (additive smoothing — prevents `-inf` log-loss if realized
+  return lands in a zero-mass bin)
+- `sum(p)` within `1e-4` of 1.0
+- horizon ∈ `{5m, 1h, 1d, 1w}`; axis ∈ `{return_pct, log_return}`
+
+A model emitting `distributions` should still populate `direction` and
+`expected_return_pct` (mirror E[r] across the longest horizon) for back-compat
+consumers, but `conviction` is recomputed from the distributions.
 
 ## The no-signal return
 

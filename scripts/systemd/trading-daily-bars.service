@@ -1,0 +1,13 @@
+[Unit]
+Description=Trading daily-bars ingestor — Massive 1-day OHLCV → Postgres local_bars_daily
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/tianyizhang/opus trading
+EnvironmentFile=/home/tianyizhang/opus trading/.env
+TimeoutStartSec=600
+ExecStart=/bin/bash -c 'cd "/home/tianyizhang/opus trading" && exec .venv/bin/python scripts/ingest_daily_bars.py'
+StandardOutput=append:/home/tianyizhang/opus trading/logs/daily-bars.log
+StandardError=append:/home/tianyizhang/opus trading/logs/daily-bars.log

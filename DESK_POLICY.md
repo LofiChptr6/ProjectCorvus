@@ -51,6 +51,12 @@ Every conviction view **≥ 0.5 conviction** must be backed by at least two tool
 - Populate `model_inputs` with the raw output (RSI value, BBAND levels, headline).
 - Record a `record_thesis` entry before submitting any view you intend to grade later.
 - Gut-feel submissions with thin rationale are not prohibited, but must be labelled as such in the rationale field: "GUT-FEEL: …"
+- **Model-backed carve-out.** Convictions submitted via `submit_conviction_from_model` (or `from_model` on a hourly review) inherently satisfy this rule: the model already consumed bars + computed features deterministically, and (when emitting `distributions`) is scored against realized outcomes via the calibration loop. The two-tool-call requirement applies only to LLM-authored numeric submissions through `submit_conviction_view`.
+- **Per-agent conviction functional (Phase G).** Each agent may declare a preferred functional in `agents/<agent>.yaml`:
+  ```yaml
+  conviction_functional: frac_kelly
+  ```
+  Registered options live in `meta_agent/conviction_functionals/combiners/` — currently `expected_return` (default), `frac_kelly`, `peak_xp_over_t`. Unset / unknown values fall back to `expected_return`. Re-rank periodically with `python scripts/suggest_functional_per_agent.py [--write-yaml]`.
 
 ---
 
@@ -110,8 +116,12 @@ No conviction submissions between **10 PM – 5 AM local** (market closed, alloc
 | Per-event audit trail (lend / return) | `agent_ledger` — every accounting event with fill_id and decision_id |
 | Per-symbol current open quantity | `positions_anchor.snapshot_json` (latest) + signed `fills` since `recorded_at` |
 | Live quote for any symbol | `data.massive_client.get_quote(symbol)` (Polygon-compatible REST) |
+| Historical OHLCV bars (5-min, ~14-day rolling) | `local_bars` table — populated every 5 min during RTH by `scripts/stream_bars.py`. Prefer this over `data.massive_client.get_bars` for any range covered by the table; fall through to Massive only for ranges outside the 2-week window. |
+| Each agent's tracked universe | `agent_watchlist` table — replaces the old `agents/sector_map.yaml`. Live edits via `add_to_watchlist` / `propose_watchlist_removal`. YAML stays on disk as the factory-reset seed and the source-of-truth for inverse-ETF cross-refs. |
 | Cash + NAV anchor | `nav_log` — most recent row, written by mike on every rebalance |
 | Position anchor | `positions_anchor` — most recent row, written by mike on every rebalance |
+
+**Data sources, simply put:** IBKR gateway is for *placing orders* only — never for data queries. Market data lives in Postgres (`local_bars`, `news_items`) or, for ranges outside the cache, Massive.com via `data.massive_client`. The single IBKR `client_id` belongs to mike's allocator; any competing read connection silently knocks it offline and corrupts order state.
 
 **Closing methodology (pro-rata).** When mike SELLs `Q` shares of `S`:
 1. Look up current holders of `S` from `agent_ledger` (`SUM(LEND.qty − RETURN.qty)` per agent).

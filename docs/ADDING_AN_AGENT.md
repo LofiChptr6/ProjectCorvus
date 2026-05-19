@@ -15,9 +15,9 @@ Total time end-to-end: ~30–60 minutes including a smoke-test review.
 Answer these before touching any file:
 
 - **Name.** Lowercase, one word, no underscores, no conflict with existing
-  (`atlas`, `cassidy`, `fab`, `fabless`, `iron`, `maya`, `mike`, `rex`,
-  `titan`, `trump`, `vera`, `volt`). Match the desk's character-name
-  convention.
+  (`atlas`, `cassidy`, `commodity`, `energy`, `fab`, `fabless`, `iron`,
+  `maya`, `mike`, `rex`, `trump`, `vera`, `volt`). Match the desk's
+  character-name convention (or sector-name for the resource specialists).
 - **Sector / responsibility.** What slice of the universe does the agent own?
   E.g., "global crypto + miners", "small-cap biotech".
   Avoid overlap >30% with any existing agent's universe — that creates
@@ -155,7 +155,7 @@ Edit `scripts/run_hourly_orchestrator.sh`. Append the agent name to the
 during phase 1, so the new agent's review runs every hour automatically.
 
 ```bash
-SECTORS=(atlas fab fabless rex maya titan vera trump iron volt zara)
+SECTORS=(atlas commodity energy fab fabless iron maya rex trump vera volt zara)
 ```
 
 If you have an evening review and it should run on the existing evening
