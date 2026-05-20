@@ -54,7 +54,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     direction = "long" if score > 0.5 else "flat"
     e_return = round(score * 4.0, 3) if direction != "flat" else 0.0
     horizon = 60
-    conviction = round(abs(e_return) / horizon, 4) if horizon else 0.0
+    likelihood = round(abs(e_return) / horizon, 4) if horizon else 0.0
 
     return {
         "signal": round(score, 3),
@@ -66,7 +66,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
             else "mixed / chop"
         ),
         "direction": direction,
-        "conviction": conviction,
+        "likelihood": likelihood,
         "expected_return_pct": e_return,
         "time_to_target_days": horizon,
         "inputs": {

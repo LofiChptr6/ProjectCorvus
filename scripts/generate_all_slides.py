@@ -3,7 +3,7 @@ bypassing the MCP-server tool registry (which hasn't been reloaded yet).
 
 For each agent:
   - read latest agent_state snapshot for headline P&L
-  - read top forecasts (by abs(forecast_score)) and active convictions
+  - read top forecasts (by abs(forecast_score)) and active views
   - read latest journal entries for "open questions"
   - synthesize sector-appropriate trends/philosophy bullets from sector_map
   - render the 1-page slide via reporting.evening_slide.render_evening_slide
@@ -56,10 +56,11 @@ async def build_agent_inputs(agent_name: str) -> dict:
                ORDER BY snapshot_at DESC LIMIT 1""",
             agent_name,
         )
-        # 2. Top convictions (by conviction desc).
+        # 2. Top active views (by allocator weight desc).
         convs = await conn.fetch(
-            """SELECT symbol, direction, conviction::float8 AS c,
+            """SELECT symbol, direction, conviction::float8 AS wt,
                       expected_return_pct::float8 AS er,
+                      likelihood::float8 AS lk,
                       time_to_target_days AS ttd, rationale
                FROM agent_conviction
                WHERE agent_name=$1 AND expires_at > NOW() AND conviction > 0
@@ -97,14 +98,15 @@ async def build_agent_inputs(agent_name: str) -> dict:
     else:
         headline = "P&L: no agent_state snapshot available"
 
-    # Theses bullets — top convictions.
+    # Theses bullets — top active views (sorted by allocator weight).
     theses = []
     for c in convs:
         rat = (c["rationale"] or "").strip().split(".")[0][:100]
         ttd = f", {c['ttd']}d" if c["ttd"] else ""
         er = f", E[ret]={float(c['er']):+.1f}%" if c["er"] is not None else ""
+        lk = f", L={float(c['lk']):.2f}" if c["lk"] is not None else ""
         theses.append(
-            f"{c['direction'].upper()} {c['symbol']} conv={float(c['c']):.2f}{er}{ttd} — {rat}"
+            f"{c['direction'].upper()} {c['symbol']} wt={float(c['wt']):.2f}{er}{lk}{ttd} — {rat}"
         )
 
     # Trends bullets — top-magnitude forecasts as catalysts/watches.
@@ -129,7 +131,7 @@ async def build_agent_inputs(agent_name: str) -> dict:
         "agent_name": agent_name,
         "headline": headline,
         "trends": trends or ["(no forecasts published this hour)"],
-        "theses": theses or ["(no active convictions)"],
+        "theses": theses or ["(no active views)"],
         "philosophy": PHILOSOPHY.get(agent_name, ["(no philosophy notes loaded)"]),
         "open_questions": open_qs,
     }

@@ -31,7 +31,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         direction = "flat"
         e_return = 0.0
     horizon = 7
-    conviction = round(abs(e_return) / horizon, 4) if horizon else 0.0
+    likelihood = round(abs(e_return) / horizon, 4) if horizon else 0.0
 
     return {
         "signal": round(strength, 3),
@@ -45,7 +45,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
             else "developing breakout"
         ),
         "direction": direction,
-        "conviction": conviction,
+        "likelihood": likelihood,
         "expected_return_pct": round(e_return, 3),
         "time_to_target_days": horizon,
         "inputs": {

@@ -7,7 +7,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < 50:
         return {
             "direction": "flat",
-            "conviction": 0.0,
+            "likelihood": 0.0,
             "expected_return_pct": 0.0,
             "time_to_target_days": 0,
             "inputs": {"reason": f"need >=50 bars, got {len(bars)}"},
@@ -33,23 +33,23 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         e_return = 0.0
 
     time_to_target_days = 14
-    conviction = (e_return / time_to_target_days) if time_to_target_days else 0.0
+    likelihood = (e_return / time_to_target_days) if time_to_target_days else 0.0
 
     # Add sensitivity to underlying sector ETFs (e.g., SMH, SOXX) as a
     # signal for momentum validity.
     if symbol in context.get('sector_etfs', []):
-        # For ETFs, expected_return_pct and conviction are adjusted.
+        # For ETFs, expected_return_pct and likelihood are adjusted.
         # For example: SMH shows a long bias if underlying designers are trending up.
         if direction == 'long':
             e_return = min(5.0, e_return * 1.2)
-            conviction = (e_return / time_to_target_days) if time_to_target_days else 0.0
+            likelihood = (e_return / time_to_target_days) if time_to_target_days else 0.0
         elif direction == 'short':
             e_return = max(-5.0, e_return * 1.2)
-            conviction = (abs(e_return) / time_to_target_days) if time_to_target_days else 0.0
+            likelihood = (abs(e_return) / time_to_target_days) if time_to_target_days else 0.0
 
     return {
         "direction": direction,
-        "conviction": round(conviction, 4),
+        "likelihood": round(likelihood, 4),
         "expected_return_pct": round(e_return if direction == "long" else -e_return, 3),
         "time_to_target_days": time_to_target_days,
         "inputs": {

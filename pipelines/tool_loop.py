@@ -8,6 +8,7 @@ Returns the final assistant text plus the full message history for audit.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -79,21 +80,64 @@ async def run(
     extra_body = {"chat_template_kwargs": {"enable_thinking": False}} if disable_thinking else None
 
     for iteration in range(max_iter + 1):
-        try:
-            kwargs: dict[str, Any] = {
-                "model": model,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "tools": tools,
-                "tool_choice": "auto" if tools else None,
-                "messages": messages,
-            }
-            if extra_body:
-                kwargs["extra_body"] = extra_body
-            resp = await client.chat.completions.create(**kwargs)
-        except Exception as exc:
-            log.exception("LLM call failed in tool_loop")
-            final_text = f"⚠️ pipeline error: {type(exc).__name__}: {exc}"
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "tools": tools,
+            "tool_choice": "auto" if tools else None,
+            "messages": messages,
+        }
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
+        # Transient-failure retry: one extra attempt with 1s backoff on
+        # timeout / network errors. vLLM occasionally stalls under contention
+        # and a single retry is usually enough; >1 retry indicates the LLM
+        # itself is down and we should surface the error.
+        resp = None
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                resp = await client.chat.completions.create(**kwargs)
+                break
+            except (asyncio.TimeoutError, ConnectionError) as exc:
+                last_exc = exc
+                if attempt == 0:
+                    log.warning(
+                        "LLM call transient failure (iter=%d attempt=%d): %s: %s — "
+                        "retrying in 1s",
+                        iteration, attempt, type(exc).__name__, exc,
+                    )
+                    await asyncio.sleep(1.0)
+                    continue
+                log.exception("LLM call failed after retry")
+            except Exception as exc:
+                last_exc = exc
+                # httpx.TimeoutException is one of httpx.NetworkError's
+                # siblings; openai may also wrap timeouts in its own classes.
+                # String-match the type name so we catch them without adding
+                # the httpx/openai dep imports here.
+                tname = type(exc).__name__
+                if "Timeout" in tname or "Connect" in tname or "Network" in tname:
+                    if attempt == 0:
+                        log.warning(
+                            "LLM call transient failure (iter=%d attempt=%d): %s: %s — "
+                            "retrying in 1s",
+                            iteration, attempt, tname, exc,
+                        )
+                        await asyncio.sleep(1.0)
+                        continue
+                # Non-transient: don't retry.
+                log.exception("LLM call failed (non-transient)")
+                break
+
+        if resp is None:
+            final_text = (
+                f"⚠️ pipeline error: {type(last_exc).__name__}: {last_exc}"
+                if last_exc is not None else
+                "⚠️ pipeline error: unknown LLM failure"
+            )
             finish_reason = "error"
             break
 

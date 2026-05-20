@@ -6,7 +6,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < 200:
         return {
             "direction": "flat",
-            "conviction": 0.0,
+            "likelihood": 0.0,
             "expected_return_pct": 0.0,
             "time_to_target_days": 0,
             "inputs": {"reason": f"need >=200 bars, got {len(bars)}"},
@@ -40,18 +40,18 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
 
     # Adjust horizon to 45 days for defense/industrial names (slow to reversion)
     time_to_target_days = 45 if symbol in ["RTX", "LMT", "BA"] else 30
-    conviction = (e_return / time_to_target_days) if time_to_target_days else 0.0
+    likelihood = (e_return / time_to_target_days) if time_to_target_days else 0.0
 
-    # Add volatility-weighted conviction scaling for better calibration
+    # Add volatility-weighted likelihood scaling for better calibration
     if len(bars) >= 14:
         atr_values = [b["h"] - b["l"] for b in bars[-14:]]
         atr14_now = sum(atr_values) / 14
         atr_ratio = abs(spread_pct_of_price) / atr14_now if atr14_now else 1.0
-        conviction = min(conviction * atr_ratio, 1.0)
+        likelihood = min(likelihood * atr_ratio, 1.0)
 
     return {
         "direction": direction,
-        "conviction": round(conviction, 4),
+        "likelihood": round(likelihood, 4),
         "expected_return_pct": round(e_return if direction == "long" else -e_return, 3),
         "time_to_target_days": time_to_target_days,
         "inputs": {

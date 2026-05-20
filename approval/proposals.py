@@ -156,6 +156,58 @@ def list_by(kind: str, statuses: tuple[str, ...]) -> list[dict]:
     ]
 
 
+def find_recent_approval(
+    vehicle: str,
+    contrib_agents: set[str],
+    *,
+    kind: str = "trade_approval",
+    window_seconds: float = 6 * 3600,
+) -> Optional[dict]:
+    """Look for the most-recent proposal of `kind` whose status is `approved`
+    or `placed`, whose `payload.vehicle` matches, whose contributing-agent set
+    is a superset of `contrib_agents`, and which was resolved within
+    `window_seconds`. Returns the proposal dict or None.
+
+    Used by the inverse-ETF gate to silence repeat approval pings for a
+    position the user has already blessed: if fab→SOXS was approved 2h ago,
+    fab's hour-3 re-publish (same agent, same vehicle) auto-promotes to
+    immediate placement instead of creating yet another pending proposal.
+
+    Match rules:
+      - prior payload.vehicle must equal `vehicle` (case-insensitive)
+      - prior payload.contributions[].agent set ⊇ contrib_agents
+        (subset is enough — a prior approval by {fab, vera} covers a
+        later request by {fab} alone)
+      - status ∈ {approved, placed}
+      - resolved_at ≥ now - window_seconds
+    """
+    v_up = (vehicle or "").upper()
+    if not v_up:
+        return None
+    contrib_agents = set(contrib_agents or [])
+    cutoff = time.time() - float(window_seconds)
+    proposals = _load()
+    # Walk newest-first so the first match is the most-recent.
+    for p in reversed(proposals):
+        if p.get("kind", "strategic_change") != kind:
+            continue
+        if p.get("status") not in ("approved", "placed"):
+            continue
+        resolved = p.get("resolved_at") or 0.0
+        if resolved < cutoff:
+            continue
+        payload = p.get("payload") or {}
+        if (payload.get("vehicle") or "").upper() != v_up:
+            continue
+        prior_agents = {
+            c.get("agent") for c in (payload.get("contributions") or [])
+            if c.get("agent")
+        }
+        if contrib_agents.issubset(prior_agents):
+            return p
+    return None
+
+
 def mark_placed(proposal_id: str) -> Optional[dict]:
     """Flip a proposal from 'approved' to 'placed' after rebalance_desk has
     actually submitted the order. Idempotent — already-placed proposals are

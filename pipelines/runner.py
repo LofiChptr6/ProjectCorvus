@@ -245,7 +245,7 @@ async def _apply_review_output(
 ) -> dict[str, Any]:
     from db import store
     summary: dict[str, Any] = {
-        "convictions_inserted": 0,
+        "views_inserted": 0,
         "forecasts_inserted": 0,
         "forecast_errors": [],
         "theses_recorded": 0,
@@ -260,7 +260,7 @@ async def _apply_review_output(
     # tagged `[DRY-RUN]` so the user can distinguish at a glance.
     if dry_run:
         await store.clear_agent_convictions_shadow(agent_name)
-        for c in parsed.convictions:
+        for c in parsed.views:
             resolved = await _resolve_conviction_fields(c, agent_name)
             if resolved is None:
                 continue
@@ -279,7 +279,7 @@ async def _apply_review_output(
                 stop_pct=resolved["stop_pct"],
                 run_session_id=session_id,
             )
-            summary["convictions_inserted"] += 1
+            summary["views_inserted"] += 1
 
         await store.clear_agent_forecasts_shadow(agent_name)
         result = await store.insert_forecasts_batch_shadow(
@@ -307,7 +307,7 @@ async def _apply_review_output(
         # to fire ocap_rebalance.
         new_resolved_payloads: list[dict] = []
         await store.clear_agent_convictions(agent_name)
-        for c in parsed.convictions:
+        for c in parsed.views:
             resolved = await _resolve_conviction_fields(c, agent_name)
             if resolved is None:
                 continue
@@ -338,7 +338,7 @@ async def _apply_review_output(
                 "expected_return_pct": resolved["expected_return_pct"],
                 "stop_pct": resolved["stop_pct"],
             })
-            summary["convictions_inserted"] += 1
+            summary["views_inserted"] += 1
 
         # Materiality: count how many of these convictions actually changed
         # vs what the agent already had. Used downstream by the worker to

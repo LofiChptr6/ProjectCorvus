@@ -105,17 +105,17 @@ def _final_text_response(text: str) -> _FakeResponse:
 
 def test_review_output_minimal_valid():
     parsed = schemas.ReviewOutput.model_validate({})
-    assert parsed.convictions == []
+    assert parsed.views == []
     assert parsed.forecasts == []
 
 
 def test_review_output_full_valid():
     payload = {
-        "convictions": [{
+        "views": [{
             "symbol": "spy",  # lowercase; validator should upper
             "direction": "long",
-            "conviction": 0.7,
             "expected_return_pct": 1.2,
+            "likelihood": 0.7,
             "time_to_target_days": 3,
             "rationale": "trend intact",
             "expires_in_hours": 4,
@@ -137,47 +137,74 @@ def test_review_output_full_valid():
         "telegram_summary": "atlas: 1 long, 1 forecast",
     }
     parsed = schemas.ReviewOutput.model_validate(payload)
-    assert parsed.convictions[0].symbol == "SPY"  # upper
+    assert parsed.views[0].symbol == "SPY"  # upper
     assert parsed.forecasts[0].symbol == "TLT"
 
 
 def test_conviction_view_rejects_short_direction():
     with pytest.raises(Exception):
         schemas.ConvictionView.model_validate({
-            "symbol": "SPY", "direction": "short", "conviction": 0.5,
+            "symbol": "SPY", "direction": "short",
+            "expected_return_pct": -1.0, "likelihood": 0.5,
+            "time_to_target_days": 3, "expires_in_hours": 4,
         })
+
+
+def _valid_long_payload(**overrides) -> dict:
+    """Build a clean ConvictionView dict in the new contract — caller can
+    override any field for the specific assertion."""
+    base = {
+        "symbol": "SPY", "direction": "long",
+        "expected_return_pct": 1.0, "likelihood": 0.5,
+        "time_to_target_days": 3, "expires_in_hours": 4,
+    }
+    base.update(overrides)
+    return base
 
 
 def test_conviction_view_coerces_negative_stop_pct():
     """LLMs emit stop_pct as a signed number (-0.05 = 5% loss limit). Our
     convention is positive magnitude. Take abs() rather than reject."""
-    parsed = schemas.ConvictionView.model_validate({
-        "symbol": "SPY", "direction": "long", "conviction": 0.5,
-        "stop_pct": -0.05, "expires_in_hours": 4,
-    })
+    parsed = schemas.ConvictionView.model_validate(
+        _valid_long_payload(stop_pct=-0.05),
+    )
     assert parsed.stop_pct == 0.05
 
 
 def test_conviction_view_preserves_positive_stop_pct():
-    parsed = schemas.ConvictionView.model_validate({
-        "symbol": "SPY", "direction": "long", "conviction": 0.5,
-        "stop_pct": 0.07, "expires_in_hours": 4,
-    })
+    parsed = schemas.ConvictionView.model_validate(
+        _valid_long_payload(stop_pct=0.07),
+    )
     assert parsed.stop_pct == 0.07
 
 
 def test_conviction_view_stop_pct_none_passes_through():
-    parsed = schemas.ConvictionView.model_validate({
-        "symbol": "SPY", "direction": "long", "conviction": 0.5,
-        "expires_in_hours": 4,
-    })
+    parsed = schemas.ConvictionView.model_validate(_valid_long_payload())
     assert parsed.stop_pct is None
 
 
-def test_conviction_view_rejects_out_of_range_conviction():
+def test_conviction_view_rejects_out_of_range_likelihood():
+    """likelihood is the bounded confidence field on the new contract;
+    [0, 1] is enforced by pydantic's Field(ge=0, le=1)."""
+    with pytest.raises(Exception):
+        schemas.ConvictionView.model_validate(_valid_long_payload(likelihood=1.5))
+
+
+def test_conviction_view_rejects_long_with_negative_er():
+    """Sign discipline: long requires expected_return_pct >= 0. Bearish views
+    route via direction='long' on the inverse ETF instead."""
+    with pytest.raises(Exception):
+        schemas.ConvictionView.model_validate(
+            _valid_long_payload(expected_return_pct=-2.0),
+        )
+
+
+def test_conviction_view_rejects_long_missing_likelihood():
     with pytest.raises(Exception):
         schemas.ConvictionView.model_validate({
-            "symbol": "SPY", "direction": "long", "conviction": 1.5,
+            "symbol": "SPY", "direction": "long",
+            "expected_return_pct": 1.0, "time_to_target_days": 3,
+            "expires_in_hours": 4,
         })
 
 
@@ -192,13 +219,13 @@ def test_thesis_record_rejects_unknown_kind():
 
 
 def test_parse_structured_plain_json():
-    parsed, err = runner._parse_structured("review", '{"convictions": []}')
+    parsed, err = runner._parse_structured("review", '{"views": []}')
     assert err is None
     assert isinstance(parsed, schemas.ReviewOutput)
 
 
 def test_parse_structured_strips_code_fence():
-    text = '```json\n{"convictions": []}\n```'
+    text = '```json\n{"views": []}\n```'
     parsed, err = runner._parse_structured("review", text)
     assert err is None and parsed is not None
 
@@ -209,7 +236,7 @@ def test_parse_structured_returns_error_on_bad_json():
 
 
 def test_parse_structured_returns_error_on_validation_failure():
-    text = '{"convictions": [{"symbol": "SPY", "direction": "x", "conviction": 0.5}]}'
+    text = '{"views": [{"symbol": "SPY", "direction": "x", "conviction": 0.5}]}'
     parsed, err = runner._parse_structured("review", text)
     assert parsed is None and "validation" in err
 
@@ -219,18 +246,18 @@ def test_strip_code_fence_handles_trailing_fence():
 
 
 def test_strip_code_fence_strips_qwen_thinking_block():
-    text = '<think>Let me think about this carefully…</think>\n{"convictions": []}'
-    assert runner._strip_code_fence(text) == '{"convictions": []}'
+    text = '<think>Let me think about this carefully…</think>\n{"views": []}'
+    assert runner._strip_code_fence(text) == '{"views": []}'
 
 
 def test_strip_code_fence_extracts_json_from_prose():
-    text = "Here's my analysis:\n\n{\"convictions\": []}\n\nLet me know if you need anything else."
-    assert runner._strip_code_fence(text) == '{"convictions": []}'
+    text = "Here's my analysis:\n\n{\"views\": []}\n\nLet me know if you need anything else."
+    assert runner._strip_code_fence(text) == '{"views": []}'
 
 
 def test_strip_code_fence_handles_thinking_plus_fence():
-    text = '<think>plan</think>\n```json\n{"convictions": []}\n```'
-    assert runner._strip_code_fence(text) == '{"convictions": []}'
+    text = '<think>plan</think>\n```json\n{"views": []}\n```'
+    assert runner._strip_code_fence(text) == '{"views": []}'
 
 
 # ── Bundler smoke (no IBKR live) ─────────────────────────────────────────────
@@ -253,12 +280,16 @@ async def test_review_bundle_degrades_gracefully(test_agent):
 
 
 def _review_json_for(test_agent: str) -> str:
+    # New contract: agent emits the forecast triple (er, lk, ttd); the runner
+    # computes conviction = abs(er) × lk / ttd. For SPY here:
+    # 0.8 × 0.6 / 2 = 0.24 — see test_review_dry_run_writes_to_shadow_tables.
     return json.dumps({
-        "convictions": [
-            {"symbol": "SPY", "direction": "long", "conviction": 0.6,
-             "expected_return_pct": 0.8, "time_to_target_days": 2,
+        "views": [
+            {"symbol": "SPY", "direction": "long",
+             "expected_return_pct": 0.8, "likelihood": 0.6,
+             "time_to_target_days": 2,
              "rationale": "trend intact", "expires_in_hours": 4},
-            {"symbol": "TLT", "direction": "flat", "conviction": 0.0,
+            {"symbol": "TLT", "direction": "flat",
              "rationale": "no edge", "expires_in_hours": 4},
         ],
         "forecasts": [
@@ -289,7 +320,7 @@ async def test_review_dry_run_writes_to_shadow_tables(test_agent, monkeypatch):
     assert result.parsed_output is not None
     assert result.write_summary is not None
     assert result.write_summary["dry_run"] is True
-    assert result.write_summary["convictions_inserted"] == 2
+    assert result.write_summary["views_inserted"] == 2
     assert result.write_summary["forecasts_inserted"] == 2
 
     # Real shadow rows.
@@ -319,7 +350,7 @@ async def test_review_live_writes_to_real_tables(test_agent, monkeypatch):
 
     result = await runner.run_skill(test_agent, "review", dry_run=False)
     assert result.write_summary["dry_run"] is False
-    assert result.write_summary["convictions_inserted"] == 2
+    assert result.write_summary["views_inserted"] == 2
     assert result.write_summary["forecasts_inserted"] == 2
     assert result.write_summary["theses_recorded"] == 1
 
@@ -330,7 +361,8 @@ async def test_review_live_writes_to_real_tables(test_agent, monkeypatch):
             test_agent,
         )
     syms = {r["symbol"]: (r["direction"], float(r["conviction"])) for r in rows}
-    assert syms == {"SPY": ("long", 0.6), "TLT": ("flat", 0.0)}
+    # SPY: central calc = abs(0.8) * 0.6 / 2 = 0.24. TLT: flat → 0.0.
+    assert syms == {"SPY": ("long", 0.24), "TLT": ("flat", 0.0)}
 
 
 async def test_review_replaces_prior_convictions(test_agent, monkeypatch):
@@ -373,7 +405,7 @@ async def test_review_invalid_json_triggers_retry(test_agent, monkeypatch):
     result = await runner.run_skill(test_agent, "review", dry_run=True)
     assert len(result.validation_errors) == 1
     assert result.parsed_output is not None
-    assert result.write_summary["convictions_inserted"] == 2
+    assert result.write_summary["views_inserted"] == 2
 
 
 async def test_review_double_failure_skips_writes(test_agent, monkeypatch):

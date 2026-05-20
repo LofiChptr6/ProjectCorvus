@@ -688,6 +688,63 @@ def ops_health() -> dict[str, Any]:
     return asyncio.run(_ops_health())
 
 
+async def _tool_error_summary(
+    agent_name: str | None = None,
+    since_hours: int = 24,
+    min_errors: int = 1,
+) -> list[dict[str, Any]]:
+    async def q(conn: asyncpg.Connection) -> list[dict[str, Any]]:
+        # tool_calls.created_at is TEXT (ISO); cast for the time window.
+        # Join with audit_log to attribute (session_id → agent_name).
+        where_agent = "AND al.agent_name = $2" if agent_name else ""
+        params: list[Any] = [str(int(since_hours))]
+        if agent_name:
+            params.append(agent_name)
+        rows = await conn.fetch(
+            f"""SELECT al.agent_name,
+                       tc.tool_name,
+                       COUNT(*) AS total_calls,
+                       SUM(CASE WHEN tc.error IS NOT NULL THEN 1 ELSE 0 END) AS error_calls,
+                       MAX(tc.created_at) FILTER (WHERE tc.error IS NOT NULL) AS last_error_at,
+                       (ARRAY_AGG(tc.error ORDER BY tc.id DESC)
+                        FILTER (WHERE tc.error IS NOT NULL))[1] AS last_error_msg
+                FROM tool_calls tc
+                JOIN audit_log al ON al.session_id = tc.session_id
+                WHERE tc.created_at::timestamptz > NOW() - ($1 || ' hours')::interval
+                  {where_agent}
+                GROUP BY al.agent_name, tc.tool_name
+                HAVING SUM(CASE WHEN tc.error IS NOT NULL THEN 1 ELSE 0 END) >= {int(min_errors)}
+                ORDER BY error_calls DESC, total_calls DESC
+                LIMIT 100""",
+            *params,
+        )
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["error_rate"] = (
+                float(d["error_calls"]) / float(d["total_calls"])
+                if d["total_calls"] else 0.0
+            )
+            # Truncate last_error_msg for readability — the full text is in
+            # tool_calls.error if the operator wants to drill in.
+            if d.get("last_error_msg"):
+                d["last_error_msg"] = d["last_error_msg"][:300]
+            out.append(d)
+        return out
+    return await _with_conn(q)
+
+
+def tool_error_summary(
+    agent_name: str | None = None,
+    since_hours: int = 24,
+    min_errors: int = 1,
+) -> list[dict[str, Any]]:
+    """Aggregated tool-call failures over the last N hours, grouped by
+    (agent_name, tool_name). Surfaces systemic tool problems (e.g. "energy's
+    get_news has failed 18/20 times in the last hour")."""
+    return asyncio.run(_tool_error_summary(agent_name, since_hours, min_errors))
+
+
 # ── Probabilistic-forecast skill (calibration aggregation) ──────────────────
 
 

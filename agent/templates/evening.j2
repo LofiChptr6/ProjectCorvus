@@ -39,14 +39,17 @@ You are **{{ agent_name }}**, the sector analyst. This is your **end-of-day even
 {% endfor %}
 {% endif %}
 
-# Active conviction stack (close-of-day)
+# Active forecasts (close-of-day)
 {% for v in bundle.active_views %}
-- **{{ v.symbol }}** {{ v.direction }} conviction={{ v.conviction }}
+- **{{ v.symbol }}** {{ v.direction }} · expected_return={{ v.expected_return_pct }}% · likelihood={{ v.likelihood }} · ttd={{ v.time_to_target_days }}d
 {% endfor %}
 
 {% if bundle.workspace.watchlist %}
-# Watchlist (excerpt)
-{{ bundle.workspace.watchlist[:2000] }}{% if bundle.workspace.watchlist|length > 2000 %}…{% endif %}
+# Watchlist ({{ bundle.workspace.watchlist|length }} active rows)
+{% for w in bundle.workspace.watchlist[:40] %}
+- {{ w.symbol }}{% if w.bearish_via %} (bearish via {{ w.bearish_via }}){% endif %} · {{ w.added_reason or "" }}
+{% endfor %}
+{% if bundle.workspace.watchlist|length > 40 %}…[{{ bundle.workspace.watchlist|length - 40 }} more truncated]{% endif %}
 {% endif %}
 
 {% if bundle.bundle_warnings %}
@@ -77,5 +80,5 @@ Grade your day, then emit a single final assistant message containing only valid
 # Hard constraints
 - Output **must be JSON only** in your final message — no prose wrapper, no markdown fences.
 - Do **NOT** call any tools — evening is single-shot. The orchestrator will generate the slide image and send the Telegram from your structured output.
-- Do **NOT** submit conviction views or forecasts — those belong to /<agent>-review, not evening.
+- Do **NOT** submit forecasts here — those belong to /<agent>-review, not evening.
 - For single-ticker predictions, set `primary_symbol` + `direction` + `entry_price` together — the nightly thesis_resolver verifies them against bars at ±2% threshold (replaces self-graded confirmations). Omit the triple for sector-wide or qualitative theses.

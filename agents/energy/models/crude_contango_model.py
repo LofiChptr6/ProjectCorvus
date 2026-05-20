@@ -25,7 +25,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     usl_bars = extras.get("USL") or []
     if len(uso_bars) < 31 or len(usl_bars) < 31:
         return {
-            "signal": None, "direction": None, "conviction": 0.0,
+            "signal": None, "direction": None, "likelihood": 0.0,
             "expected_return_pct": 0.0, "time_to_target_days": 0,
             "inputs": {},
             "reason": f"need >=31 bars USO+USL, got USO={len(uso_bars)} USL={len(usl_bars)}",
@@ -35,7 +35,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     usl_30 = _ret_n(usl_bars, 30)
     if uso_30 is None or usl_30 is None:
         return {
-            "signal": None, "direction": None, "conviction": 0.0,
+            "signal": None, "direction": None, "likelihood": 0.0,
             "expected_return_pct": 0.0, "time_to_target_days": 0,
             "inputs": {}, "reason": "30-day return compute failed",
         }
@@ -52,7 +52,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         return {
             "signal": round(spread * 100, 3),
             "direction": "long",
-            "conviction": round(min(abs(spread) * 30, 0.8), 3),
+            "likelihood": round(min(abs(spread) * 30, 0.8), 3),
             "expected_return_pct": round(min(abs(spread) * 100, 4.0), 3),
             "time_to_target_days": 14,
             "inputs": inputs,
@@ -62,7 +62,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         return {
             "signal": round(spread * 100, 3),
             "direction": "flat",
-            "conviction": 0.0,
+            "likelihood": 0.0,
             "expected_return_pct": 0.0,
             "time_to_target_days": 14,
             "inputs": inputs,
@@ -71,7 +71,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     return {
         "signal": round(spread * 100, 3),
         "direction": "flat",
-        "conviction": 0.0,
+        "likelihood": 0.0,
         "expected_return_pct": 0.0,
         "time_to_target_days": 14,
         "inputs": inputs,

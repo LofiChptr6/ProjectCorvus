@@ -18,14 +18,14 @@ EXTRA_SYMBOLS = ["TIP"]
 def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < MIN_BARS:
         return {
-            "signal": None, "direction": None, "conviction": 0.0,
+            "signal": None, "direction": None, "likelihood": 0.0,
             "expected_return_pct": 0.0, "time_to_target_days": 0,
             "inputs": {}, "reason": f"need >={MIN_BARS} bars, got {len(bars)}",
         }
     tip_bars = (context.get("extra_bars") or {}).get("TIP") or []
     if len(tip_bars) < 2:
         return {
-            "signal": None, "direction": None, "conviction": 0.0,
+            "signal": None, "direction": None, "likelihood": 0.0,
             "expected_return_pct": 0.0, "time_to_target_days": 0,
             "inputs": {}, "reason": f"extra_bars.TIP needs >=2, got {len(tip_bars)}",
         }
@@ -46,7 +46,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         return {
             "signal": round(real_yield_change_proxy_bps, 3),
             "direction": "flat",
-            "conviction": 0.0,
+            "likelihood": 0.0,
             "expected_return_pct": 0.0,
             "time_to_target_days": 5,
             "inputs": inputs,
@@ -56,7 +56,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         return {
             "signal": round(real_yield_change_proxy_bps, 3),
             "direction": "long",
-            "conviction": round(min(abs(tip_return_pct) / 1.0, 0.7), 3),
+            "likelihood": round(min(abs(tip_return_pct) / 1.0, 0.7), 3),
             "expected_return_pct": round(min(abs(tip_return_pct) * 5, 3.0), 3),
             "time_to_target_days": 10,
             "inputs": inputs,
@@ -65,7 +65,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     return {
         "signal": round(real_yield_change_proxy_bps, 3),
         "direction": "flat",
-        "conviction": 0.0,
+        "likelihood": 0.0,
         "expected_return_pct": 0.0,
         "time_to_target_days": 10,
         "inputs": inputs,

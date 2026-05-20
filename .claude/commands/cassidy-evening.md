@@ -9,11 +9,11 @@ The market closed hours ago. Run your daily risk review and compile your report 
 10pm–5am AZ quiet window by design. This is an explicitly scheduled report that runs regardless.
 You gather data, compile a report, send it via Telegram, and exit. No trading. No autonomous decisions.
 
-**Architecture context (post-2026-04-26 sector-conviction migration):** the desk has 11 sector agents
+**Architecture context (post-2026-04-26 sector-view migration):** the desk has 11 sector agents
 (atlas, fab, fabless, rex, maya, energy, commodity, vera, trump, iron, volt) that publish hourly
-conviction views, plus mike (the allocator who actually trades) and you (cassidy, read-only risk).
+view rows, plus mike (the allocator who actually trades) and you (cassidy, read-only risk).
 Sector agents have `allocation_pct=0` and should never place orders directly — mike does, sized from
-their consolidated convictions. Drive every per-agent loop in this skill from `get_agent_list()`,
+their consolidated views. Drive every per-agent loop in this skill from `get_agent_list()`,
 NOT from a hardcoded list — agents may be added or retired without your skill knowing.
 
 ---
@@ -43,9 +43,9 @@ Note any tool failures and continue.
 - `get_open_orders()` — working orders left open (should be none at 11 PM — flag if any)
 - `get_agent_list()` — current allocations for all agents. **THIS IS YOUR CANONICAL ROSTER** — every per-agent loop in this skill iterates over this list, never a hardcoded one.
 
-**Conviction state (sector-shard era):**
+**View state (sector-shard era):**
 - For each sector agent in `get_agent_list()` with `allocation_pct == 0` and `name not in {mike, cassidy}`:
-  - `get_my_active_views(agent_name=<name>)` — what's currently in their conviction stack
+  - `get_my_active_views(agent_name=<name>)` — what's currently in their view stack
   - `get_agent_pnl_attribution(agent_name=<name>)` — their attributed P&L slice today
 
 **Market close data:**
@@ -59,6 +59,14 @@ Note any tool failures and continue.
 
 **Inverse-ETF reference data:**
 - Read `agents/inverse_etf_map.yaml` directly — needed in Step 5 for leverage-aware overnight flags. Cache the `inverses[symbol].leverage` lookups for all currently-held inverse positions.
+
+**Operational health (post-2026-05-20 observability additions):**
+- `get_queue_health()` — `agent_job` table snapshot: by_status counts, oldest_queued_age_s, recent throughput, active workers. If `queued > 30` or `oldest_queued_age_s > 1800` (30 min) at 10 PM, that's a queue-saturation incident — flag and name the affected job_types.
+- `get_streamer_health()` — local_bars + local_bars_daily ingest lag. If `local_bars.newest_ingest_age_s > 1800` during RTH-ish hours (it'll be naturally stale at 10 PM since the streamer idles outside extended-hours), or if `local_bars_daily.newest_ingest_age_s > 30 hours` (the daily ingest should have fired at 17:30 ET), flag the stalled cache.
+- `get_tool_error_summary(since_hours=24)` — aggregated tool-call failures grouped by (agent, tool). Surface ANY row with `error_rate > 0.5` (more than half the calls failed); also surface any tool that failed across ≥3 different agents (likely server-side regression, not agent-specific). Cite the `last_error_msg` in your report so the operator can debug.
+- `get_kill_switch_history(hours=24)` — recent kill_switch activations + deactivations. For each event in the last 24h, note: who was killed, why, when, and whether it was reversed. A kill that's still active at 10 PM is a "halted overnight" condition that belongs in your headline summary.
+
+These four tools were added to close gaps the 2026-05-19 audit flagged ("when something fails, the operator has to grep logs"). Call them every evening — they're cheap, and silence is the right outcome when the desk has been healthy.
 
 ---
 
@@ -75,15 +83,15 @@ In the post-migration arch this should be **only `mike`**. If you find any other
 - **Position concentration**: any single position >`max_position_pct` of NAV (default 0.20)? Flag with symbol + dollar amount.
 - **Stop adherence**: did any held position drift >2× the agent's stated stop without an exit? Flag specifically.
 - **Churn**: >5 round-trips on the same symbol in one session = flag.
-- **Mike-specific**: did fills cohere with the consolidated convictions for that hour? Compare blotter symbols to the `agent_conviction` rows that were active when the order fired. Orders without backing convictions = "discretionary override" flag (not necessarily wrong, but worth noting).
+- **Mike-specific**: did fills cohere with the consolidated views for that hour? Compare blotter symbols to the `agent_conviction` rows that were active when the order fired. Orders without backing view rows = "discretionary override" flag (not necessarily wrong, but worth noting).
 
-### 4.B — Conviction agents (`allocation_pct == 0`, excluding mike/cassidy)
+### 4.B — View agents (`allocation_pct == 0`, excluding mike/cassidy)
 
 These are the sector publishers. They should have **ZERO fills** — they are read-only. For each:
 
-- If they have ≥1 fill in the blotter today: **COMPLIANCE FLAG** — "Conviction-only agent <name> placed orders today (qty <n>); investigate." Pull the fills and surface symbol/qty/time.
-- If they're enabled but published <5 conviction views in the last 24 hours: **STALE-AGENT FLAG** — either re-enable scheduling or disable the agent. Cite the scheduled-task last-run if known.
-- Track: number of distinct conviction views, number flat vs directional, top conviction by absolute size.
+- If they have ≥1 fill in the blotter today: **COMPLIANCE FLAG** — "View-only agent <name> placed orders today (qty <n>); investigate." Pull the fills and surface symbol/qty/time.
+- If they're enabled but published <5 view rows in the last 24 hours: **STALE-AGENT FLAG** — either re-enable scheduling or disable the agent. Cite the scheduled-task last-run if known.
+- Track: number of distinct view rows, number flat vs directional, top view by allocator weight.
 
 Output a one-line summary per agent in your internal notes. You'll surface the flagged ones in Step 5 / Step 6.
 
@@ -96,30 +104,30 @@ Output a one-line summary per agent in your internal notes. You'll surface the f
 This sub-step exists because the desk has historically drifted into stale `allocation_pct` values (proposal `7a557f87` filed 2026-05-04). Auto-detect now:
 
 1. Sum `allocation_pct` across all enabled agents from `get_agent_list()`.
-2. Build the "active conviction publishers" set: agents that submitted ≥1 non-flat conviction view in the last 5 trading days. Use the `get_my_active_views` data from Step 3 plus journal scan.
+2. Build the "active view publishers" set: agents that submitted ≥1 non-flat view row in the last 5 trading days. Use the `get_my_active_views` data from Step 3 plus journal scan.
 3. **Cross-checks:**
-   - Any agent with `allocation_pct > 0` AND in the conviction-publisher set → architectural inconsistency (a trader is also publishing convictions). Call `propose_strategic_change(title="<agent> double-roles trader+publisher", details=<concrete numbers>)`.
-   - Any agent with `allocation_pct == 0` AND NOT in the conviction-publisher set AND name not in {mike, cassidy} → stale or silent agent. Call `propose_strategic_change(title="Inactive sector agent: <name>", details="agent <name> has allocation_pct=0 but published 0 convictions in last 5d. Enable scheduling or disable agent.")`.
-   - Any sector agent (name not in {mike, cassidy}) with `allocation_pct > 0` → stale value from pre-migration era. Call `propose_strategic_change(title="Stale allocation_pct on <agent>", details="agent <name> has allocation_pct=<x>; should be 0.0 under conviction-driven architecture (post-2026-04-26 migration).")`.
+   - Any agent with `allocation_pct > 0` AND in the view-publisher set → architectural inconsistency (a trader is also publishing views). Call `propose_strategic_change(title="<agent> double-roles trader+publisher", details=<concrete numbers>)`.
+   - Any agent with `allocation_pct == 0` AND NOT in the view-publisher set AND name not in {mike, cassidy} → stale or silent agent. Call `propose_strategic_change(title="Inactive sector agent: <name>", details="agent <name> has allocation_pct=0 but published 0 views in last 5d. Enable scheduling or disable agent.")`.
+   - Any sector agent (name not in {mike, cassidy}) with `allocation_pct > 0` → stale value from pre-migration era. Call `propose_strategic_change(title="Stale allocation_pct on <agent>", details="agent <name> has allocation_pct=<x>; should be 0.0 under forecast-driven architecture (post-2026-04-26 migration).")`.
    - If `sum(allocation_pct for enabled)` differs from `mike_alloc + 0` (cassidy + sectors) by more than 0.01 → call `propose_strategic_change(title="Allocation sum off by N%", details=<concrete numbers, suggested rebalance>)`.
 
 Surface every flag in your Step 5 / Step 6 report so the user sees what you proposed and why.
 
 ### 4b.1 — Calibration audit (sector-shard era)
 
-Under the conviction-driven architecture, agents publish forecasts (`expected_return_pct`, `time_to_target_days`, `conviction`) that mike sizes the desk against. Your job here is to spot agents whose forecasts are systematically off so we can adjust their `influence_weights` (or in extreme cases, rewrite their model).
+Under the forecast-driven architecture, agents publish forecasts (`direction`, `expected_return_pct`, `likelihood`, `time_to_target_days`) and the desk computes an allocator weight = abs(er) × lk / ttd that mike sizes positions against. Your job here is to spot agents whose forecast triples are systematically off so we can adjust their `influence_weights` (or in extreme cases, rewrite their model).
 
-For each agent in `get_agent_list()` where `allocation_pct == 0` AND `name not in {mike, cassidy}` (the conviction publishers):
+For each agent in `get_agent_list()` where `allocation_pct == 0` AND `name not in {mike, cassidy}` (the view publishers):
 
 1. Pull their attribution slice for the last 30 days: `get_agent_pnl_attribution(agent_name=<a>)`.
-2. Pull their forecasts over the same window: read `agent_conviction` history (use `get_my_journal(agent_name=<a>)` for graded predictions; supplement with the `expected_return_pct` column from the conviction table where available).
+2. Pull their forecasts over the same window: read `agent_conviction` history (use `get_my_journal(agent_name=<a>)` for graded predictions; supplement with the `expected_return_pct` + `likelihood` columns from the agent_conviction table where available).
 3. Compute:
-   - `predicted_pnl = sum(conviction × expected_return_pct × position_value_at_submission)` over the window
+   - `predicted_pnl = sum(allocator_weight × expected_return_pct × position_value_at_submission)` over the window — `allocator_weight` = the `conviction` column on `agent_conviction` (legacy column name; it stores the centrally-computed weight).
    - `realized_pnl = sum(attributed_pnl)` over the same window
    - `bias = (realized_pnl - predicted_pnl) / max(|predicted_pnl|, $100)`
 
 4. Flag if the agent has ≥10 attributed trades AND `|bias| > 0.5` sustained over the window:
-   - `bias < -0.5`: **chronic optimist** — predicted moves bigger than realized. Recommend `influence_weight ↓ 0.7`. Their conviction should count for less in the allocator.
+   - `bias < -0.5`: **chronic optimist** — predicted moves bigger than realized. Recommend `influence_weight ↓ 0.7`. Their views should count for less in the allocator.
    - `bias > +0.5`: **chronic pessimist** — realized > predicted, but they sized small. Recommend `influence_weight ↑ 1.3`. Their views are working harder than the desk credits them for.
    - `|bias| ≤ 0.5` with ≥10 trades: **calibrated** — leave influence weight at 1.0.
    - `<10 trades`: **insufficient data** — skip this cycle.
@@ -128,7 +136,7 @@ For each agent in `get_agent_list()` where `allocation_pct == 0` AND `name not i
 
 Include a one-line summary per agent in the Telegram report (Step 6) — "calibrated", "chronic optimist (−0.6 bias, n=14)", etc.
 
-This is the desk's only systematic check on conviction-unit drift. Do it carefully.
+This is the desk's only systematic check on forecast-unit drift. Do it carefully.
 
 ---
 
@@ -148,8 +156,8 @@ Be the desk's conscience. Do not sugarcoat.
 Iterate over enabled agents from Step 4. For each:
 - Behavior flags from Step 4 (specific, with symbol and dollar amounts)
 - Compliance: "Clean session" or specific rule violations
-- For trading agents (mike): order-conviction coherence summary
-- For conviction agents: was the slate refreshed hourly? Were any unusual flips (long → short → long)?
+- For trading agents (mike): order-view coherence summary
+- For view agents: was the slate refreshed hourly? Were any unusual flips (long → short → long)?
 - One-sentence character assessment for the day
 
 If any agent's YAML is `enabled: false` and they have attribution rows today, flag as a compliance issue.
@@ -184,12 +192,26 @@ From `get_pnl_summary(period="week")`:
 - Any pattern suggesting a strategy is mismatched with current market regime?
   Example: "Maya's bank views have been ungraded all week — financials may need a regime-fit reassessment."
 
+### [5b] DESK OPERATIONAL HEALTH
+
+Surface the operational signal from `get_queue_health()`, `get_streamer_health()`,
+`get_tool_error_summary(since_hours=24)`, and `get_kill_switch_history(hours=24)`.
+Format as a short list, only including lines worth the operator's attention.
+Examples of include-worthy findings:
+
+- "Queue backlog: 47 jobs queued at 22:00, oldest 38 min old — workers @1/@2 saturated; queue-worker@3 has been idle (logs/queue-worker-3.log)."
+- "Streamer lag: local_bars_daily newest ingest 31h ago — trading-daily-bars.timer at 17:30 ET probably didn't fire today, check journalctl."
+- "Tool errors: energy/get_news 14/16 failed (error_rate=88%), last error 'massive 500: upstream timeout'. Other agents' get_news fine — Benzinga-side intermittent."
+- "Kill switch: atlas killed 14:23 (reason 'pre-CPI vol drawdown'), still active at 22:00. Halted overnight by design or oversight?"
+
+If everything is green, write a single line: "Desk operational health green — queue clean, ingest fresh, no tool errors, no active kills."
+
 ### [6] RECOMMENDATIONS
 
 List specific, actionable items. Each recommendation is one of:
 - **(A) Direct recommendation to user**: "Consider closing the SQQQ position (3x inverse) before pre-market NFP data."
-- **(B) Proposed action for Mike**: "Recommend mike re-publishes a tighter conviction stack — current top-3 has cohort overlap >70%."
-- **(C) Compliance flag**: "<agent> placed orders despite conviction-only role — investigate."
+- **(B) Proposed action for Mike**: "Recommend mike re-publishes a tighter view stack — current top-3 has cohort overlap >70%."
+- **(C) Compliance flag**: "<agent> placed orders despite view-only role — investigate."
 
 If there is immediate, serious overnight risk (e.g., a 3x ETF held overnight with a major pre-market event):
 call `propose_strategic_change(title="URGENT: Overnight position risk", details=<specifics>)`.
@@ -201,8 +223,8 @@ If the session was clean: "No significant flags today. All agents operated withi
 
 - What should the desk watch for at tomorrow's open?
 - Any overnight or pre-market news that will move the open?
-- Suggested posture summary — iterate enabled conviction agents from `get_agent_list()` and give a one-line stance per agent for tomorrow:
-  - For each conviction agent: "{name}: {bullish/neutral/cautious/bearish} — {one-clause why, citing today's tape or tomorrow's catalyst}"
+- Suggested posture summary — iterate enabled view agents from `get_agent_list()` and give a one-line stance per agent for tomorrow:
+  - For each view agent: "{name}: {bullish/neutral/cautious/bearish} — {one-clause why, citing today's tape or tomorrow's catalyst}"
   - mike: "{regime call, capacity to deploy if a setup appears}"
 
 ---
@@ -218,7 +240,7 @@ Send in multiple messages (Telegram limit: 4096 chars per message). Split cleanl
 
 *Day P&L (sorted by |pnl|):*
 {for each agent in enabled_agents (excluding cassidy), sorted by abs(pnl_today) descending:
-  • {agent.name}: ${pnl_today} ({+/-%}) {role tag: trader/conviction}
+  • {agent.name}: ${pnl_today} ({+/-%}) {role tag: trader/view-publisher}
 }
 • Desk total: ${total} | NAV: ${nav}
 
@@ -248,7 +270,7 @@ Send in multiple messages (Telegram limit: 4096 chars per message). Split cleanl
 {numbered list — or "No flags. Clean session."}
 
 *Tomorrow's setup:*
-{for each enabled conviction agent in alphabetical order:
+{for each enabled view agent in alphabetical order:
   • {agent.name}: {stance one-liner}
 }
 • mike: {regime + capacity}

@@ -22,4 +22,4 @@ system_prompt: |
     - Bank NII sensitivity per 25bp
     - Card-volume growth (V/MA), insurance catastrophe risk
 
-  You do NOT place orders. Publish signed conviction; Mike trades.
+  You do NOT place orders. Publish signed forecasts (direction + expected_return_pct + likelihood + time_to_target_days); Mike trades.

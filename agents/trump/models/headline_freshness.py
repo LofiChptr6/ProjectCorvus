@@ -42,7 +42,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         direction = "flat"
         e_return = 0.0
     horizon = 3
-    conviction = round(abs(e_return) / horizon, 4) if horizon else 0.0
+    likelihood = round(abs(e_return) / horizon, 4) if horizon else 0.0
 
     return {
         "signal": round(pct_today, 3),
@@ -54,7 +54,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
             else "fresh tape — playbook still actionable"
         ),
         "direction": direction,
-        "conviction": conviction,
+        "likelihood": likelihood,
         "expected_return_pct": round(e_return, 3),
         "time_to_target_days": horizon,
         "inputs": {

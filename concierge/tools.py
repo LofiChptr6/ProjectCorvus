@@ -146,7 +146,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "get_agent_overview",
-        "description": "Full snapshot of one sector agent: active convictions (with rationales), open theses, recent thesis resolutions, P&L today + week, last 2 sector stories, last evening digest. Use for 'what is Fab thinking' / 'how is Maya doing' / 'show me X's book'.",
+        "description": "Full snapshot of one sector agent: active views (with rationales), open theses, recent thesis resolutions, P&L today + week, last 2 sector stories, last evening digest. Use for 'what is Fab thinking' / 'how is Maya doing' / 'show me X's book'.",
         "input_schema": {
             "type": "object",
             "properties": {"agent_name": {"type": "string", "description": "One of: atlas, fab, fabless, iron, maya, rex, trump, vera, volt, energy, commodity (mike/cassidy are not sector publishers)."}},
@@ -348,9 +348,9 @@ async def _tool_send_telegram_followup(args: dict[str, Any]) -> str:
 
 # ── Agent reasoning surface ───────────────────────────────────────────────────
 # These let the concierge answer "why does Fab hold ASML" / "what is Maya
-# thinking" by reading every agent's published convictions, theses, and
-# rationales straight from the canonical tables. Without them the concierge
-# would only see prices + positions, never the *reason* behind a position.
+# thinking" by reading every agent's published views, theses, and rationales
+# straight from the canonical tables. Without them the concierge would only
+# see prices + positions, never the *reason* behind a position.
 
 
 async def _tool_get_position_dossier(args: dict[str, Any]) -> str:

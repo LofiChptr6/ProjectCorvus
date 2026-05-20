@@ -737,6 +737,39 @@ async def get_kill_switch_status() -> str:
 
 
 @mcp.tool()
+async def get_kill_switch_history(hours: int = 24) -> str:
+    """Recent kill_switch activations (and deactivations) over the last N
+    hours. Use in evening / post-mortem reviews to surface "why was atlas
+    halted at 14:23 today" — the current-state tool `get_kill_switch_status`
+    only shows the latest per-agent state, not the trail.
+
+    Returns: {"window_hours": N, "events": [
+      {id, agent_name, is_active, activated_at, activated_by, reason,
+       deactivated_at}, ...
+    ]} sorted by id DESC.
+    """
+    await _ensure_init_light()
+    from db.schema import get_pool
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, agent_name, is_active, activated_at, activated_by,
+                      reason, deactivated_at
+               FROM kill_switch
+               WHERE COALESCE(activated_at::timestamptz,
+                              deactivated_at::timestamptz) >
+                     NOW() - ($1 || ' hours')::interval
+               ORDER BY id DESC
+               LIMIT 100""",
+            str(int(hours)),
+        )
+    return json.dumps({
+        "window_hours": int(hours),
+        "events": [dict(r) for r in rows],
+    }, default=str)
+
+
+@mcp.tool()
 async def activate_kill_switch(reason: str, agent_name: Optional[str] = None) -> str:
     """
     Activate the kill switch.
@@ -935,6 +968,39 @@ async def prime_sector_queues() -> str:
     await _ensure_init_light()
     from meta_agent.queue_primer import prime_all_agent_queues
     return json.dumps(await prime_all_agent_queues(), default=str)
+
+
+@mcp.tool()
+async def get_tool_error_summary(
+    agent_name: Optional[str] = None,
+    since_hours: int = 24,
+    min_errors: int = 1,
+) -> str:
+    """Aggregated tool-call failures over the last N hours, grouped by
+    (agent_name, tool_name). Surfaces systemic tool problems — e.g. "energy
+    has called get_news 20 times and 18 failed" — which would otherwise be
+    invisible without grepping per-session logs.
+
+    Returns: {"window_hours": N, "rows": [
+      {agent_name, tool_name, total_calls, error_calls, error_rate,
+       last_error_at, last_error_msg (truncated 300 chars)}, ...
+    ]}. Ordered by error_calls desc.
+
+    Use when:
+      - Cassidy is writing the evening risk review — folds into the
+        per-agent tool-failure section.
+      - Investigating why an agent's reviews keep crashing or returning
+        partial output.
+      - Catching MCP-side regressions: a tool that started failing across
+        many agents at once is a server-side problem, not an agent one.
+    """
+    await _ensure_init_light()
+    from obs.queries import _tool_error_summary
+    rows = await _tool_error_summary(agent_name, since_hours, min_errors)
+    return json.dumps({
+        "window_hours": int(since_hours),
+        "rows": rows,
+    }, default=str)
 
 
 @mcp.tool()
@@ -1762,17 +1828,17 @@ async def generate_forecast_panel(agent_name: str) -> str:
 
     One row per ticker, stacked vertically. Each row shows the last 5 trading
     days of close prices plus a dashed forecast line extending to the
-    conviction's `time_to_target_days`, ending at
-        today_price × (1 + expected_return_pct/100 × conviction).
+    forecast's `time_to_target_days`, ending at
+        today_price × (1 + expected_return_pct/100 × likelihood).
     A vertical horizon marker labels `time_to_target_days = N` so the agent's
     timescale is legible at a glance. Tickers are picked from
-    (active convictions ∪ current positions), deduped, ranked by abs(market
-    value) primary and abs(conviction) secondary.
+    (active forecasts ∪ current positions), deduped, ranked by abs(market
+    value) primary and the desk's internal allocator weight secondary.
 
     Use in the evening review alongside `generate_pnl_curve` /
     `generate_agent_chart`. Returns {"chart_path": "..."} or
     {"error": "..."} on failure or {"empty": true} when the agent has no
-    convictions and no positions.
+    active forecasts and no positions.
 
     Args:
         agent_name: Sector agent name (e.g. "fab", "fabless", "vera").
@@ -2115,24 +2181,26 @@ async def submit_conviction_view(
     session_id: Optional[str] = None,
 ) -> str:
     """
-    Publish a signed conviction view on one symbol. Upserts on (agent_name, symbol)
-    so calling again replaces the prior view. Mike reads these to size the desk.
+    Publish a signed forecast on one symbol. Upserts on (agent_name, symbol)
+    so calling again replaces the prior row. Mike reads these to size the desk.
 
-    AGENTS DO NOT PICK THE CONVICTION NUMBER. You supply your forecast inputs —
+    AGENTS DO NOT PICK THE ALLOCATOR WEIGHT. You supply the forecast triple —
     (expected_return_pct, likelihood, time_to_target_days) — and the server
-    computes conviction centrally as:
+    computes the desk's internal weight centrally as:
 
-        conviction = abs(expected_return_pct) × likelihood / time_to_target_days
+        weight = abs(expected_return_pct) × likelihood / time_to_target_days
 
-    See `meta_agent.allocator.compute_conviction`. This guarantees every agent
-    uses the same scale and removes a hand-tuning degree of freedom that the
-    2026-05 audit flagged.
+    See `meta_agent.allocator.compute_conviction`. This guarantees every
+    agent uses the same scale and removes a hand-tuning degree of freedom
+    that the 2026-05 audit flagged.
 
     Args:
         agent_name: Your agent name (e.g. 'atlas', 'fab', 'vera').
         symbol: Ticker, will be uppercased.
-        direction: 'long' | 'short' | 'flat'. 'flat' bypasses the conviction
-                   formula (conviction stored as 0).
+        direction: 'long' | 'short' | 'flat'. Bearish views go through
+                   inverse-ETF longs, not direction='short'. 'flat' is the
+                   canonical "no view" submission and bypasses the weight
+                   formula.
         rationale: 1–2 sentence why (audit trail). For inverse-ETF symbols this is
                    what the user reads on the Telegram approval prompt — be concrete.
         expires_in_hours: REQUIRED. Auto-expire after N hours. Range 0.0833 (5min)
@@ -2144,12 +2212,14 @@ async def submit_conviction_view(
                              signed % move on this name (e.g. +8.5 = expect +8.5%
                              move; -6.0 = expect -6% move). Sign MUST match
                              direction (long → positive, short → negative).
-        likelihood: REQUIRED for direction != 'flat'. Probability the forecast
-                    plays out, in [0, 1]. 0.5 = coin-flip; 0.8 = strong
-                    confidence. Drives the central conviction formula.
+        likelihood: REQUIRED for direction != 'flat'. Your probability in [0,1]
+                    that the forecast plays out. 0.5 = coin-flip; 0.8 = strong
+                    confidence. The ONLY confidence number you author — the
+                    desk's allocator weight is derived from it.
         time_to_target_days: REQUIRED for direction != 'flat' and must be > 0.
-                             Your horizon in trading days. Drives both the central
-                             conviction formula and the evening forecast panel.
+                             Your horizon in trading days. Drives both the
+                             desk's internal weight and the evening forecast
+                             panel.
         model_inputs: Raw quant model output for replay (optional dict).
         momentum_confirmed: For direction='long' on a verified inverse ETF, asserts
                             whether the underlying is already showing the bearish move
@@ -2157,7 +2227,7 @@ async def submit_conviction_view(
                             None on non-inverse symbols.
         stop_pct: Optional defensive auto-flat trigger. If unrealized return on
                   this symbol falls below -stop_pct, the allocator treats this
-                  conviction as flat regardless of whether you re-publish.
+                  position as flat regardless of whether you re-publish.
                   Recommended for inverse-ETF longs: 8 on 1×, 4 on ≥2×.
     """
     await _ensure_init_light()
@@ -2259,19 +2329,20 @@ async def submit_conviction_from_model(
     session_id: Optional[str] = None,
 ) -> str:
     """
-    Publish a conviction whose numeric fields come from running a server-side
-    quant model. The agent picks (model, symbol, rationale); compute() picks
-    direction / conviction / expected_return_pct / time_to_target_days /
-    stop_pct. This is the only write path that bypasses LLM-authored
-    prediction numbers — see agents/MODEL_CONTRACT.md for the contract.
+    Publish a forecast whose numeric fields come from running a server-side
+    quant model. The agent picks (model, symbol, rationale); compute() returns
+    direction / expected_return_pct / likelihood / time_to_target_days /
+    stop_pct. The desk's internal allocator weight is then recomputed
+    centrally — neither the agent nor the model picks it. See
+    agents/MODEL_CONTRACT.md for the model contract.
 
     Flow: load agents/{agent_name}/models/{model_name}.py → fetch bars at the
     model's declared BAR_FREQUENCY for LOOKBACK_DAYS (defaults 1d / 252) →
     build context {nav, regime, agent_name} → call compute() → if
     signal/direction declines, return {skipped: true}; otherwise insert with
-    numbers from the model output. Agent supplies only `rationale` (prose)
-    and `momentum_confirmed` (inverse-ETF entry timing — a human call,
-    not a number).
+    the model's triple. Agent supplies only `rationale` (prose) and
+    `momentum_confirmed` (inverse-ETF entry timing — a human call, not a
+    number).
 
     Args:
         agent_name: Sector agent whose watchlist contains the symbol (agent_watchlist).
@@ -2286,7 +2357,9 @@ async def submit_conviction_from_model(
 
     Returns one of:
         - {view_id, symbol, direction, conviction, expected_return_pct,
-           time_to_target_days, stop_pct, from_model, model_version}
+           likelihood, time_to_target_days, stop_pct, from_model, model_version}
+          where `conviction` is the desk-internal allocator weight computed
+          from the triple — NOT a value the model emitted.
         - {skipped: true, reason, model, model_version} — model declined.
         - {error: "..."} — bad input or compute crash.
     """
@@ -2365,8 +2438,8 @@ async def submit_conviction_from_model(
 @mcp.tool()
 async def clear_my_views(agent_name: str) -> str:
     """
-    Drop all of this agent's conviction rows. Call at start of each review so the
-    new slate fully replaces the old one (rather than mixing stale + fresh).
+    Drop all of this agent's active forecast rows. Call at start of each review
+    so the new slate fully replaces the old one (rather than mixing stale + fresh).
 
     Args:
         agent_name: Your agent name.
@@ -2887,8 +2960,10 @@ async def get_my_active_forecasts(agent_name: str, horizon: str = "") -> str:
 @mcp.tool()
 async def get_my_active_views(agent_name: str) -> str:
     """
-    Read this agent's currently active (non-expired, non-flat) conviction rows.
-    Useful for continuity: see what you said last hour before forming this hour's view.
+    Read this agent's currently active (non-expired, non-flat) forecast rows
+    — each carrying direction, expected_return_pct, likelihood, time_to_target_days,
+    rationale. Useful for continuity: see what you said last hour before
+    forming this hour's view.
 
     Args:
         agent_name: Your agent name.
@@ -3283,6 +3358,7 @@ async def rebalance_desk(
         }
 
     auto_orders: list = []
+    silenced_by_recent_approval: list[dict] = []
     for o in proposed:
         if o.symbol.upper() in just_placed_symbols:
             # Approved trade just placed at the top of this run; drop to avoid
@@ -3293,11 +3369,48 @@ async def rebalance_desk(
         )
         if decision == "auto":
             auto_orders.append(o)
-        else:  # "gated"
-            pending_inverse_approvals.append({
-                "order": o,
-                "payload": _build_payload(o, contribs),
+            continue
+
+        # decision == "gated" — would normally queue a Telegram approval.
+        # Before doing that, check whether the user has ALREADY approved an
+        # entry on this (vehicle, contributing-agents) tuple within the last
+        # 6 hours. If yes, treat as user-blessed and place immediately —
+        # otherwise the desk re-prompts every hourly review on the same
+        # unconfirmed inverse-ETF view (the SOXS-from-fab loop reported
+        # 2026-05-20).
+        contrib_agents = {
+            (v.agent_name or "").strip() for v in (contribs or []) if v.agent_name
+        }
+        recent_approval = (
+            _approval_proposals.find_recent_approval(
+                vehicle=o.symbol.upper(),
+                contrib_agents=contrib_agents,
+                window_seconds=6 * 3600,
+            ) if contrib_agents else None
+        )
+        if recent_approval:
+            auto_orders.append(o)
+            age_h = (_time.time() - (recent_approval.get("resolved_at") or 0)) / 3600.0
+            silenced_by_recent_approval.append({
+                "symbol": o.symbol.upper(),
+                "qty": int(o.qty),
+                "side": o.side,
+                "prior_proposal_id": recent_approval["id"][:8],
+                "prior_approved_age_h": round(age_h, 2),
+                "contrib_agents": sorted(contrib_agents),
             })
+            log.info(
+                "inverse-ETF gate auto-promoted via recent approval %s "
+                "(age %.1fh): %s BUY %d (agents=%s)",
+                recent_approval["id"][:8], age_h, o.symbol.upper(), int(o.qty),
+                sorted(contrib_agents),
+            )
+            continue
+
+        pending_inverse_approvals.append({
+            "order": o,
+            "payload": _build_payload(o, contribs),
+        })
     proposed = auto_orders
 
     contributing_views_json = {
@@ -3420,6 +3533,7 @@ async def rebalance_desk(
             "pending_user_review": pending_user_review,
             "approved_trades_placed": approved_trades_placed,
             "pending_inverse_approvals": pending_inverse_approvals_dump,
+            "silenced_by_recent_approval": silenced_by_recent_approval,
             "netted_pairs": netted_pairs_dump,
             "stop_pct_brakes_fired": brake_log,
             "mixture_path_enabled": use_mixture_enabled(),

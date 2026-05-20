@@ -8,7 +8,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < 200:
         return {
             "direction": "flat",
-            "conviction": 0.0,
+            "likelihood": 0.0,
             "expected_return_pct": 0.0,
             "time_to_target_days": 0,
             "inputs": {"reason": f"need >=200 bars, got {len(bars)}"},
@@ -49,11 +49,11 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         e_return = 0.0
 
     time_to_target_days = 90
-    conviction = (abs(e_return) / time_to_target_days) if time_to_target_days else 0.0
+    likelihood = (abs(e_return) / time_to_target_days) if time_to_target_days else 0.0
 
     return {
         "direction": direction,
-        "conviction": round(conviction, 4),
+        "likelihood": round(likelihood, 4),
         "expected_return_pct": round(e_return, 3),   # already signed
         "time_to_target_days": time_to_target_days,
         "inputs": {

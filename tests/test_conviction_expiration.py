@@ -140,8 +140,8 @@ def test_conviction_view_schema_rejects_over_30days():
 def test_conviction_view_schema_accepts_float_5min():
     from pipelines import schemas
     cv = schemas.ConvictionView(
-        symbol="SPY", direction="long", conviction=0.5,
-        expected_return_pct=1.0, time_to_target_days=1,
+        symbol="SPY", direction="long",
+        expected_return_pct=1.0, likelihood=0.5, time_to_target_days=1,
         expires_in_hours=5/60,
     )
     assert cv.expires_in_hours == pytest.approx(5/60)

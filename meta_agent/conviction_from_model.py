@@ -157,20 +157,18 @@ async def compute_conviction_payload(
     if direction == "short" and expected_return_pct > 0:
         return {"status": "error", "error": f"contract violation: direction='short' but expected_return_pct={expected_return_pct} > 0"}
 
-    # Likelihood — new contract field. Older models emit `conviction` ∈ [0, 1]
-    # which served the same role; fall back to it so we don't have to rewrite
-    # every existing model in one shot. Models migrating forward should emit
-    # `likelihood` explicitly.
-    likelihood_raw = result.get("likelihood")
-    if likelihood_raw is None:
-        likelihood_raw = result.get("conviction")
+    # Likelihood — the model's probability in [0, 1] that the forecast plays
+    # out. All 16 active models emit `likelihood` directly per MODEL_CONTRACT.md
+    # (rev 2026-05-20). The legacy `conviction`-named field was dropped after
+    # the migration; if a future model accidentally emits `conviction` and
+    # omits `likelihood`, the row gets likelihood=0 and is skipped.
     try:
-        likelihood = float(likelihood_raw) if likelihood_raw is not None else 0.0
+        likelihood = float(result.get("likelihood") or 0.0)
     except (TypeError, ValueError):
         likelihood = 0.0
     if likelihood < 0.0:
         likelihood = 0.0
-    if likelihood > 1.0:
+    elif likelihood > 1.0:
         likelihood = 1.0
 
     # Central conviction calculation — same formula as submit_conviction_view.

@@ -55,7 +55,7 @@ def _no_signal(reason: str) -> dict[str, Any]:
     return {
         "signal": None,
         "direction": None,
-        "conviction": 0.0,
+        "likelihood": 0.0,
         "expected_return_pct": 0.0,
         "time_to_target_days": 0,
         "inputs": {},
@@ -220,7 +220,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     return {
         "signal": round(mu_pct, 3),
         "direction": direction,
-        "conviction": min(abs(mu_pct) / 3.0, 1.0) if direction != "flat" else 0.0,
+        "likelihood": min(abs(mu_pct) / 3.0, 1.0) if direction != "flat" else 0.0,
         "expected_return_pct": e_return,
         "time_to_target_days": ttd,
         "stop_pct": None,

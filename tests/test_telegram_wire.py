@@ -146,10 +146,11 @@ def _final(text: str) -> _FakeResponse:
 # ── Review: live fires Telegram, dry-run is silent ───────────────────────────
 
 
-def _review_json_with_summary(summary: str = "regime intact; long SPY 0.65") -> str:
+def _review_json_with_summary(summary: str = "regime intact; long SPY") -> str:
     return json.dumps({
-        "convictions": [{"symbol": "SPY", "direction": "long", "conviction": 0.65,
-                         "expires_in_hours": 4}],
+        "views": [{"symbol": "SPY", "direction": "long",
+                         "expected_return_pct": 0.5, "likelihood": 0.6,
+                         "time_to_target_days": 2, "expires_in_hours": 4}],
         "forecasts": [{
             "symbol": "SPY", "expected_return_pct": 0.5, "likelihood": 0.6,
             "time_to_target_days": 2, "method": "regime",
@@ -188,7 +189,7 @@ async def test_review_dry_run_fires_telegram_with_dry_run_prefix(test_agent, mon
 async def test_review_live_with_empty_summary_does_not_fire(test_agent, monkeypatch, telegram_recorder):
     """LLM may legitimately omit telegram_summary (None) — runner should not send empty."""
     payload = json.dumps({
-        "convictions": [],
+        "views": [],
         "forecasts": [],
         # no telegram_summary field
     })

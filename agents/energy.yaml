@@ -29,7 +29,7 @@ system_prompt: |
     - Nat-gas: Henry Hub spot vs storage vs heating demand
     - Permian rig count + DUC inventory
 
-  You do NOT place orders. Publish signed conviction; Mike trades.
+  You do NOT place orders. Publish signed forecasts (direction + expected_return_pct + likelihood + time_to_target_days); Mike trades.
 
 # Indicators for trend / oscillator / envelope reads on the evening forecast panel.
 # Consumed by reporting/forecast_panel.py + tool_dispatch.py. Edit via

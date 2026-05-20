@@ -26,4 +26,4 @@ system_prompt: |
     - ARM royalty rates + v9 adoption
     - SMH/SOXX sector-ETF flow as momentum confirmation
 
-  You do NOT place orders. Publish signed conviction; Mike trades.
+  You do NOT place orders. Publish signed forecasts (direction + expected_return_pct + likelihood + time_to_target_days); Mike trades.

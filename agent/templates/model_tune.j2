@@ -83,6 +83,6 @@ When you've decided, emit a single final assistant message containing only valid
 
 - Output **must be JSON only** in your final message.
 - For `tune` and `add`, you MUST include a top-level `MODEL_VERSION = "X.Y"` constant in `new_content` matching `new_version`. Major bump = arch change, minor = param tweak.
-- The `compute(symbol, bars, context) -> dict` signature MUST be preserved (the auto-discovery loader calls it). Output dict must include `direction`, `conviction`, `expected_return_pct`, `time_to_target_days`, `inputs`.
+- The `compute(symbol, bars, context) -> dict` signature MUST be preserved (the auto-discovery loader calls it). Output dict must include `direction`, `expected_return_pct`, `likelihood` (∈ [0, 1] — your model's calibrated probability that the forecast plays out), `time_to_target_days`, `inputs`. The desk computes its own internal allocator weight from those three numbers — do NOT emit a "conviction" field; the older fallback path treats it as a likelihood proxy but you should write fresh code with `likelihood` directly.
 - `file_path` must start with `agents/{{ agent_name }}/models/` — the orchestrator rejects paths that escape this root.
-- Do NOT submit conviction views, forecasts, or send Telegrams. The orchestrator handles persistence and notifications from your structured output.
+- Do NOT submit forecasts or send Telegrams here. The orchestrator handles persistence and notifications from your structured output.

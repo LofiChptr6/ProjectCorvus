@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ── Review (Phase 2) ──────────────────────────────────────────────────────────
@@ -61,6 +61,54 @@ class ConvictionView(BaseModel):
         if v is None:
             return None
         return abs(float(v))
+
+    @model_validator(mode="after")
+    def _enforce_sign_and_triple(self) -> "ConvictionView":
+        """Enforce desk-level invariants the agent prompt promises:
+
+        - direction='long' requires expected_return_pct >= 0. A bearish view
+          on the underlying must be expressed as direction='long' on the
+          INVERSE symbol (with positive expected_return_pct on the bear ETF) —
+          never as direction='long' with a negative magnitude. Catching this
+          at parse time mirrors the legacy submit_conviction_view tool's
+          sign-discipline check; without it the row silently slipped through
+          the structured-output path (atlas 2026-05-20 emitted long TLT
+          er=-3.0 instead of long TBT er=+3.0).
+        - direction='flat' must have no triple (or a fully-zero placeholder),
+          since the central allocator weight is forced to 0 anyway.
+        - direction='long' requires the full triple (er, lk, ttd).
+        """
+        d = self.direction
+        if d == "long":
+            if self.expected_return_pct is None:
+                raise ValueError(
+                    "direction='long' requires expected_return_pct (signed % move)"
+                )
+            if float(self.expected_return_pct) < 0:
+                raise ValueError(
+                    f"direction='long' requires expected_return_pct >= 0, got "
+                    f"{self.expected_return_pct}. For bearish views, submit "
+                    f"direction='long' on the INVERSE symbol with positive er."
+                )
+            if self.likelihood is None:
+                raise ValueError(
+                    "direction='long' requires likelihood (your probability in [0,1])"
+                )
+            if self.time_to_target_days is None or self.time_to_target_days <= 0:
+                raise ValueError(
+                    "direction='long' requires time_to_target_days > 0"
+                )
+        elif d == "flat":
+            # 'flat' tolerates None or 0 in the triple — the central weight
+            # is forced to 0 regardless. But reject a non-zero er on a flat
+            # row since that's clearly a logic bug on the LLM's part.
+            er = self.expected_return_pct
+            if er is not None and abs(float(er)) > 1e-9:
+                raise ValueError(
+                    f"direction='flat' requires expected_return_pct == 0 (or null), "
+                    f"got {er}"
+                )
+        return self
 
 
 class ForecastRow(BaseModel):
@@ -120,8 +168,12 @@ class ReviewOutput(BaseModel):
         record_thesis / update_thesis_status
     All atomic at the row level — partial failures are logged and skipped, not
     cascaded.
+
+    Field-name note: `views` is the actionable-forecast array (each row is
+    sized by the allocator); `forecasts` is the broader proof-of-work array
+    (multi-horizon, allocator-inert).
     """
-    convictions: list[ConvictionView] = Field(default_factory=list)
+    views: list[ConvictionView] = Field(default_factory=list)
     forecasts: list[ForecastRow] = Field(default_factory=list)
     theses_to_record: list[ThesisRecord] = Field(default_factory=list)
     theses_to_grade: list[ThesisGrade] = Field(default_factory=list)

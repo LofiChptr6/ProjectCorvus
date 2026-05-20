@@ -1441,8 +1441,9 @@ async def get_agent_active_convictions(agent_name: str) -> list[dict]:
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             """SELECT id, symbol, direction, conviction, expected_return_pct,
-                      time_to_target_days, rationale, momentum_confirmed,
-                      stop_pct, submitted_at, expires_at, first_held_since
+                      likelihood, time_to_target_days, rationale,
+                      momentum_confirmed, stop_pct, submitted_at, expires_at,
+                      first_held_since
                FROM agent_conviction
                WHERE agent_name=$1 AND expires_at > NOW() AND conviction > 0
                ORDER BY conviction DESC""",

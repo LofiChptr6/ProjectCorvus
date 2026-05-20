@@ -35,7 +35,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         direction = "flat"
         e_return = 0.0
     horizon = 5
-    conviction = round(abs(e_return) / horizon, 4) if horizon else 0.0
+    likelihood = round(abs(e_return) / horizon, 4) if horizon else 0.0
 
     return {
         "signal": round(-z, 3),
@@ -49,7 +49,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
             f"{'fade-the-rally' if z > 2 else 'buy-the-dip' if z < -2 else 'no edge'}"
         ),
         "direction": direction,
-        "conviction": conviction,
+        "likelihood": likelihood,
         "expected_return_pct": round(e_return, 3),
         "time_to_target_days": horizon,
         "inputs": {"z": round(z, 3), "mean_20": round(mean, 2), "stdev_20": round(stdev, 3)},

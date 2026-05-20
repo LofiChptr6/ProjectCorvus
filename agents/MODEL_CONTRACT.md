@@ -51,7 +51,7 @@ Semantics:
 - **Per-symbol fetch failure → empty list.** The model is expected to check
   `len(context["extra_bars"].get(sym, [])) >= N` and return the no-signal shape
   if it can't compute. The runner does NOT short-circuit on extra-fetch
-  failure — one missing extra shouldn't kill the conviction for everything else.
+  failure — one missing extra shouldn't kill the prediction for everything else.
 - **Same frequency as main bars.** No per-extra `BAR_FREQUENCY` override.
 - **Validator behavior.** The startup registry build (`model_inputs_validator`)
   uses synthetic bars and re-uses them as synthetic stand-ins for every
@@ -72,23 +72,37 @@ pick its own definition of "RSI" / "curve slope" / "yield-change proxy".
 | `bars` | `list[dict]` | OHLCV bars, oldest first. Each bar `{o, h, l, c, v}` floats/ints. Length = `LOOKBACK_DAYS` worth at `BAR_FREQUENCY`. |
 | `context` | `dict` | Sector regime, macro flags, `as_of` timestamp, etc. Always optional — never `KeyError` on a missing key. |
 
-## `compute()` output
+## `compute()` output — the forecast triple
 
 A single dict. All numeric fields must come from a real computation on `bars` —
 never from `context` echoing, never hardcoded "plausible" defaults.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `signal` | `float \| None` | One-number summary of the setup (-1..+1 conventionally). **`None` means "model declines to publish"** — runner skips conviction write. |
+| `signal` | `float \| None` | One-number summary of the setup (-1..+1 conventionally). **`None` means "model declines to publish"** — runner skips the write. |
 | `direction` | `"long" \| "short" \| "flat" \| None` | Which way the model thinks. `"flat"` = explicit neutral; `None` = no decision. Both cause the runner to skip. |
-| `conviction` | `float ∈ [0, 1]` | Model's confidence. Drives Mike's allocation weight. Don't let `1.0` mean anything other than "I'd put the whole desk on this". |
 | `expected_return_pct` | `float` | Magnitude of the move expected between now and `time_to_target_days`. **Signed**, matches `direction`. |
+| `likelihood` | `float ∈ [0, 1]` | Model's calibrated probability that the forecast plays out. 0 → no edge; 1 → full-confidence call. **This is the only confidence number a model emits.** The desk computes its own internal allocator weight as `\|expected_return_pct\| × likelihood / time_to_target_days` — models do NOT author that weight. |
 | `time_to_target_days` | `int` | When this prediction should be evaluated. The resolver uses this. |
 | `stop_pct` | `float \| None` | Adverse move from entry that invalidates. Risk-derived (e.g. 1× ATR, recent swing low) — not a guess. |
 | `inputs` | `dict[str, float]` | Features the model actually used. The **replay payload** — must be recomputable from `bars` alone. Used by `model_inputs_validator` to detect fabrication. |
 | `rationale` | `str` (optional) | One-sentence human gloss. Fine to omit. |
 | `interpretation` | `str` (optional) | Short label ("strong breakout", "weak setup"). Fine to omit. |
-| `distributions` | `list[dict]` (optional) | Probabilistic per-horizon forecasts; see "Probabilistic distributions" below. When present, persisted to `agent_forecast` with a fresh `forecast_run_id` and the registered conviction functional collapses them into the scalar conviction (overrides `conviction` if set). |
+| `distributions` | `list[dict]` (optional) | Probabilistic per-horizon forecasts; see "Probabilistic distributions" below. When present, persisted to `agent_forecast` with a fresh `forecast_run_id` and the registered functional collapses them into a scalar `likelihood` (overrides any `likelihood` you set). |
+
+### Legacy `conviction` field (transitional shim)
+
+Older models emitted a field named `conviction ∈ [0, 1]` that served the same
+role this contract now assigns to `likelihood`. The runner accepts either name:
+if `likelihood` is missing it falls back to the value under `conviction`.
+**New models must use `likelihood`.** When migrating an existing model, rename
+the dict key — leave nothing else in the code under the old name.
+
+The runner does not persist the model's emitted `conviction`/`likelihood` value
+as the desk's allocator weight. That weight is recomputed centrally from
+the triple `(expected_return_pct, likelihood, time_to_target_days)`. There is
+no path through which the LLM agent or a quant model can pick the allocator
+weight directly.
 
 ## Probabilistic distributions
 
@@ -99,10 +113,11 @@ distributions:
 1. The runner validates each entry against `meta_agent/distribution_validator.py`.
 2. A fresh `forecast_run_id` (UUID) is allocated and stamped on every
    resulting row in `agent_forecast` plus the scalar in `agent_conviction`.
-3. The registered conviction functional
-   (`meta_agent/conviction_functionals/`) collapses the per-horizon
-   distributions into a single scalar conviction in `[0, 1]`, which
-   overrides the model's own `conviction` field (the model can omit it).
+3. The registered functional (`meta_agent/conviction_functionals/`) collapses
+   the per-horizon distributions into a single scalar `likelihood ∈ [0, 1]`,
+   which overrides the model's own `likelihood` field (the model can omit it).
+   The desk then computes the allocator weight from that scalar likelihood
+   plus the model's expected_return_pct and time_to_target_days as usual.
 
 Each distribution entry:
 
@@ -134,7 +149,7 @@ Validation rules (enforced at submit):
 
 A model emitting `distributions` should still populate `direction` and
 `expected_return_pct` (mirror E[r] across the longest horizon) for back-compat
-consumers, but `conviction` is recomputed from the distributions.
+consumers, but `likelihood` is recomputed from the distributions.
 
 ## The no-signal return
 
@@ -145,7 +160,7 @@ state), return this shape verbatim:
 return {
     "signal": None,
     "direction": None,
-    "conviction": 0.0,
+    "likelihood": 0.0,
     "expected_return_pct": 0.0,
     "time_to_target_days": 0,
     "inputs": {},
@@ -154,7 +169,7 @@ return {
 ```
 
 The runner uses `signal is None or direction in (None, "flat")` as the gate to
-skip writing.
+skip the write.
 
 ## Rules
 
@@ -172,7 +187,7 @@ skip writing.
    bumping `MODEL_VERSION` and updating callers will break the validator.
 6. **Sign discipline.** If `direction="short"`, `expected_return_pct` must be
    negative. If `"long"`, positive. The allocator trusts this.
-7. **`conviction = 0.0` for no signal.** Never emit `conviction > 0` alongside
+7. **`likelihood = 0.0` for no signal.** Never emit `likelihood > 0` alongside
    `direction=None` or `signal=None`.
 
 ## What goes in `inputs`?
@@ -182,7 +197,7 @@ computed RSI but didn't branch on it, RSI doesn't go in `inputs`. The point of
 the replay payload is "given these numbers, the model output is determined".
 
 The validator (`meta_agent/model_inputs_validator.py`) introspects every
-model's `inputs` keys at startup. Convictions that arrive with `model_inputs`
+model's `inputs` keys at startup. Submissions that arrive with `model_inputs`
 keys not in any of an agent's models' output will be rejected.
 
 ## Example: minimal compliant model
@@ -199,7 +214,7 @@ LOOKBACK_DAYS  = 210
 
 def compute(symbol, bars, context):
     if len(bars) < MIN_BARS:
-        return {"signal": None, "direction": None, "conviction": 0.0,
+        return {"signal": None, "direction": None, "likelihood": 0.0,
                 "expected_return_pct": 0.0, "time_to_target_days": 0,
                 "inputs": {}, "reason": f"need >={MIN_BARS} bars"}
 
@@ -213,19 +228,19 @@ def compute(symbol, bars, context):
         return {
             "signal": -z,
             "direction": "long",
-            "conviction": min((-z - 2.0) / 2.0, 1.0),
+            "likelihood": min((-z - 2.0) / 2.0, 1.0),
             "expected_return_pct": 2.5,
             "time_to_target_days": 5,
             "stop_pct": -3.0,
             "inputs": {"z5": round(z, 3), "above_sma200": 1.0},
             "interpretation": "oversold above trend",
         }
-    return {"signal": None, "direction": None, "conviction": 0.0,
+    return {"signal": None, "direction": None, "likelihood": 0.0,
             "expected_return_pct": 0.0, "time_to_target_days": 0,
             "inputs": {}, "reason": "no setup"}
 ```
 
-## How models become convictions
+## How models become rows in `agent_conviction`
 
 `submit_conviction_from_model(agent_name, model_name, symbol, rationale)`
 (server-side) is the **only** path that writes to `agent_conviction`:
@@ -235,33 +250,41 @@ def compute(symbol, bars, context):
 3. Builds `context` from the desk state at run time.
 4. Calls `compute(symbol, bars, context)`.
 5. If `signal is None` or `direction in (None, "flat")`: returns `{skipped: true, reason: ...}`.
-6. Otherwise inserts the conviction with numbers taken directly from the
-   model output. The agent supplies only the human-readable `rationale`
-   string; everything else (`conviction`, `expected_return_pct`,
-   `time_to_target_days`, `stop_pct`, `model_inputs`) comes from `compute()`.
+6. Otherwise inserts the row. `expected_return_pct`, `likelihood`,
+   `time_to_target_days`, `stop_pct`, `model_inputs` are taken directly from
+   the model output. The desk-internal allocator weight is recomputed
+   centrally via `meta_agent.allocator.compute_conviction` — neither the
+   model nor the agent picks it. The agent supplies only the human-readable
+   `rationale` string.
 
 The legacy `submit_conviction_view` tool (where the agent supplies the
-numbers) is being retired. During the migration it accepts only convictions
-whose `model_inputs` keys match the registry — see
-`meta_agent/model_inputs_validator.py`.
+numbers) accepts only the forecast triple `(expected_return_pct, likelihood,
+time_to_target_days)`. It still rejects submissions whose `model_inputs`
+keys don't match the registry — see `meta_agent/model_inputs_validator.py`.
 
 ## When a model needs to evolve
 
 - Behavior change → bump `MODEL_VERSION`.
 - New feature in `inputs` → add it, then run the validator's registry rebuild.
+- Renaming legacy `conviction` → `likelihood` → minor MODEL_VERSION bump;
+  the runner accepts both during the migration window but emit a clean
+  `likelihood` going forward.
 - Retired model → move to `agents/<name>/models/scrapped/`; do not delete.
-  The forecast/conviction history references the file path indirectly via
-  `method` and `model_inputs`, so the audit trail breaks if files vanish.
+  The forecast history references the file path indirectly via `method`
+  and `model_inputs`, so the audit trail breaks if files vanish.
 
 ## Why this contract exists
 
 Before this contract was enforced, LLM agents fabricated thesis price anchors
 (rex stamped `AAPL=198.45` across 14 hourly theses with real last 298),
 indicator readings (RSI/BBAND keys for agents whose real models emit
-`z`/`above_sma200`), and conviction numbers that bore no relation to the
-agent's own models. The price-anchored resolver was about to grade fake
+`z`/`above_sma200`), and self-tuned conviction numbers that bore no relation
+to the agent's own models. The price-anchored resolver was about to grade fake
 anchors against real closes — a tautology.
 
 This contract makes hallucination impossible at the field level: prediction
 numbers come from Python; the LLM owns model selection, model authorship, and
-the rationale prose.
+the rationale prose. The desk's internal allocator weight is computed once,
+centrally, from the same `(expected_return_pct, likelihood, time_to_target_days)`
+triple that the resolver later grades — closing the loop between forecast
+authorship, sizing, and accountability.

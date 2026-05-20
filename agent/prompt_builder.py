@@ -197,7 +197,7 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
     lines = [
         f"=== {routine_name.upper()} | Agent: {agent_name} | {now} ===",
         "",
-        f"Desk NAV: ${nav:,.0f}  ({'allocator — sizes whole desk' if direct_trade else 'conviction-only — does not trade directly'})",
+        f"Desk NAV: ${nav:,.0f}  ({'allocator — sizes whole desk' if direct_trade else 'forecast-only — does not trade directly'})",
         f"Trading mode: {summary.get('mode', 'unknown')}",
         "",
         "--- ACCOUNT SUMMARY ---",
@@ -318,7 +318,7 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
             lines.append("")
 
     # ── POSITION AGING (commitment vs. reality) ─────────────────────────────
-    # For sector agents: show each currently-active conviction with how long
+    # For sector agents: show each currently-active forecast with how long
     # they've held it, target horizon remaining, and any open theses that
     # reference the symbol. Gates premature flat-out behavior — if you have
     # an open thesis with verify_by in the future, drifting to flat now
@@ -330,11 +330,20 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
             log.warning("position aging fetch failed for %s: %s", agent_name, exc)
             aging = []
         if aging:
+            # Look up recent user-approved inverse-ETF entries so we can hint
+            # the agent to set momentum_confirmed=True on continuation (else
+            # mike re-prompts every hour for an already-blessed position —
+            # the SOXS-from-fab loop reported 2026-05-20).
+            try:
+                from approval import proposals as _approval_proposals
+            except Exception:
+                _approval_proposals = None
             lines.append("--- POSITION AGING (your active commitments) ---")
             for a in aging:
                 sym = a["symbol"]
                 direction = a["direction"]
-                conv = float(a["conviction"] or 0)
+                lk = a.get("likelihood")
+                lk_str = f"lk={float(lk):.2f}" if lk is not None else "lk=?"
                 erp = a.get("expected_return_pct")
                 ttd = a.get("time_to_target_days")
                 days_held = a.get("days_held")
@@ -355,9 +364,32 @@ async def build_context_message(agent_cfg: dict, routine_name: str) -> str:
                         rem_str = f"  ⚠ {remaining:.0f}d to target — invalidate or roll"
                     else:
                         rem_str = f"  ({remaining:.0f}d remaining)"
+                # User-blessed inverse-ETF entry hint. The allocator silences
+                # repeat approval prompts inside a 6h window (mcp_server
+                # rebalance_desk), but here we give the agent a 24h hint so
+                # it ALSO stops requesting re-approval — emit
+                # momentum_confirmed=True on continuation.
+                approval_hint = ""
+                if _approval_proposals is not None and direction == "long":
+                    try:
+                        prior = _approval_proposals.find_recent_approval(
+                            vehicle=sym, contrib_agents={agent_name},
+                            window_seconds=24 * 3600,
+                        )
+                        if prior:
+                            import time as _t
+                            age_h = (_t.time() - (prior.get("resolved_at") or 0)) / 3600.0
+                            approval_hint = (
+                                f"  ✅ user approved entry {age_h:.1f}h ago "
+                                f"(proposal {prior['id'][:8]}); set "
+                                f"momentum_confirmed=True on continuation"
+                            )
+                    except Exception as exc:
+                        log.debug("recent-approval check failed for %s/%s: %s",
+                                  agent_name, sym, exc)
                 lines.append(
-                    f"  {sym:<6} {direction:<5} conv={conv:.2f}  held {days_held_str}  "
-                    f"{target_str}{rem_str}"
+                    f"  {sym:<6} {direction:<5} {lk_str}  held {days_held_str}  "
+                    f"{target_str}{rem_str}{approval_hint}"
                 )
                 # Linked open theses (substring word-match on symbol)
                 theses = a.get("linked_theses") or []
@@ -518,7 +550,7 @@ WORKFLOW EVERY REVIEW (hourly + evening):
      a `watchlist` list (SQL rows) and a `notes` list (markdown files).
 
   2. To add a name to your watchlist (because you want to track it but
-     it's not yet conviction-grade), call
+     it's not yet actionable as a forecast), call
      `add_to_watchlist(agent_name="<you>", symbol="XYZ", reason="...")`.
      This inserts a row in `agent_watchlist` (or reactivates a soft-deleted
      one).
@@ -561,14 +593,14 @@ Each hourly review must:
      inflection". Don't repeat yesterday's thesis if it hasn't changed —
      skip the record. Quality > quantity.
 
-  2. In every conviction's rationale, cite the thesis it acts on by ID
+  2. In every forecast's rationale, cite the thesis it acts on by ID
      (the integer returned by `record_thesis`). No FK constraint — this
      is convention, not enforcement. Example rationale:
-     "Long FCX 0.45 conv (+5.5% / 7d) — acts on thesis #117 (oversold
+     "Long FCX (+5.5% / 7d, lk=0.65) — acts on thesis #117 (oversold
      integrated copper-gold leverage; OPEC+ hold + DXY softening)."
 
-  3. Reason BACKWARDS from your thesis to your buy/sell action. If you
-     can't trace the conviction to a recorded thesis, you don't have a
+  3. Reason BACKWARDS from your thesis to your forecast triple. If you
+     can't trace the forecast to a recorded thesis, you don't have a
      thesis — you have a feeling. Either record the thesis first, or
      publish direction='flat' for the name.
 
@@ -581,14 +613,15 @@ are your prose summary.
 
 [DESK POLICY: ≥20 FORECASTS PER HOUR — MULTI-HORIZON PROOF OF WORK]
 
-Convictions are the names you want Mike's allocator to ACT ON. Forecasts are
-everything else. Every hour, you must publish a forecast on at least 20
-tickers from your sector universe via submit_forecast_batch — regardless of
-whether any of them turn into convictions.
+Every hour, you must publish a forecast on at least 20 tickers from your
+sector universe — flats included. A forecast is the unit; whether the
+allocator acts on it is a downstream consequence of your (expected_return_pct,
+likelihood, time_to_target_days) inputs, not a separate "I want to trade
+this" knob.
 
 MULTI-HORIZON FORECASTING — each symbol should have up to 4 forecast rows,
-one per time horizon. This is not optional for high-conviction names; for
-lower-priority names, at minimum the intraday row is required.
+one per time horizon. This is not optional for names you have a strong view
+on; for lower-priority names, at minimum the intraday row is required.
 
 The four horizon buckets are:
   intraday — time_to_target_days = 1      "Where does this name close today?"
@@ -605,18 +638,20 @@ DOES NOT overwrite the others.
 WHY THIS MATTERS: Horizon-disaggregated forecasting forces you to think about
 whether a name is right for today vs. for the next earnings cycle. If your
 intraday view is +0.5% but your near-term view is −6% (because earnings are
-in 4 days and consensus is too optimistic), that tension should drive a smaller
-conviction — or no conviction until after earnings. The user reviews all four
-forecast rows each evening; inconsistent multi-horizon signals will be visible.
+in 4 days and consensus is too optimistic), that tension should drive a
+lower likelihood on the longer horizons — or you publish flat on the longer
+horizons and only carry the intraday. The user reviews all four forecast
+rows each evening; inconsistent multi-horizon signals will be visible.
 
 A forecast row is (expected_return_pct, likelihood, time_to_target_days,
-method). The score expected_return_pct × likelihood / time_to_target_days
-is computed server-side. You can derive the inputs however you like: your
-custom model, technicals, news, sell-side consensus, gut feel, or even a
-number you saw on Bloomberg. The methodology field (method) records HOW you
-got there — it can be different per ticker and per horizon. The point is to
-show the user your thinking across the full sector AND across timeframes, not
-just the names you're putting money on.
+method). The desk's internal allocator weight is
+`|expected_return_pct| × likelihood / time_to_target_days`, computed
+server-side — you do NOT author it. You can derive the triple however you
+like: your custom model, technicals, news, sell-side consensus, gut feel,
+or even a number you saw on Bloomberg. The methodology field (method)
+records HOW you got there — it can be different per ticker and per horizon.
+The point is to show the user your thinking across the full sector AND across
+timeframes, not just the names you're putting money on.
 
 Workflow each hour:
   # Option A — full refresh (clears all horizons, re-submit everything):
@@ -643,59 +678,56 @@ Workflow each hour:
       ],
   )
 
-Conviction sizing from multi-horizon signals — use this heuristic:
-  ALL 4 horizons bullish (+ aligned with sector cohort higher highs ≥3 sessions)
-    → upper-quartile sizing, conviction 0.7–1.0
-  3 of 4 horizons bullish, cycle neutral
-    → normal sizing, conviction 0.4–0.7
-  Mixed (intraday bullish, far/cycle bearish, e.g. pre-earnings fade)
-    → no conviction or small intraday-only with tight exit
-  Intraday bullish but near/far bearish (approaching resistance or catalyst risk)
-    → no conviction; wait for resolution
+Likelihood calibration from multi-horizon signals — use this heuristic:
+  ALL 4 horizons aligned + sector cohort confirming for ≥3 sessions
+    → likelihood 0.7–0.9 (high-confidence call, large desk exposure)
+  3 of 4 horizons aligned, cycle neutral
+    → likelihood 0.5–0.7 (normal-confidence call)
+  Mixed (intraday vs far/cycle disagree, e.g. pre-earnings fade)
+    → likelihood ≤ 0.4 OR publish flat on the conflicted horizons
+  Intraday signal but no thesis, OR setup that pre-dates a known catalyst
+    → publish flat; wait for resolution
 
-Convictions and forecasts are independent:
-  - A name with a forecast but no conviction = "I have a view but won't act."
-  - A name with a conviction also has a forecast (the conviction is the
-    "act" half of the same view; submit both).
+How to estimate likelihood without a model — three paths, pick whichever
+fits the name:
+  (a) **News-cited base rate** — "guidance raise + 8 of last 10 cohort
+      members rallied 3-5d post-raise" → ~0.65. Cite the cohort.
+  (b) **Technical confluence** — confluence of RSI / SMA / volume + sector
+      cohort behavior. Single-indicator setups are weak (≤0.5); 3+ aligned
+      indicators + cohort confirm is ~0.65-0.75.
+  (c) **Defer to a quant model** — set `from_model="<name>"` on the row
+      and the runner fetches the model's full triple. Use whenever the
+      model genuinely covers the name.
 
-Submission rules: likelihood ∈ [0,1]; time_to_target_days > 0; method
-non-empty; symbol must be in your sector universe (or a verified inverse
-ETF). Forecasts auto-expire after 2 hours by default — re-submit each cycle.
-
-
-[DESK POLICY: EVERY NON-FLAT CONVICTION MUST CARRY A FORECAST]
-
-When you call submit_conviction_view with direction='long' or 'short', you MUST
-pass BOTH:
-  - expected_return_pct  — signed % move you forecast on this name
-                            (e.g. +8.5 means "I expect this to rise 8.5%";
-                            -6.0 means "I expect this to drop 6%").
-  - time_to_target_days  — your horizon in trading days (must be > 0).
-
-These are not optional. They drive (a) the evening forecast panel that the
-user reviews each night, and (b) the calibration tracker that grades how
-well-sized your convictions are. The MCP tool will reject submissions that
-omit either field on a non-flat view.
-
-Your quant models already compute both. Pass them through directly:
-  result = compute_custom_indicator(agent_name=..., model_name=..., symbol=...)
-  submit_conviction_view(
-      ...,
-      expected_return_pct = result["expected_return_pct"],
-      time_to_target_days = result["time_to_target_days"],
-      ...
-  )
-
-direction='flat' with conviction=0 is the only path that may omit them — it's
-the canonical "I have no view on this name today" submission.
+Submission rules: likelihood ∈ [0,1]; expected_return_pct sign matches
+direction; time_to_target_days > 0; method non-empty; symbol must be in
+your sector universe (or a verified inverse ETF). Forecasts auto-expire
+after 2 hours by default — re-submit each cycle.
 
 
-[DESK POLICY: EVERY CONVICTION MUST CARRY A CUSTOM expires_in_hours]
+[DESK POLICY: NON-FLAT FORECASTS REQUIRE THE FULL TRIPLE]
 
-submit_conviction_view and submit_conviction_from_model both REQUIRE
-`expires_in_hours` per call — there is no default. The value must match
-the thesis horizon: a scalp and a multi-day swing should NOT get the same
-expiry. The MCP tool rejects values outside [0.0833, 720] (5 min to 30 days).
+When you publish direction='long', the row MUST carry:
+  - expected_return_pct  — signed % move (positive for long; negative is
+                            rejected; bearish views go via inverse-ETF long).
+  - likelihood           — your probability in [0,1] that the forecast plays out.
+  - time_to_target_days  — your horizon in trading days (> 0).
+
+The MCP tool will reject submissions that omit any of the three on a
+non-flat row. The desk's internal allocator weight is recomputed from these
+three inputs — you cannot author it directly.
+
+direction='flat' is the canonical "no view on this name this horizon"
+submission and may omit the triple.
+
+
+[DESK POLICY: EVERY FORECAST CARRIES A CUSTOM expires_in_hours]
+
+Every actionable-forecast row (the `views` array in your review JSON — the
+agent_conviction table is what the allocator reads) and every proof-of-work
+forecast row REQUIRES `expires_in_hours` per row — there is no default. The
+value must match the thesis horizon: a scalp and a multi-day swing should
+NOT get the same expiry. Range: [0.0833, 720] (5 min to 30 days).
 
 Pick by catalyst type:
   - intraday momentum / scalp / pre-earnings drift  → 0.25 – 4 hours
@@ -703,7 +735,7 @@ Pick by catalyst type:
   - 1-day to 1-week swing                           → 24 – 168 hours
   - multi-week macro / regime call (rare)           → 168 – 720 hours
 
-The allocator drops convictions once they expire; you must re-publish
+The allocator drops forecasts once they expire; you must re-publish
 before then to stay in the stack. Short expiries mean tighter
 re-publication discipline; long expiries mean you're committing to a
 view for that long.
@@ -715,15 +747,15 @@ allocator uses the expiry to know when to revisit.
 
 [DESK POLICY: COMMITMENT VS DRIFT — DON'T FLAT JUST BECAUSE PRICE WENT AGAINST YOU]
 
-When you submitted a long/short conviction with time_to_target_days=N, you
-made a commitment to be patient for ~N days. Within-horizon drawdown is
-the price of being early, NOT thesis invalidation. The desk's most common
-loss pattern is dropping a name 3-5 days into a 30-day thesis because the
-tape is uncomfortable — and then watching the catalyst fire 2 weeks later
+When you published a long forecast with time_to_target_days=N, you made a
+commitment to be patient for ~N days. Within-horizon drawdown is the price
+of being early, NOT thesis invalidation. The desk's most common loss
+pattern is dropping a name 3-5 days into a 30-day thesis because the tape
+is uncomfortable — and then watching the catalyst fire 2 weeks later
 without you.
 
 Read the POSITION AGING section in your context. For each name you currently
-hold (non-flat conviction), it shows:
+hold (non-flat forecast), it shows:
   - days held / target horizon (how patient have you committed to being?)
   - linked open theses (with verify_by dates)
   - whether the verify_by has passed
@@ -749,7 +781,7 @@ Before publishing direction='flat' on any name in your active POSITION AGING:
 
   3. No linked thesis at all?
      YES → flat is acceptable, but you should ALSO ask: why was I
-           publishing a non-flat conviction without an underlying recorded
+           publishing a non-flat forecast without an underlying recorded
            thesis? That's a desk-policy gap; record_thesis going forward.
 
 The clear answer "stay patient when within horizon, invalidate only when
@@ -772,21 +804,25 @@ VERIFIED INVERSE-ETF CATALOG (single source: agents/inverse_etf_map.yaml):
 Workflow for any bearish thesis:
 
 1. Pick an inverse vehicle from the verified catalog above. If your underlying
-   appears in the 'NO VERIFIED INVERSE' list, publish direction='flat' with
-   conviction=0 instead of inventing a vehicle.
+   appears in the 'NO VERIFIED INVERSE' list, publish direction='flat' on the
+   underlying instead of inventing a vehicle.
 
-2. Size for the inverse's leverage. The conviction you submit is the position
-   you want IN THE INVERSE — divide your underlying-view conviction by the
-   leverage factor:
-   - 1x inverse: conviction passes through (1.0 long ≈ 1.0 short on underlying)
-   - 2x inverse: conviction halves (a 1.5 underlying-short → 0.75 long on inverse)
-   - 3x inverse: conviction divides by 3 (a 1.5 underlying-short → 0.5 long)
-   `expected_return_pct` on the INVERSE is signed positive (you expect the bear
-   ETF to rise) and ≈ leverage × |underlying expected drop|.
+2. Size your `expected_return_pct` for the inverse's leverage. The forecast
+   row is on the INVERSE; signed positive (the bear ETF rises ≈ leverage ×
+   |underlying expected drop|). Likelihood transfers — your confidence in the
+   underlying call IS your confidence in the inverse-ETF call (modulo the
+   decay risk in step 3). Examples:
+   - 1x inverse: expected_return_pct ≈ |underlying drop|
+   - 2x inverse: expected_return_pct ≈ 2 × |underlying drop|
+   - 3x inverse: expected_return_pct ≈ 3 × |underlying drop|
+   The desk's internal allocator weight is recomputed from your triple — you
+   do NOT divide the triple by leverage to control desk exposure; you pick a
+   shorter time_to_target_days to reflect the decay urgency (see MOMENTUM
+   REASONING below).
 
 3. Submit via submit_conviction_view with direction='long' on the INVERSE
    symbol. Rationale MUST cite: (a) underlying name covered, (b) chosen vehicle
-   and why, (c) leverage adjustment used.
+   and why, (c) leverage of the inverse used.
 
 [FUNDAMENTAL THESIS REQUIRED — TECHNICALS ALONE ARE NOT A REASON]
 
@@ -796,7 +832,7 @@ technicals alone is the desk's #1 documented loss vector: it produced ~$490 of
 unrealized inverse-ETF bleed in late April / early May 2026 when agents shorted
 trending semis on RSI signals while business momentum continued.
 
-Every inverse-ETF conviction rationale MUST contain three elements, in order:
+Every inverse-ETF forecast rationale MUST contain three elements, in order:
 
   (a) BUSINESS MECHANIC. What's actually happening at the company / sector
       level that supports a bearish view? Revenue trajectory, margin pressure,
@@ -817,7 +853,7 @@ Every inverse-ETF conviction rationale MUST contain three elements, in order:
       (b) have been stated.
 
 If you cannot write (a) and (b), you do not have a thesis. Publish direction='flat'
-on the underlying and move on — paper-trail only. Inverse-ETF convictions
+on the underlying and move on — paper-trail only. Inverse-ETF forecasts
 submitted without a NAMED business mechanic AND a NAMED dated catalyst will be
 flagged in cassidy-evening audits and contribute to allocation_pct downgrades.
 
@@ -827,27 +863,32 @@ Two examples, contrasting:
     "SMH RSI_14=72, price 1.4% above upper BBAND. Sector overbought after
      8-day rip. Going long SOXS for mean-reversion."
     Why: no business mechanic, no catalyst, no date. This is a chart pattern
-    and a wish.
+    and a wish — your likelihood number on this row would be guessing.
 
   ACCEPTED (fundamental-first):
     "AVGO May-21 print is the catalyst (8 trading days out). Hyperscaler capex
      guidance has decelerated for 2 consecutive quarters and recent supply-
      chain checks show TSMC CoWoS allocation rolling off Broadcom in Q3. SOXS
      entry: SMH RSI_14=72 + price 1.4% above upper BBAND CONFIRMS the setup
-     is stretched into a credible negative catalyst, not against the trend."
+     is stretched into a credible negative catalyst, not against the trend.
+     Likelihood 0.65 — 4 of last 5 hyperscaler-capex-decel earnings printed
+     in line with the mechanic; expected_return_pct +9% on SOXS over 6 days."
     Why: business mechanic (capex deceleration + CoWoS rolloff), named
-    catalyst with date (AVGO May-21), technicals as confirmation not driver.
+    catalyst with date (AVGO May-21), technicals as confirmation not driver,
+    likelihood backed by a named historical base rate.
 
-[MOMENTUM REASONING REQUIRED FOR INVERSE-ETF CONVICTIONS]
+[MOMENTUM REASONING REQUIRED FOR INVERSE-ETF FORECASTS]
 
 Inverse ETFs decay continuously, especially leveraged ones. WORKED EXAMPLE of
 the cost of being early: a 3x inverse held flat in a market that grinds up
 ~+1%/day loses ~3%/day from beta + decay friction. 5 trading days = ~-15%
 of position value before any underlying mean-reversion. Your fundamental
-thesis must be confident enough in TIMING to absorb that drag.
+thesis must be confident enough in TIMING to absorb that drag — that
+confidence shows up as a higher `likelihood` on the row AND a shorter
+`time_to_target_days` to reflect the urgency.
 
 To put the user in the loop only on early entries, every direction='long'
-conviction on an inverse-ETF symbol MUST also pass `momentum_confirmed: bool`:
+forecast on an inverse-ETF symbol MUST also pass `momentum_confirmed: bool`:
 
 - momentum_confirmed=True — the underlying is ALREADY showing the bearish
   move (RSI cracked from peak, price below recent SMA, lower-high formed,
@@ -874,14 +915,14 @@ is delayed past your decay tolerance, or the trend is more durable than the
 fundamentals justify. In any of those cases, exit, paper-trail the lesson in
 record_thesis, and re-evaluate from a fresh read next session.
 
-Defensive automation: you may set `stop_pct` on any conviction (recommended
+Defensive automation: you may set `stop_pct` on any forecast (recommended
 for inverse longs: 8 on 1× inverses, 4 on ≥2× inverses). The allocator will
 auto-flat the position if its unrealized return falls below -stop_pct, even
-if you keep re-publishing the conviction. Treat this as a circuit-breaker,
+if you keep re-publishing the forecast. Treat this as a circuit-breaker,
 not a substitute for the exit rule above.
 
 NETTING: Mike's allocator runs net_inverse_pairs after collecting all desk
-convictions. If a long-underlying position from one agent and a long-on-its-
+forecasts. If a long-underlying position from one agent and a long-on-its-
 inverse from another agent cancel out, the allocator collapses them into a
 single net position — you don't need to coordinate with peers. Publish your
 view honestly and let the netting layer handle desk-level offsets.
@@ -894,7 +935,7 @@ SKIPPED by the allocator — they record paper-trail but generate no orders.
 
 You OWN your model directory at agents/<you>/models/. Reading
 compute_all_models output without questioning it is a failure mode the desk
-grades against you. Every conviction you publish carries an implicit claim
+grades against you. Every forecast you publish carries an implicit claim
 that your quants were consulted critically — not skimmed.
 
 After every compute_all_models call (per symbol), run this 5-point sanity
@@ -919,11 +960,11 @@ check before STEP 3:
   4. MAGNITUDE SANITY — each model's |expected_return_pct| should be
      within ~3× ATR for the horizon. Outliers are suspect: a +30% / 5d call
      on a low-vol mega-cap is a model bug or a misinterpreted input. Verify
-     before quoting in any conviction rationale.
+     before quoting in any forecast rationale.
 
   5. CROSS-MODEL DISPERSION — if all your models agree on every name across
      the sweep, one is reading another (collinearity). If they disagree,
-     your conviction rationale must say which model you weight this hour
+     your forecast rationale must say which model you weight this hour
      and why.
 
 Skipping the sanity check = silent acceptance = audit failure. Cassidy
@@ -969,12 +1010,12 @@ Mandatory escalation if a model is broken AND not fixed this run:
      description=..., use_case=..., priority='high')` — REQUIRED if the
      fix needs new tooling or external data the desk doesn't have.
 
-  c. In your STEP 4 conviction submissions, the rationale of any name
+  c. In your STEP 4 forecast submissions, the rationale of any name
      where the broken model would have spoken MUST explicitly say
      "<model> disabled this run; reasoning from technicals + fundamentals
      only." No hand-waving. No silent omission.
 
-Forbidden: publishing convictions while a model is broken without naming it.
+Forbidden: publishing forecasts while a model is broken without naming it.
 Forbidden: "model returned flat across the universe" treated as a normal
   state. That is a broken or stale model 9 times out of 10.
 Forbidden: deferring a 5-line TypeError fix to /model-tune. The 30-line gate

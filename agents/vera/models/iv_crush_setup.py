@@ -36,7 +36,7 @@ def _avg_range(bars: list[dict]) -> float:
 def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(bars) < MIN_BARS:
         return {
-            'signal': None, 'direction': None, 'conviction': 0.0,
+            'signal': None, 'direction': None, 'likelihood': 0.0,
             'expected_return_pct': 0.0, 'time_to_target_days': 0,
             'inputs': {},
             'reason': f'need >={MIN_BARS} bars, got {len(bars)}',
@@ -47,7 +47,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     xlv_bars = extras.get('XLV') or []
     if len(vix_bars) < 30 or len(xlv_bars) < 15:
         return {
-            'signal': None, 'direction': None, 'conviction': 0.0,
+            'signal': None, 'direction': None, 'likelihood': 0.0,
             'expected_return_pct': 0.0, 'time_to_target_days': 0,
             'inputs': {},
             'reason': f'extras incomplete (VIXY={len(vix_bars)}, XLV={len(xlv_bars)}; need VIXY>=30 and XLV>=15)',
@@ -66,7 +66,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     xlv_rsi = _rsi(xlv_closes)
     if xlv_rsi is None:
         return {
-            'signal': None, 'direction': None, 'conviction': 0.0,
+            'signal': None, 'direction': None, 'likelihood': 0.0,
             'expected_return_pct': 0.0, 'time_to_target_days': 0,
             'inputs': {},
             'reason': 'xlv_rsi computation failed',
@@ -82,7 +82,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         return {
             'signal': round(expansion, 3),
             'direction': 'flat',
-            'conviction': 0.0,
+            'likelihood': 0.0,
             'expected_return_pct': 0.0,
             'time_to_target_days': 3,
             'inputs': inputs,
@@ -92,7 +92,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         return {
             'signal': round(-expansion, 3),
             'direction': 'long',
-            'conviction': round(min(0.4 + (40 - xlv_rsi) / 100, 0.9), 3),
+            'likelihood': round(min(0.4 + (40 - xlv_rsi) / 100, 0.9), 3),
             'expected_return_pct': 4.0,
             'time_to_target_days': 5,
             'inputs': inputs,
@@ -103,7 +103,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
         return {
             'signal': round(expansion, 3),
             'direction': 'flat',
-            'conviction': 0.0,
+            'likelihood': 0.0,
             'expected_return_pct': 0.0,
             'time_to_target_days': 2,
             'inputs': inputs,
@@ -112,7 +112,7 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     return {
         'signal': round(expansion, 3),
         'direction': 'flat',
-        'conviction': 0.0,
+        'likelihood': 0.0,
         'expected_return_pct': 0.0,
         'time_to_target_days': 0,
         'inputs': inputs,
