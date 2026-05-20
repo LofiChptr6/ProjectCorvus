@@ -92,7 +92,7 @@ For EACH symbol in your universe, **think in all three frameworks before decidin
 Then for EACH symbol, decide:
 
 a) **Direction**: `long` | `short` | `flat`. Same agent owns both sides. **DESK POLICY: bearish theses are expressed as `direction="long"` on an inverse ETF that you choose** — see Bearish handling below. `direction="short"` submissions on individual stocks are SKIPPED by the allocator (no order generated); they are only useful as paper-trail for a thesis you couldn't express via inverse.
-b) **Conviction** (positive float): your forecast formula, but the spirit is `E[return_pct] / time_to_target_days`. A +5% move expected in 5 days ≈ conviction 1.0. A +10% move in 30 days ≈ conviction 0.33. Cassidy reviews calibration in evening — be honest.
+b) **Likelihood** (float in [0, 1]): probability the forecast plays out. 0.5 = coin-flip, 0.7 = lean, 0.85 = strong confidence, 0.95 = near-certain. The server computes conviction CENTRALLY as `abs(expected_return_pct) × likelihood / time_to_target_days` via `meta_agent.allocator.compute_conviction` — you no longer pick the conviction value. Cassidy reviews calibration in evening — be honest.
 c) **Expected return %** (signed): your point forecast.
 d) **Time to target (days)**: when you expect the move to play out.
 e) **Rationale** (1–2 sentences): cite which frameworks agree (e.g., "fundamental: hyperscaler capex raise; technical: RSI 28 + bounce off lower BBAND; quant: 2-sigma below sector momentum spread").
@@ -103,11 +103,11 @@ e) **Rationale** (1–2 sentences): cite which frameworks agree (e.g., "fundamen
 
 1. **Pick the inverse vehicle from the audited catalog** — full list with leverage, vendor, and verification status is injected into your system prompt under `[DESK POLICY: NO DIRECT SHORTS]`, sourced from `agents/inverse_etf_map.yaml`. If your underlying is on the "NO VERIFIED INVERSE" line, publish `direction="flat"` instead of inventing a ticker.
 
-2. **Size for the inverse's leverage.** The conviction you submit is the position you want IN THE INVERSE — divide by the leverage factor:
-   - 1x inverse: conviction passes through (1.0 long ≈ 1.0 short on underlying)
-   - 2x inverse: conviction halves (1.5 underlying-short → 0.75 long on inverse)
-   - 3x inverse: conviction divides by 3 (1.5 underlying-short → 0.5 long on inverse)
-   `expected_return_pct` on the INVERSE is signed positive and ≈ `leverage × |underlying expected drop|`.
+2. **Size for the inverse's leverage.** Your `expected_return_pct` should be the INVERSE's expected move — multiply the underlying's expected drop by the leverage factor:
+   - 1x inverse: `expected_return_pct` passes through (-1% underlying ≈ +1% on inverse)
+   - 2x inverse: `expected_return_pct` doubles (-1.5% underlying → +3% on inverse)
+   - 3x inverse: `expected_return_pct` triples (-1.5% underlying → +4.5% on inverse)
+   `likelihood` reflects your probability the underlying move plays out — not affected by leverage.
 
 3. **Submit as `direction="long"` on the inverse symbol.** Rationale MUST cite: (a) underlying name covered, (b) chosen vehicle and why, (c) leverage adjustment used.
 
@@ -120,8 +120,9 @@ Direct-short submissions (`direction="short"`) are SKIPPED — paper trail only.
 ```
 submit_conviction_view(
   agent_name='energy',
-  symbol='CASH', direction='long', conviction=X,
+  symbol='CASH', direction='long',
   rationale='one clause: why cash beats your best long today',
+  expires_in_hours=4,
 )
 ```
 
@@ -134,7 +135,7 @@ Sizing: only positive (`direction='long'`) cash convictions are accepted — no 
 
 **Cross-desk awareness.** Glancing at other agents' active views via `get_consolidated_view` is **mike-only** — you can't peek. That's by design: think independently, then let Mike aggregate.
 
-**Standing flat is valid.** If a name has no edge today, either submit `direction="flat", conviction=0` (explicitly says "no view") or simply omit it. Mike treats both the same way. But "I didn't look hard" is NOT a valid reason to be flat — sweep all three frameworks first.
+**Standing flat is valid.** If a name has no edge today, either submit `direction="flat"` (explicitly says "no view") or simply omit it. Mike treats both the same way. But "I didn't look hard" is NOT a valid reason to be flat — sweep all three frameworks first.
 
 ## STEP 3.5 — Publish forecasts (≥20 names, multi-horizon) — proof-of-work
 
@@ -180,7 +181,7 @@ Convictions in STEP 4 are independent — submit only the names you'd put money 
 ## STEP 4 — Publish
 
 1. `clear_my_views(agent_name="energy")` — wipe last hour's slate so the new submission fully replaces it.
-2. For each non-flat call: `submit_conviction_view(agent_name="energy", symbol, direction, conviction, expected_return_pct, time_to_target_days, rationale, expires_in_hours, model_inputs?)`.
+2. For each non-flat call: `submit_conviction_view(agent_name="energy", symbol, direction, expected_return_pct, likelihood, time_to_target_days, rationale, expires_in_hours, model_inputs?)`. **Server computes conviction** from (expected_return_pct, likelihood, time_to_target_days) — see `meta_agent.allocator.compute_conviction`. The response JSON echoes the computed conviction back.
    - **`expires_in_hours` is REQUIRED per conviction — there is no default.** Pick a value (0.0833 to 720; i.e. 5 min to 30 days) that matches the *thesis horizon*: a scalp and a swing must NOT get the same expiry. Suggested mapping:
      - intraday momentum / scalp / pre-earnings drift → `0.25–4`
      - overnight position / next-session trade        → `4–24`
@@ -211,20 +212,6 @@ P&L slice: <attributed_pnl_today / week>
 
 ## STEP 7 — Telegram analysis ping (always)
 
-Send ONE concise analysis Telegram via `send_telegram_update`. The user wants to *see* sector thinking, not just NAV from Mike. Stay tight (≤350 chars), Markdown-safe (no stray backticks; if your rationale has them, drop them rather than escape them — the server already auto-falls-back to plain text on parse error, but cleaner to avoid the round-trip).
-
-Format:
-
-```
-🛰 *<AGENT>* @ <HH:MM ET>  <regime emoji 🟢/🟡/🔴>
-Top: <SYM> +<conv> <one-clause why> | <SYM2> +<conv> <one-clause why>
-Stance: <one sentence — agree/disagree with Mike, what's the dominant theme>
-```
-
-Examples:
-- `🛰 *atlas* @ 11:32 ET 🟡  Top: GLD +0.75 haven bid in TRANSITIONAL tape | SQQQ +1.65 RSI 91 mean-revert  Stance: agree with Mike on risk-off; pressing index-short basket harder than yesterday.`
-- `🛰 *fab* @ 11:32 ET 🟢  Top: LRCX +1.4 cleanest pullback to SMA20 | KLAC +1.1 RSI cooled to 65  Stance: leaning INTO the equipment-name dip; agree on stretched MU/INTC.`
-
-If your sector view changed *materially* this hour (flipped net-long → net-short or vice versa), prefix with `⚠️ FLIP:` so it stands out.
-
-If you have nothing meaningful (everyone flat, no edge), still send a one-liner: `🛰 *<agent>* @ <HH:MM ET>  No edge — standing aside (X% of universe at RSI<70 and >30, no catalyst).` so the user knows you ran and chose to do nothing rather than silently failing.
+`Read('agents/thinking_template.md')` and follow its **Output** section verbatim. Per-skill substitutions:
+- Header agent tag: `🛰 *energy* · ...`
+- Model dir for the optional Code-adjustment block (if you Edited a model this run): `agents/energy/models/*.py`

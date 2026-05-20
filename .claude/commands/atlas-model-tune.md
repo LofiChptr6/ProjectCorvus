@@ -175,7 +175,8 @@ This log is your ONLY memory across cycles. Without it, next cycle you re-derive
    Hypothesis log: agents/atlas/notes/model_hypothesis.md
    Verify by: <date>
    ```
-3. Risky changes (need new MCP tool, external data feed, cross-agent dep): `propose_strategic_change(title="atlas model: <change>", details=<rationale>)`.
+3. **Per-file code-adjustment pings** — for EACH `agents/atlas/models/*.py` file you added, edited, or scrapped this run, send a SEPARATE `send_telegram_update` using the **Code-adjustment block** format in `agents/thinking_template.md` (read the template if you haven't already). One ping per file. Order them after the summary telegram above so the user sees the headline first, then drills into per-file changes.
+4. Risky changes (need new MCP tool, external data feed, cross-agent dep): `propose_strategic_change(title="atlas model: <change>", details=<rationale>)`.
 
 ## STEP 9 — Output (stdout)
 

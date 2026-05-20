@@ -239,13 +239,51 @@ async def enrich_views_with_mixture(
     return out_views, report
 
 
+def compute_conviction(
+    expected_return_pct: Optional[float],
+    likelihood: Optional[float],
+    time_to_target_days: Optional[float],
+) -> float:
+    """Central conviction formula — the ONLY place a conviction value is derived.
+
+    conviction = abs(expected_return_pct) × likelihood / time_to_target_days
+
+    Inputs:
+        expected_return_pct: signed %% move (sign is carried by `direction`;
+            magnitude used here). e.g. +5.0 for +5%%, -8.0 for -8%%.
+        likelihood: forecast probability in [0, 1]. 0 → conviction 0 (no edge);
+            1 → full-confidence call.
+        time_to_target_days: trading-day horizon, must be > 0.
+
+    Returns a positive float (unbounded — short horizons + large moves
+    naturally produce higher convictions). The allocator's per-symbol
+    sum-of-abs normalization makes the absolute value moot; only the
+    cross-symbol ranking + relative magnitudes matter.
+
+    Returns 0.0 on any invalid input (caller treats as flat).
+    """
+    if expected_return_pct is None or likelihood is None or time_to_target_days is None:
+        return 0.0
+    try:
+        er = abs(float(expected_return_pct))
+        lk = float(likelihood)
+        ttd = float(time_to_target_days)
+    except (TypeError, ValueError):
+        return 0.0
+    if lk <= 0.0 or ttd <= 0.0:
+        return 0.0
+    if lk > 1.0:
+        lk = 1.0  # clamp; agents that emit >1 are mis-calibrating, not earning a bonus
+    return er * lk / ttd
+
+
 def compute_target_weights(
     views: Iterable[ConvictionView],
     influence_weights: Optional[dict[str, float]] = None,
-    gross_leverage: float = 1.0,
-    max_per_symbol: float = 0.20,
-    min_trade_threshold: float = 0.005,
-    top_n: Optional[int] = 10,
+    gross_leverage: float = 2.0,
+    max_per_symbol: float = 0.40,
+    min_trade_threshold: float = 0.002,
+    top_n: Optional[int] = 30,
 ) -> TargetWeights:
     """Aggregate signed convictions into normalized target weights.
 
@@ -253,13 +291,14 @@ def compute_target_weights(
         views: All active (non-expired, non-flat) conviction rows.
         influence_weights: Per-agent multiplier (default 1.0). Cassidy's
             calibration audit can recommend adjustments here.
-        gross_leverage: Total |weight| sum after normalization. 1.0 = no margin.
-        max_per_symbol: Cap any single name at this fraction of NAV.
-        min_trade_threshold: Drop names below this absolute weight.
+        gross_leverage: Total |weight| sum after normalization. 1.0 = no margin;
+            >1.0 uses margin. Default 2.0 (2x leverage).
+        max_per_symbol: Cap any single name at this fraction of NAV. Default 0.40.
+        min_trade_threshold: Drop names below this absolute weight. Default 0.002.
         top_n: Keep only the top-N highest |signed-conviction| symbols (after
             agent aggregation). CASH is held aside before this trim and is
-            ALWAYS retained. Set to None to disable. Default 10 — concentration
-            policy: own fewer, bigger positions to amortize commission floor.
+            ALWAYS retained. Set to None to disable. Default 30 — wide breadth
+            across 11 sector agents.
 
     Returns:
         TargetWeights with `.weights` and `.contributors`.

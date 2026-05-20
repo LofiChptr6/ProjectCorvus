@@ -20,14 +20,17 @@ from pydantic import BaseModel, Field, field_validator
 class ConvictionView(BaseModel):
     """One row in the agent's published conviction stack.
 
-    Mirrors agent_conviction columns. `direction='flat'` + `conviction=0` is the
-    canonical 'I have no view' submission and is acceptable per upsert_conviction
-    docstring.
+    Mirrors agent_conviction columns. Agents supply the FORECAST TRIPLE
+    `(expected_return_pct, likelihood, time_to_target_days)`; conviction is
+    computed centrally by `meta_agent.allocator.compute_conviction` at write
+    time — agents no longer hand-tune the scale. `direction='flat'` is the
+    canonical 'I have no view' submission.
     """
     symbol: str
     direction: Literal["long", "flat"]
-    conviction: float = Field(..., ge=0.0, le=1.0)
+    # Forecast triple — REQUIRED when direction != "flat".
     expected_return_pct: Optional[float] = None
+    likelihood: Optional[float] = Field(None, ge=0.0, le=1.0)
     time_to_target_days: Optional[int] = Field(None, ge=0)
     rationale: Optional[str] = None
     model_inputs: Optional[dict[str, Any]] = None
@@ -38,7 +41,7 @@ class ConvictionView(BaseModel):
     # for the canonical range constants.
     expires_in_hours: float = Field(..., ge=5/60, le=24*30)
     from_model: Optional[str] = None  # name under agents/<agent>/models/; when
-                                      # set, runner overrides direction/conviction/
+                                      # set, runner overrides direction/likelihood/
                                       # expected_return_pct/time_to_target_days/
                                       # stop_pct/model_inputs with model output
 

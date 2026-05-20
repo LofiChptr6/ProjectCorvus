@@ -150,7 +150,8 @@ NEVER touch another agent's models.
    Hypothesis log: agents/commodity/notes/model_hypothesis.md
    Verify by: <date>
    ```
-3. Need new MCP tool / data feed (LME inventory, USDA WASDE scraper): `propose_strategic_change(...)`.
+3. **Per-file code-adjustment pings** — for EACH `agents/commodity/models/*.py` file you added, edited, or scrapped this run, send a SEPARATE `send_telegram_update` using the **Code-adjustment block** format in `agents/thinking_template.md` (read the template if you haven't already). One ping per file. Order them after the summary telegram above so the user sees the headline first, then drills into per-file changes.
+4. Need new MCP tool / data feed (LME inventory, USDA WASDE scraper): `propose_strategic_change(...)`.
 
 ## STEP 9 — Output (stdout)
 

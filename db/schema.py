@@ -286,6 +286,11 @@ SCHEMA_STATEMENTS = [
     # join directly instead of guessing via timestamp heuristic. NULL on rows
     # written before this column existed.
     "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS session_id TEXT",
+    # Likelihood — forecast probability in [0, 1] supplied by the agent (or by
+    # the quant model). The server computes `conviction = abs(expected_return_pct)
+    # × likelihood / time_to_target_days` in `meta_agent.allocator.compute_conviction`
+    # at submission time; this column preserves the input for audit/calibration.
+    "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS likelihood NUMERIC",
     "CREATE INDEX IF NOT EXISTS idx_conv_session ON agent_conviction (session_id) WHERE session_id IS NOT NULL",
     "CREATE INDEX IF NOT EXISTS idx_conv_active ON agent_conviction (expires_at) WHERE conviction > 0",
     "CREATE INDEX IF NOT EXISTS idx_conv_symbol ON agent_conviction (symbol, expires_at)",
@@ -592,6 +597,8 @@ END $$""",
         run_session_id        TEXT
     )""",
     "CREATE INDEX IF NOT EXISTS idx_conv_shadow_agent_run ON agent_conviction_shadow (agent_name, submitted_at DESC)",
+    # Mirror the live-table likelihood column.
+    "ALTER TABLE agent_conviction_shadow ADD COLUMN IF NOT EXISTS likelihood NUMERIC",
     """CREATE TABLE IF NOT EXISTS agent_forecast_shadow (
         id                    BIGSERIAL PRIMARY KEY,
         agent_name            TEXT NOT NULL,

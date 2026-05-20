@@ -146,7 +146,6 @@ async def compute_conviction_payload(
         return {"status": "error", "error": f"model produced invalid direction={direction!r}"}
 
     try:
-        conviction = float(result.get("conviction", 0.0))
         expected_return_pct = float(result["expected_return_pct"])
         time_to_target_days = int(result["time_to_target_days"])
     except (KeyError, TypeError, ValueError) as exc:
@@ -157,6 +156,27 @@ async def compute_conviction_payload(
         return {"status": "error", "error": f"contract violation: direction='long' but expected_return_pct={expected_return_pct} < 0"}
     if direction == "short" and expected_return_pct > 0:
         return {"status": "error", "error": f"contract violation: direction='short' but expected_return_pct={expected_return_pct} > 0"}
+
+    # Likelihood — new contract field. Older models emit `conviction` ∈ [0, 1]
+    # which served the same role; fall back to it so we don't have to rewrite
+    # every existing model in one shot. Models migrating forward should emit
+    # `likelihood` explicitly.
+    likelihood_raw = result.get("likelihood")
+    if likelihood_raw is None:
+        likelihood_raw = result.get("conviction")
+    try:
+        likelihood = float(likelihood_raw) if likelihood_raw is not None else 0.0
+    except (TypeError, ValueError):
+        likelihood = 0.0
+    if likelihood < 0.0:
+        likelihood = 0.0
+    if likelihood > 1.0:
+        likelihood = 1.0
+
+    # Central conviction calculation — same formula as submit_conviction_view.
+    # If the distributions branch overrides this below, it wins.
+    from meta_agent.allocator import compute_conviction
+    conviction = compute_conviction(expected_return_pct, likelihood, time_to_target_days)
 
     stop_pct = result.get("stop_pct")
     if stop_pct is not None:
@@ -210,6 +230,7 @@ async def compute_conviction_payload(
             "conviction": conviction,
             "expected_return_pct": expected_return_pct,
             "time_to_target_days": time_to_target_days,
+            "likelihood": likelihood,
             "stop_pct": stop_pct,
             "model_inputs": model_inputs,
             "forecast_run_id": forecast_run_id,

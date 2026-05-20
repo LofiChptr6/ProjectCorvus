@@ -177,10 +177,28 @@ async def _resolve_conviction_fields(
     When `from_model` is None, pass the LLM-authored fields through unchanged.
     """
     if not c.from_model:
+        # Non-model path: compute conviction centrally from the forecast triple.
+        # Flat → conviction 0. Otherwise apply compute_conviction(er, lk, ttd).
+        if c.direction == "flat":
+            conviction = 0.0
+        else:
+            from meta_agent.allocator import compute_conviction
+            conviction = compute_conviction(
+                c.expected_return_pct, c.likelihood, c.time_to_target_days,
+            )
+            if conviction <= 0.0:
+                log.info(
+                    "review.conviction_zero dropped: agent=%s sym=%s "
+                    "er=%s lk=%s ttd=%s (check forecast-triple inputs)",
+                    agent_name, c.symbol, c.expected_return_pct, c.likelihood,
+                    c.time_to_target_days,
+                )
+                return None
         return {
             "direction": c.direction,
-            "conviction": c.conviction,
+            "conviction": conviction,
             "expected_return_pct": c.expected_return_pct,
+            "likelihood": c.likelihood,
             "time_to_target_days": c.time_to_target_days,
             "stop_pct": c.stop_pct,
             "model_inputs": c.model_inputs,
@@ -205,6 +223,7 @@ async def _resolve_conviction_fields(
         "direction": p["direction"],
         "conviction": p["conviction"],
         "expected_return_pct": p["expected_return_pct"],
+        "likelihood": p.get("likelihood"),
         "time_to_target_days": p["time_to_target_days"],
         "stop_pct": p["stop_pct"],
         "model_inputs": p["model_inputs"],  # already stamped with _model/_version
@@ -252,6 +271,7 @@ async def _apply_review_output(
                 conviction=resolved["conviction"],
                 expected_return_pct=resolved["expected_return_pct"],
                 time_to_target_days=resolved["time_to_target_days"],
+                likelihood=resolved.get("likelihood"),
                 rationale=c.rationale,
                 model_inputs=resolved["model_inputs"],
                 expires_in_hours=c.expires_in_hours,
@@ -300,6 +320,7 @@ async def _apply_review_output(
                 conviction=resolved["conviction"],
                 expected_return_pct=resolved["expected_return_pct"],
                 time_to_target_days=resolved["time_to_target_days"],
+                likelihood=resolved.get("likelihood"),
                 rationale=c.rationale,
                 model_inputs=resolved["model_inputs"],
                 expires_in_hours=c.expires_in_hours,

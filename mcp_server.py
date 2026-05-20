@@ -2104,10 +2104,10 @@ async def submit_conviction_view(
     agent_name: str,
     symbol: str,
     direction: str,
-    conviction: float,
     rationale: str,
     expires_in_hours: float,
     expected_return_pct: Optional[float] = None,
+    likelihood: Optional[float] = None,
     time_to_target_days: Optional[int] = None,
     model_inputs: Optional[dict] = None,
     momentum_confirmed: Optional[bool] = None,
@@ -2118,40 +2118,47 @@ async def submit_conviction_view(
     Publish a signed conviction view on one symbol. Upserts on (agent_name, symbol)
     so calling again replaces the prior view. Mike reads these to size the desk.
 
+    AGENTS DO NOT PICK THE CONVICTION NUMBER. You supply your forecast inputs —
+    (expected_return_pct, likelihood, time_to_target_days) — and the server
+    computes conviction centrally as:
+
+        conviction = abs(expected_return_pct) × likelihood / time_to_target_days
+
+    See `meta_agent.allocator.compute_conviction`. This guarantees every agent
+    uses the same scale and removes a hand-tuning degree of freedom that the
+    2026-05 audit flagged.
+
     Args:
-        agent_name: Your agent name (e.g. 'rex', 'semi', 'atlas').
+        agent_name: Your agent name (e.g. 'atlas', 'fab', 'vera').
         symbol: Ticker, will be uppercased.
-        direction: 'long' | 'short' | 'flat'. 'flat' must have conviction == 0.
-        conviction: Positive float ≈ E[return] / time_to_target_days. Higher = stronger.
-                    Use your own forecast formula; Cassidy reviews calibration in evening.
+        direction: 'long' | 'short' | 'flat'. 'flat' bypasses the conviction
+                   formula (conviction stored as 0).
         rationale: 1–2 sentence why (audit trail). For inverse-ETF symbols this is
                    what the user reads on the Telegram approval prompt — be concrete.
-        expires_in_hours: REQUIRED. Auto-expire after N hours. There is no default
-                          — you MUST pick a value matching your thesis horizon.
-                          Range: 0.0833 (5 minutes) to 720 (30 days).
-                          Sub-1 values are for scalp/intraday catalysts; <24 for
-                          single-session views; 24–168 for swing; 168–720 for
-                          multi-week regime calls. Off-hours expirations are
-                          no-ops (market_hours risk check blocks SELLs outside RTH).
+        expires_in_hours: REQUIRED. Auto-expire after N hours. Range 0.0833 (5min)
+                          to 720 (30 days). Must match your thesis horizon: a
+                          scalp and a swing should NOT get the same expiry.
+                          Off-hours expirations are no-ops (market_hours risk
+                          check blocks SELLs outside RTH).
         expected_return_pct: REQUIRED for direction != 'flat'. Your forecast as a
-                             signed % move on this name (e.g. +8.5 = expect a 8.5%
-                             rise; -6.0 = expect a 6% drop). Drives the evening
-                             forecast panel and the calibration tracker.
+                             signed % move on this name (e.g. +8.5 = expect +8.5%
+                             move; -6.0 = expect -6% move). Sign MUST match
+                             direction (long → positive, short → negative).
+        likelihood: REQUIRED for direction != 'flat'. Probability the forecast
+                    plays out, in [0, 1]. 0.5 = coin-flip; 0.8 = strong
+                    confidence. Drives the central conviction formula.
         time_to_target_days: REQUIRED for direction != 'flat' and must be > 0.
-                             Your horizon in trading days. Sets the x-axis length
-                             of the forecast line in your evening panel.
+                             Your horizon in trading days. Drives both the central
+                             conviction formula and the evening forecast panel.
         model_inputs: Raw quant model output for replay (optional dict).
         momentum_confirmed: For direction='long' on a verified inverse ETF, asserts
                             whether the underlying is already showing the bearish move
                             (True) vs. an early entry ahead of confirmation (False).
-                            None on non-inverse symbols. None on an inverse-ETF buy is
-                            treated as False (safe default — needs human approval).
-        stop_pct: Optional defensive auto-flat trigger. If the desk's unrealized
-                  return on this symbol falls below -stop_pct (e.g., 8 ⇒ -8%), the
-                  allocator treats this conviction as flat regardless of whether
-                  you re-publish — the position closes. STRONGLY recommended for
-                  inverse-ETF longs where decay compounds: 8 on 1× inverses,
-                  4 on ≥2× inverses. NULL ⇒ no stop (default).
+                            None on non-inverse symbols.
+        stop_pct: Optional defensive auto-flat trigger. If unrealized return on
+                  this symbol falls below -stop_pct, the allocator treats this
+                  conviction as flat regardless of whether you re-publish.
+                  Recommended for inverse-ETF longs: 8 on 1×, 4 on ≥2×.
     """
     await _ensure_init_light()
     ok, reason = _validate_symbol(symbol)
@@ -2167,9 +2174,6 @@ async def submit_conviction_view(
         return _err("CASH conviction must be direction='long' (cash reserve, not margin)", code="validation")
     # Catch LLM-fabricated technical-indicator blobs slipping in as model_inputs
     # (the 2026-05-12 audit found 23/34 recent rows had keys no model emits).
-    # Warn-only by default; the validator logs each hit to its dedicated log
-    # file. Flip via MODEL_INPUTS_VALIDATOR_MODE=reject after the observation
-    # window confirms agents now route through their models.
     from meta_agent.model_inputs_validator import (
         validate as _validate_model_inputs, is_reject_mode as _mi_reject_mode,
     )
@@ -2178,19 +2182,45 @@ async def submit_conviction_view(
     )
     if not mi_ok and _mi_reject_mode():
         return _err(f"model_inputs: {mi_reason}", code="validation")
-    # Non-flat convictions MUST carry a forecast — without (expected_return_pct,
-    # time_to_target_days) the evening forecast panel can't draw a line and
-    # Mike's calibration tracker has nothing to score the call against. CASH
-    # is exempt: it's a cash-reserve vote, not a price view, so it carries no
-    # forecast metadata.
+    # Non-flat convictions MUST carry the forecast triple — these are the inputs
+    # to the central conviction formula. CASH is exempt: it's a cash-reserve vote.
     if direction != "flat" and symbol.upper() != "CASH":
         if expected_return_pct is None:
-            return _err("validation: expected_return_pct is required for direction != 'flat' (your forecast — % move you expect on this name)")
+            return _err("validation: expected_return_pct is required for direction != 'flat' (signed %% move you expect, sign matches direction)")
+        if likelihood is None:
+            return _err("validation: likelihood is required for direction != 'flat' (probability in [0,1] that the forecast plays out)")
+        if not (0.0 <= float(likelihood) <= 1.0):
+            return _err(f"validation: likelihood must be in [0, 1], got {likelihood}")
         if time_to_target_days is None or int(time_to_target_days) <= 0:
-            return _err("validation: time_to_target_days is required and must be > 0 for direction != 'flat' (your horizon in days)")
+            return _err("validation: time_to_target_days is required and must be > 0 for direction != 'flat' (horizon in trading days)")
+        # Sign discipline: long → positive, short → negative.
+        if direction == "long" and float(expected_return_pct) < 0:
+            return _err(f"validation: direction='long' requires expected_return_pct >= 0, got {expected_return_pct}")
+        if direction == "short" and float(expected_return_pct) > 0:
+            return _err(f"validation: direction='short' requires expected_return_pct <= 0, got {expected_return_pct}")
     allowed, reason = await _agent_owns_symbol(agent_name, symbol)
     if not allowed:
         return _err(f"watchlist: {reason}", code="validation")
+    # Central conviction calculation — the only place a conviction value is
+    # derived from agent inputs. Flat / CASH get conviction = 0 / per agent choice.
+    from meta_agent.allocator import compute_conviction
+    if direction == "flat":
+        conviction = 0.0
+    elif symbol.upper() == "CASH":
+        # CASH carries a "preference weight" only — agents can omit the forecast
+        # triple. If they pass a likelihood, use it; else default to 1.0 with
+        # a placeholder return so the allocator gets a stable positive value.
+        if likelihood is not None and expected_return_pct is not None and time_to_target_days:
+            conviction = compute_conviction(expected_return_pct, likelihood, time_to_target_days)
+        else:
+            conviction = 1.0
+    else:
+        conviction = compute_conviction(expected_return_pct, likelihood, time_to_target_days)
+        if conviction <= 0.0:
+            return _err(
+                "validation: computed conviction == 0 — check expected_return_pct / "
+                "likelihood / time_to_target_days inputs"
+            )
     from db import store
     try:
         view_id = await store.upsert_conviction(
@@ -2200,6 +2230,7 @@ async def submit_conviction_view(
             conviction=conviction,
             expected_return_pct=expected_return_pct,
             time_to_target_days=time_to_target_days,
+            likelihood=likelihood,
             rationale=rationale,
             model_inputs=model_inputs,
             expires_in_hours=expires_in_hours,
@@ -2207,7 +2238,12 @@ async def submit_conviction_view(
             stop_pct=stop_pct,
             session_id=session_id,
         )
-        return json.dumps({"view_id": view_id, "symbol": symbol.upper(), "direction": direction})
+        return json.dumps({
+            "view_id": view_id,
+            "symbol": symbol.upper(),
+            "direction": direction,
+            "conviction": round(conviction, 4),
+        })
     except (ValueError, AssertionError) as e:
         return _err(f"validation: {e}", code="validation")
 
@@ -2298,6 +2334,7 @@ async def submit_conviction_from_model(
             conviction=payload["conviction"],
             expected_return_pct=payload["expected_return_pct"],
             time_to_target_days=payload["time_to_target_days"],
+            likelihood=payload.get("likelihood"),
             rationale=rationale,
             model_inputs=payload["model_inputs"],
             expires_in_hours=expires_in_hours,
@@ -2884,9 +2921,9 @@ async def get_consolidated_view(caller: str = "") -> str:
 async def rebalance_desk(
     caller: str = "",
     dry_run: bool = True,
-    gross_leverage: float = 1.0,
-    max_per_symbol: float = 0.20,
-    min_trade_threshold: float = 0.005,
+    gross_leverage: float = 2.0,
+    max_per_symbol: float = 0.40,
+    min_trade_threshold: float = 0.002,
     influence_weights: Optional[dict] = None,
 ) -> str:
     """
@@ -2900,9 +2937,11 @@ async def rebalance_desk(
     Args:
         caller: Must be 'mike'.
         dry_run: If True (default), only logs proposed orders — no orders placed.
-        gross_leverage: Sum of |target_weights|. 1.0 = no margin.
-        max_per_symbol: Hard cap per name as fraction of NAV.
+        gross_leverage: Sum of |target_weights|. 1.0 = no margin; default 2.0
+                        (2x leverage; aggressive cap regime).
+        max_per_symbol: Hard cap per name as fraction of NAV. Default 0.40.
         min_trade_threshold: Skip orders smaller than this fraction of NAV.
+                             Default 0.002.
         influence_weights: Per-agent multiplier {agent: float}. Default all 1.0.
 
     Returns: JSON with target_weights, contributors, proposed_orders, decision_id.

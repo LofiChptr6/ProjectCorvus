@@ -822,6 +822,7 @@ async def insert_conviction_shadow(
     expires_in_hours: float,
     expected_return_pct: Optional[float] = None,
     time_to_target_days: Optional[int] = None,
+    likelihood: Optional[float] = None,
     rationale: Optional[str] = None,
     model_inputs: Optional[dict] = None,
     momentum_confirmed: Optional[bool] = None,
@@ -837,12 +838,12 @@ async def insert_conviction_shadow(
         row = await conn.fetchrow(
             """INSERT INTO agent_conviction_shadow
                (agent_name, symbol, direction, conviction, expected_return_pct,
-                time_to_target_days, rationale, model_inputs, momentum_confirmed,
-                stop_pct, expires_at, run_session_id)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                time_to_target_days, likelihood, rationale, model_inputs,
+                momentum_confirmed, stop_pct, expires_at, run_session_id)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
                RETURNING id""",
             agent_name, symbol.upper(), direction, conviction, expected_return_pct,
-            time_to_target_days, rationale,
+            time_to_target_days, likelihood, rationale,
             json.dumps(model_inputs) if model_inputs else None,
             momentum_confirmed, stop_pct, expires_at, run_session_id,
         )
@@ -1246,6 +1247,7 @@ async def upsert_conviction(
     expires_in_hours: float,
     expected_return_pct: Optional[float] = None,
     time_to_target_days: Optional[int] = None,
+    likelihood: Optional[float] = None,
     rationale: Optional[str] = None,
     model_inputs: Optional[dict] = None,
     momentum_confirmed: Optional[bool] = None,
@@ -1302,24 +1304,25 @@ async def upsert_conviction(
         row = await conn.fetchrow(
             """INSERT INTO agent_conviction
                  (agent_name, symbol, direction, conviction,
-                  expected_return_pct, time_to_target_days,
+                  expected_return_pct, time_to_target_days, likelihood,
                   rationale, model_inputs, momentum_confirmed, expires_at,
                   stop_pct, first_held_since, session_id,
                   forecast_run_id, functional_name)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,
-                       NOW() + ($10 || ' hours')::interval,
-                       $11, $12, $13, $14::uuid, $15)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,
+                       NOW() + ($11 || ' hours')::interval,
+                       $12, $13, $14, $15::uuid, $16)
                ON CONFLICT (agent_name, symbol) DO UPDATE SET
                  direction           = EXCLUDED.direction,
                  conviction          = EXCLUDED.conviction,
                  expected_return_pct = EXCLUDED.expected_return_pct,
                  time_to_target_days = EXCLUDED.time_to_target_days,
+                 likelihood          = EXCLUDED.likelihood,
                  rationale           = EXCLUDED.rationale,
                  model_inputs        = EXCLUDED.model_inputs,
                  momentum_confirmed  = EXCLUDED.momentum_confirmed,
                  stop_pct            = EXCLUDED.stop_pct,
                  submitted_at        = NOW(),
-                 expires_at          = NOW() + ($10 || ' hours')::interval,
+                 expires_at          = NOW() + ($11 || ' hours')::interval,
                  -- session_id reflects whoever just re-published; NULL stays NULL.
                  session_id          = EXCLUDED.session_id,
                  forecast_run_id     = EXCLUDED.forecast_run_id,
@@ -1334,7 +1337,7 @@ async def upsert_conviction(
                  END
                RETURNING id""",
             agent_name, symbol.upper(), direction, conviction,
-            expected_return_pct, time_to_target_days, rationale,
+            expected_return_pct, time_to_target_days, likelihood, rationale,
             json.dumps(model_inputs) if model_inputs is not None else None,
             momentum_confirmed,
             str(expires_in_hours),
