@@ -14,6 +14,61 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
+# ── Citations (Phase A of CITATION_ARCH, 2026-05-21) ─────────────────────────
+
+
+# Source classes a load-bearing claim can pin to. The verifier worker (Phase C)
+# dispatches on this kind via meta_agent.citation_pipeline. The Literal stays
+# here because pydantic needs a static type at class-definition time; the
+# module-load assertion below enforces it matches the pipeline registry.
+CITATION_KIND = Literal[
+    "news_post",          # post.id from thread 'news-headlines'
+    "model_run",          # forecast_run_id (UUID) from agent_forecast
+    "computed_indicator", # ad-hoc indicator value from the compute_indicator tool
+    "prior_thesis",       # agent_thesis.id (chain must trace to a non-thesis root)
+    "sibling_view",       # another agent's active conviction (agent_conviction.id)
+]
+
+
+def _assert_citation_kind_matches_registry() -> None:
+    """Module-load consistency check: the CITATION_KIND Literal must match
+    the runtime registry in meta_agent.citation_pipeline. Drift between the
+    two would let pydantic accept a kind the verifier doesn't know about,
+    or vice versa — silent failure mode that's hard to debug. Fail loudly
+    at import time instead."""
+    from typing import get_args
+    from meta_agent.citation_pipeline import all_kinds
+    schema_kinds = set(get_args(CITATION_KIND))
+    registry_kinds = set(all_kinds())
+    if schema_kinds != registry_kinds:
+        missing_in_registry = schema_kinds - registry_kinds
+        missing_in_schema = registry_kinds - schema_kinds
+        raise RuntimeError(
+            "CITATION_KIND Literal drifted from citation_pipeline registry: "
+            f"only-in-schema={sorted(missing_in_schema) or '∅'} "
+            f"only-in-registry={sorted(missing_in_registry) or '∅'}. "
+            "Update one or the other so they match."
+        )
+
+
+_assert_citation_kind_matches_registry()
+
+
+class Citation(BaseModel):
+    """A typed pointer from an LLM-authored claim to a verifiable evidence row.
+
+    Sealed at submission time via `db.store.stamp_evidence`. The `evidence_id`
+    is the durable handle; `kind` and `source_ref_id` are denormalized for
+    indexing and dashboard rendering without joining evidence_snapshot.
+
+    Phase A: optional on ConvictionView. Phase D: required for direction='long'.
+    """
+    kind: CITATION_KIND
+    evidence_id: int = Field(..., ge=1)
+    source_ref_id: str = Field(..., min_length=1, max_length=128)
+    quote: str = Field(..., max_length=300)
+
+
 # ── Review (Phase 2) ──────────────────────────────────────────────────────────
 
 
@@ -44,6 +99,10 @@ class ConvictionView(BaseModel):
                                       # set, runner overrides direction/likelihood/
                                       # expected_return_pct/time_to_target_days/
                                       # stop_pct/model_inputs with model output
+    # Phase A of CITATION_ARCH: typed pointers from rationale claims to
+    # evidence_snapshot rows. Optional in Phase A (agents can populate or omit);
+    # Phase D will require non-empty citations for direction='long'.
+    citations: Optional[list[Citation]] = None
 
     @field_validator("symbol")
     @classmethod

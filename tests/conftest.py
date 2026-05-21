@@ -65,6 +65,16 @@ async def test_agent():
     pool = await get_pool()
     async with pool.acquire() as conn:
         # Add to this list as more tables get test data.
+        # conviction_verification doesn't have an agent_name column; clean it
+        # via a join on agent_conviction.
+        try:
+            await conn.execute(
+                """DELETE FROM conviction_verification
+                   WHERE conviction_id IN (SELECT id FROM agent_conviction WHERE agent_name = $1)""",
+                name,
+            )
+        except Exception:
+            pass
         for table in (
             "agent_inbox",
             "agent_thesis",
@@ -72,6 +82,7 @@ async def test_agent():
             "agent_forecast", "agent_forecast_shadow",
             "agent_evening_digests",
             "sector_story",
+            "evidence_snapshot",
         ):
             try:
                 await conn.execute(f"DELETE FROM {table} WHERE agent_name=$1", name)

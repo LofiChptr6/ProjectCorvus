@@ -144,7 +144,11 @@ def validate(
         log.warning("agent=%s symbol=%s direction=%s reason=%s",
                     agent_name, symbol, direction, reason)
         return False, reason
-    submitted = set(model_inputs.keys())
+    # Strip provenance-stamped keys (start with "_") from the validation set —
+    # they're added by meta_agent.conviction_from_model after the model returns
+    # (e.g. _model, _version), not by the model itself. The validator's job is
+    # to catch fabricated feature keys, not block legitimate stamps.
+    submitted = {k for k in model_inputs.keys() if not k.startswith("_")}
     fabricated = sorted(submitted - allowed)
     if fabricated:
         reason = (

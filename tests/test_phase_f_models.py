@@ -16,15 +16,19 @@ def _build_bars(n: int = 220, base: float = 100.0, drift: float = 0.0,
                 vol: float = 0.005, seed: int = 13,
                 regime_switch: bool = False) -> list[dict]:
     """Daily-bar generator. Optionally switches regime halfway to give the HMM
-    something non-degenerate to fit."""
+    something non-degenerate to fit. The bear-leg uses negative drift +
+    3× vol so the two regimes are well-separated in (μ, σ) space — without this
+    contrast hmmlearn collapses to a single state and the model's
+    degenerate-fit guard (σ_state > 0.3, triggered by the prior fallback of
+    the unused state) declines."""
     rnd = random.Random(seed)
     price = base
     bars: list[dict] = []
     for i in range(n):
         if regime_switch and i >= n // 2:
-            local_drift, local_vol = drift + 0.002, vol * 1.5
+            local_drift, local_vol = drift - 0.005, vol * 3.0
         else:
-            local_drift, local_vol = drift, vol
+            local_drift, local_vol = drift + 0.002, vol
         ret = local_drift + local_vol * (2 * rnd.random() - 1)
         new_price = max(0.01, price * math.exp(ret))
         bars.append({"o": price, "h": max(price, new_price) * 1.001,

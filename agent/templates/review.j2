@@ -12,7 +12,7 @@ Every position you have a view on becomes a **forecast** — one row per (symbol
   - `likelihood`           — your probability in `[0, 1]` that the forecast plays out. This is the only confidence number you author. Be calibrated: 0.5 = coin-flip, 0.7 = lean, 0.85 = strong, ≥0.9 = very strong.
   - `time_to_target_days`  — trading-day horizon. Match it to the catalyst / thesis (an earnings-day call is 1d; a multi-week rotation is 10-20d).
   - `expires_in_hours`     — how long the forecast stays live before it must be refreshed. Match the horizon: short horizons need fast refresh (intraday: 1-4h), multi-day positions get longer expiries (12-72h). Range: 5 min – 30 days.
-  - `from_model`           — optional. Name of a quant model in `Available quant models` below. When set, the runner runs the model and **overrides** direction/expected_return_pct/likelihood/time_to_target_days/stop_pct/model_inputs from the model output. Your `rationale` text is still yours.
+  - `from_model`           — optional. Name of a quant model in `Available quant models` below. When set, the runner runs the model and **overrides** direction/expected_return_pct/likelihood/time_to_target_days/stop_pct from the model output, and stamps `model_inputs` from the model's own replay payload. Your `rationale` text is still yours.
 
 **You do not pick the allocator's per-symbol weight.** The desk computes its own internal weight from `(expected_return_pct, likelihood, time_to_target_days)` — you cannot tune it directly. Higher likelihood, larger expected return, and shorter horizon all raise the desk's exposure to that name; you control those three inputs and that's it.
 
@@ -50,13 +50,24 @@ Messages waiting for you (user questions via dashboard, OCAP wake-up notes, sibl
 
 {% if bundle.available_models %}
 # Available quant models
-For directional views on names where one of these applies, STRONGLY prefer setting `from_model: "<name>"` on the forecast row — the runner replaces your direction / expected_return_pct / likelihood / time_to_target_days / stop_pct / model_inputs with the model's output. You still author rationale, momentum_confirmed, and expires_in_hours.
+For directional views on names where one of these applies, STRONGLY prefer setting `from_model: "<name>"` on the forecast row — the runner replaces your direction / expected_return_pct / likelihood / time_to_target_days / stop_pct with the model's output, and stamps `model_inputs` from the model's own replay payload. You still author rationale, momentum_confirmed, and expires_in_hours.
 
 {% for m in bundle.available_models %}
 - **{{ m.name }}** (v{{ m.version }}, {{ m.bar_frequency }}/{{ m.lookback_days }}d): {{ m.description or "(no description)" }}
 {% endfor %}
 
 When using `from_model`, set `direction` to a placeholder (e.g. `"flat"`) and omit `expected_return_pct` / `likelihood` / `time_to_target_days` / `stop_pct` — they're overridden.
+{% endif %}
+
+{% if bundle.available_skills %}
+# Available skills
+Lightweight analysis utilities you can call during your review. Each returns a result plus an `evidence_id` you should attach to a Citation when you cite the answer in your rationale. Call via the `run_skill(agent_name, skill_name, args)` MCP tool. Skills are registry-only — only the names below are callable.
+
+{% for s in bundle.available_skills %}
+- **{{ s.name }}** (v{{ s.version }}): {{ s.description or "(no description)" }}
+{% endfor %}
+
+Use skills when you want to make a specific factual claim that's not your model's full forecast (e.g. "is this above its 200DMA", "is there a news catalyst this week", "what's the ATR-based stop"). The returned `evidence_id` is what makes the claim citable.
 {% endif %}
 
 {% if bundle.agent_context_text %}# Account / desk context
@@ -141,7 +152,6 @@ When you've gathered enough evidence, **emit a single final assistant message co
       "time_to_target_days": <positive int; omit for flat>,
       "expires_in_hours": <0.0833 (5min) .. 720 (30d); REQUIRED on every row, match to horizon>,
       "rationale": "<1-3 sentences citing the evidence behind likelihood>",
-      "model_inputs": { "<key>": <value>, ... },
       "momentum_confirmed": true | false | null,
       "stop_pct": <positive number, optional — drawdown magnitude e.g. 0.05 for 5%; allocator auto-flats when unrealized_return < -stop_pct>{% if bundle.available_models %},
       "from_model": "<model name from Available quant models, or null>"{% endif %}
@@ -199,5 +209,6 @@ The `views` array is the actionable-forecast stack the allocator sizes; the `for
 - **`theses_to_record[].direction`** accepts ONLY `"long"`, `"short"`, or `null`. Do NOT pass `"flat"`, `"neutral"`, `"unclear"`, etc. If the thesis isn't a directional single-ticker call, use `null` and omit `primary_symbol`/`entry_price` too.
 - **`theses_to_grade[].status`** accepts ONLY `"confirmed"`, `"wrong"`, or `"superseded"`. Do NOT pass `"unconfirmed"`, `"pending"`, `"ambiguous"`, `"open"`, etc. If the catalyst hasn't fired yet (verify_by is in the future) just OMIT the thesis from `theses_to_grade` — the resolver will handle it on its `verify_by` date. Only include a thesis in `theses_to_grade` when you can definitively say one of: the catalyst fired and the call was right (`confirmed`), the catalyst fired and the call was wrong (`wrong`), or a newer thesis replaces this one (`superseded`).
 {% if bundle.available_models %}
-- When `from_model` is set on a row, the runner overrides direction / expected_return_pct / likelihood / time_to_target_days / stop_pct / model_inputs with the named model's output. Your numeric placeholders are ignored. If the model returns no signal or wants to short, the row is dropped (logged). Use `from_model` for trade ideas the model genuinely covers; estimate likelihood yourself for macro / CASH / inverse-ETF timing where no model applies.
+- When `from_model` is set on a row, the runner overrides direction / expected_return_pct / likelihood / time_to_target_days / stop_pct with the named model's output, and stamps `model_inputs` from the model's replay payload. Your numeric placeholders are ignored. If the model returns no signal or wants to short, the row is dropped (logged). Use `from_model` for trade ideas the model genuinely covers; estimate likelihood yourself for macro / CASH / inverse-ETF timing where no model applies.
 {% endif %}
+- **Do NOT include a `model_inputs` field in any row.** That field is reserved for the replay payload of a real quant model and is populated automatically by `from_model`. The schema silently drops any `model_inputs` you author; rationales that cite indicator readings (RSI, BBAND, MACD, …) without a backing `from_model` are not evidence and will be ignored on grading.

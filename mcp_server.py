@@ -575,6 +575,186 @@ async def compute_technicals(symbol: str, indicators: list[str]) -> str:
 
 
 @mcp.tool()
+async def query_news(
+    terms: list[str],
+    symbol: Optional[str] = None,
+    window_days: int = 7,
+    around_date: Optional[str] = None,
+    limit: int = 20,
+    agent_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """
+    Search the news-headlines feed for posts matching ALL `terms` within a
+    date window, optionally constrained by a symbol mention. Stamps the
+    query + result into evidence_snapshot; the returned `evidence_id` is
+    what you attach to a Citation(kind='news_post').
+
+    Use this to cite news support for a thesis or rationale claim. The AND-
+    semantics across terms keeps weak hits out of the audit trail. An empty
+    match set is itself a legitimate result — see `verify_catalyst` for the
+    'event did/did not happen' pattern that exploits absence-of-evidence.
+
+    Args:
+        terms: list of strings, ALL must appear in matching posts.
+        symbol: optional ticker filter (posts must mention the symbol).
+        window_days: search ± this many days around `around_date`.
+        around_date: ISO date 'YYYY-MM-DD' anchor (default: today).
+        limit: max matches returned (capped at 100).
+        agent_name: stamped onto the evidence row for audit.
+        session_id: stamped onto the evidence row.
+
+    Returns:
+        JSON with {ok, terms, symbol, window, match_count, matches, evidence_id}.
+    """
+    await _ensure_init_light()
+    from tools.analysis.query_news import execute
+    out = await execute(
+        terms=terms, symbol=symbol, window_days=window_days,
+        around_date=around_date, limit=limit,
+        agent_name=agent_name, session_id=session_id,
+    )
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+async def verify_catalyst(
+    event_text: str,
+    date: str,
+    lookback_days: int = 30,
+    lookforward_days: int = 3,
+    agent_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """
+    Check whether an alleged event occurs in the news feed on or near a date.
+    Designed for `verify_by` catalyst validation: a thesis citing "OPEC+ meeting
+    on June 4" should be backed by a news post mentioning the event. This tool
+    answers yes/no with a confidence tier and supporting evidence.
+
+    The 2026-05-21 audit found 51 theses citing 'OPEC+ June 4' with zero
+    backing news posts; this tool catches that fabrication pattern before
+    it makes it into a thesis row.
+
+    Search window is asymmetric on purpose: news coverage of FUTURE catalysts
+    arrives weeks ahead (so we look back 30d by default), while past events
+    get covered the day-of (3d forward is enough).
+
+    Confidence tiers:
+      - 'strong': news bodies explicitly name the date AND the event
+      - 'window': event topic is in the news but no body names the date
+      - 'absent': zero news mentions of the event → catalyst likely fabricated
+
+    Args:
+        event_text: free-form description (e.g. "OPEC+ meeting", "FOMC", "earnings call").
+        date: ISO date the catalyst is alleged to occur.
+        lookback_days: search back this many days from the date (default 30, max 60).
+        lookforward_days: search forward this many days (default 3, max 14).
+        agent_name: stamped onto evidence row.
+        session_id: stamped onto evidence row.
+
+    Returns:
+        JSON with {ok, event, date, lookback_days, lookforward_days, found,
+        confidence, matches, checked_date_markers, evidence_id}.
+        `found = False` is a legitimate result; the evidence row still gets
+        stamped so callers can cite "we checked and there were no mentions."
+    """
+    await _ensure_init_light()
+    from tools.analysis.verify_catalyst import execute
+    out = await execute(
+        event_text=event_text, date=date,
+        lookback_days=lookback_days, lookforward_days=lookforward_days,
+        agent_name=agent_name, session_id=session_id,
+    )
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+async def run_skill(
+    agent_name: str,
+    skill_name: str,
+    args: Optional[dict] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """
+    Run one of your agent's registered skills and get back a result with an
+    `evidence_id`. Skills are lightweight, agent-callable analysis utilities
+    (e.g. `compute_above_sma200`, `find_catalyst_in_news`) that wrap common
+    composed queries so you don't have to re-derive them each review.
+
+    See `Available skills` in your bundle for the list with descriptions.
+    Skills are registry-only: only files under `agents/<your-name>/skills/`
+    are callable. Ad-hoc Python authorship is restricted to the nightly
+    `*-model-tune` channel (Phase E of CITATION_ARCH, currently deferred).
+
+    Args:
+        agent_name: Your agent name (e.g. 'energy', 'rex').
+        skill_name: One of the names in `Available skills` in your bundle.
+        args: dict of arguments the skill expects. Each skill documents its
+              own signature; common keys are `symbol`, `terms`, `asof`.
+        session_id: Your review session id (stamped onto the evidence row).
+
+    Returns:
+        JSON: {"status": "ok", "payload": {ok, result, inputs_used, evidence_id, ...}}
+        or {"status": "error", "error": "..."}.
+        On `ok=True`, attach `evidence_id` to a Citation(kind=...) in your
+        ConvictionView. On `ok=False`, the skill declined gracefully —
+        the `reason` field explains.
+    """
+    await _ensure_init_light()
+    from meta_agent.skill_loader import run_skill as _run
+    out = await _run(agent_name=agent_name, skill_name=skill_name, args=args, session_id=session_id)
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
+async def compute_indicator(
+    symbol: str,
+    indicator: str,
+    asof: Optional[str] = None,
+    agent_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> str:
+    """
+    Compute ONE technical indicator on a symbol and stamp the result into
+    evidence_snapshot. Returns the value plus an `evidence_id` you attach
+    to a Citation when this number appears in a rationale or thesis.
+
+    Use this when you want to cite a specific indicator reading. Reading
+    indicators without calling this tool (or `compute_technicals`) is the
+    documented hallucination vector — your rationale claims an "RSI 75"
+    that no model emitted, and the verifier (Phase C) rejects it.
+
+    Args:
+        symbol: Ticker (case-insensitive).
+        indicator: One of: 'RSI_14', 'RSI_28', 'SMA_20', 'SMA_50', 'SMA_200',
+                   'EMA_9', 'EMA_21', 'ATR_14', 'BBANDS_20', 'BBAND_POSITION'
+                   (0..1 scalar where 0=at lower band, 1=at upper band),
+                   'ABOVE_SMA200' (boolean).
+        asof: Optional ISO date 'YYYY-MM-DD' or 'today'. Default = latest
+              available daily bar. Used for replay verification.
+        agent_name: Stamped onto the evidence row for audit.
+        session_id: Stamped onto the evidence row for session cross-reference.
+
+    Returns:
+        JSON with {ok, symbol, indicator, asof, value, last_close, bars_used,
+        bars_hash, evidence_id, computed_at} on success, or
+        {ok: False, reason} on a graceful decline. Source is local_bars_daily,
+        so values are deterministic for the same (symbol, indicator, asof).
+    """
+    await _ensure_init_light()
+    ok, reason = _validate_symbol(symbol)
+    if not ok:
+        return _err(f"validation: {reason}", code="validation")
+    from tools.analysis.compute_indicator import execute
+    out = await execute(
+        symbol=symbol, indicator=indicator, asof=asof,
+        agent_name=agent_name, session_id=session_id,
+    )
+    return json.dumps(out, default=str)
+
+
+@mcp.tool()
 async def get_agent_pnl_windows(agent_name: Optional[str] = None) -> str:
     """
     Per-agent P&L over rolling windows (1d, week-to-date, 1 month, 3 month)

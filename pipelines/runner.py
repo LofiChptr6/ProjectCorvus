@@ -194,6 +194,19 @@ async def _resolve_conviction_fields(
                     c.time_to_target_days,
                 )
                 return None
+        # LLM-supplied model_inputs is a documented hallucination vector — the
+        # 2026-05-19 audit found every non-empty LLM-authored model_inputs blob
+        # carried fabricated indicator keys (rsi_14, bbands_upper, …) that no
+        # quant model emits. Strip to None; rows that want replay metadata must
+        # use `from_model`. The mcp_server submit_conviction_view path applies
+        # meta_agent.model_inputs_validator, but this review-pipeline path used
+        # to bypass it — same defense now applied here.
+        if c.model_inputs:
+            log.info(
+                "review.model_inputs dropped (LLM-authored, no from_model): "
+                "agent=%s sym=%s keys=%s",
+                agent_name, c.symbol, sorted(c.model_inputs.keys())[:8],
+            )
         return {
             "direction": c.direction,
             "conviction": conviction,
@@ -201,7 +214,13 @@ async def _resolve_conviction_fields(
             "likelihood": c.likelihood,
             "time_to_target_days": c.time_to_target_days,
             "stop_pct": c.stop_pct,
-            "model_inputs": c.model_inputs,
+            "model_inputs": None,
+            # Citations are LLM-authored pointers to evidence_snapshot rows. We
+            # pass them through unchanged here; the verify_worker (Phase C of
+            # CITATION_ARCH) independently checks each citation's evidence row
+            # and writes a conviction_verification row with action ∈
+            # {pass, downgrade, reject} that the allocator reads.
+            "citations": [c.model_dump() for c in c.citations] if c.citations else None,
         }
     from meta_agent.conviction_from_model import compute_conviction_payload
     res = await compute_conviction_payload(agent_name, c.from_model, c.symbol)
@@ -219,6 +238,40 @@ async def _resolve_conviction_fields(
                  "(allocator skips direct shorts; LLM should express via inverse-ETF long)",
                  agent_name, c.symbol, c.from_model)
         return None
+    # Belt-and-suspenders: the validator's registry is built from these same
+    # model files via synthetic-bar introspection, so model-supplied inputs
+    # should pass by construction. A failure here means the model emits a key
+    # outside the introspected set (a feature reachable only on a non-synthetic
+    # branch) OR the registry is stale relative to a newly-added model. Drop
+    # the row in reject mode rather than persisting un-replayable metadata.
+    from meta_agent.model_inputs_validator import (
+        validate as _validate_mi, is_reject_mode as _mi_reject,
+    )
+    mi_ok, mi_reason = _validate_mi(
+        agent_name, p.get("model_inputs"), symbol=c.symbol, direction=p["direction"],
+    )
+    if not mi_ok and _mi_reject():
+        log.warning(
+            "review.from_model rejected by model_inputs_validator: "
+            "agent=%s sym=%s model=%s reason=%s",
+            agent_name, c.symbol, c.from_model, mi_reason,
+        )
+        return None
+    # When a from_model run wrote a distribution, mint an auto-citation pointing
+    # at the forecast_run_id so the verify_worker can grade it as a model_run.
+    # LLM-authored citations (when present) are merged in too.
+    auto_citations: list[dict] = []
+    run_id = p.get("forecast_run_id")
+    if run_id:
+        auto_citations.append({
+            "kind": "model_run",
+            "evidence_id": 0,           # placeholder — model_run citations key off run_id, not evidence_snapshot
+            "source_ref_id": str(run_id),
+            "quote": f"model:{c.from_model} forecast_run_id={run_id}",
+        })
+    llm_citations = [c.model_dump() for c in c.citations] if c.citations else []
+    merged_citations = (llm_citations + auto_citations) or None
+
     return {
         "direction": p["direction"],
         "conviction": p["conviction"],
@@ -233,6 +286,7 @@ async def _resolve_conviction_fields(
         # ignore them.
         "forecast_run_id": p.get("forecast_run_id"),
         "functional_name": p.get("functional_name"),
+        "citations": merged_citations,
     }
 
 
@@ -278,6 +332,7 @@ async def _apply_review_output(
                 momentum_confirmed=c.momentum_confirmed,
                 stop_pct=resolved["stop_pct"],
                 run_session_id=session_id,
+                citations=resolved.get("citations"),
             )
             summary["views_inserted"] += 1
 
@@ -330,6 +385,7 @@ async def _apply_review_output(
                 session_id=session_id,
                 forecast_run_id=resolved.get("forecast_run_id"),
                 functional_name=resolved.get("functional_name"),
+                citations=resolved.get("citations"),
             )
             new_resolved_payloads.append({
                 "symbol": c.symbol.upper(),

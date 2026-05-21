@@ -265,6 +265,15 @@ async def _persist_distributions(
     if not isinstance(distributions, list) or not distributions:
         raise ValueError("distributions must be a non-empty list")
 
+    # distribution.horizon ∈ {5m, 1h, 1d, 1w} per MODEL_CONTRACT, but
+    # agent_forecast.horizon is constrained to {5m, 1h, intraday, near, far,
+    # cycle} — the dashboard's _HORIZON_ORDER tuple and bucket-based queries
+    # break on raw 1d/1w. Map daily/weekly distribution horizons to their
+    # bucket equivalents (1d→near, 1w→far). 5m/1h pass through unchanged
+    # because the upsert allow-list includes them. The distribution jsonb
+    # keeps the original label so the scorer/resolver still see "1d"/"1w".
+    _DIST_HORIZON_TO_BUCKET = {"5m": "5m", "1h": "1h", "1d": "near", "1w": "far"}
+
     run_id = str(uuid.uuid4())
     rows: list[dict] = []
     horizon_pairs: list[tuple[dict, float]] = []
@@ -275,6 +284,7 @@ async def _persist_distributions(
         if not ok:
             raise ValueError(f"distributions[{i}] invalid: {reason}")
         horizon = dist["horizon"]
+        row_horizon = _DIST_HORIZON_TO_BUCKET.get(horizon, horizon)
         ttd_days = horizon_to_ttd_days(horizon)
         # Mirror E[r] into the legacy expected_return_pct column for back-compat;
         # likelihood = peak(p) gives consumers a usable scalar without parsing
@@ -296,7 +306,7 @@ async def _persist_distributions(
             "time_to_target_days": ttd_days,
             "method": f"model:{model_name}@{model_version}",
             "rationale": None,
-            "horizon": horizon,
+            "horizon": row_horizon,
             "distribution": dist,
             "forecast_run_id": run_id,
             "expires_in_hours": ttl_hours,

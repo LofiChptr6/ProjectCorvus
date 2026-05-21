@@ -781,6 +781,52 @@ END $$""",
         PRIMARY KEY (agent_name, summary_at)
     )""",
     "CREATE INDEX IF NOT EXISTS idx_sector_summary_recent ON agent_sector_summary (agent_name, summary_at DESC)",
+    # ─────────────────────────────────────────────────────────────────────
+    # Phase A of CITATION_ARCH (2026-05-21): evidence_snapshot is the
+    # append-only audit trail every tool result writes to. Convictions and
+    # theses attach Citation rows that point back here. The append-only
+    # contract is what makes the audit trail trustworthy — once a tool
+    # returns, its evidence row is frozen even if the underlying source
+    # (news article, model output) changes later.
+    """CREATE TABLE IF NOT EXISTS evidence_snapshot (
+        id              BIGSERIAL PRIMARY KEY,
+        kind            TEXT NOT NULL,
+        source_ref_id   TEXT NOT NULL,
+        content_hash    TEXT NOT NULL,
+        content_snippet TEXT,
+        inputs_json     JSONB,
+        outputs_json    JSONB,
+        computed_by     TEXT NOT NULL,
+        computed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        agent_name      TEXT,
+        session_id      TEXT,
+        UNIQUE (kind, source_ref_id, content_hash)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_kind_ref ON evidence_snapshot (kind, source_ref_id)",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_agent_session ON evidence_snapshot (agent_name, session_id) WHERE session_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_evidence_recent ON evidence_snapshot (computed_at DESC)",
+    # ─────────────────────────────────────────────────────────────────────
+    # Phase C of CITATION_ARCH: conviction_verification holds the CoVe-style
+    # post-submission check results. Populated by scripts/run_verify_worker.py.
+    # Allocator reads `action` to gate sizing. Empty in Phase A — this table
+    # is provisioned now so downstream code can reference the schema.
+    """CREATE TABLE IF NOT EXISTS conviction_verification (
+        conviction_id     BIGINT NOT NULL,
+        verified_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        citations_total   INTEGER NOT NULL,
+        citations_ok      INTEGER NOT NULL,
+        citations_flagged JSONB,
+        action            TEXT NOT NULL,
+        verifier_notes    TEXT,
+        PRIMARY KEY (conviction_id, verified_at)
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_conviction_verify_recent ON conviction_verification (verified_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_conviction_verify_action ON conviction_verification (action) WHERE action <> 'pass'",
+    # Phase C of CITATION_ARCH (2026-05-21): citations jsonb on agent_conviction.
+    # A list[Citation] — each entry {kind, evidence_id, source_ref_id, quote}.
+    # The verify_worker walks this list and writes a conviction_verification row.
+    "ALTER TABLE agent_conviction ADD COLUMN IF NOT EXISTS citations JSONB",
+    "ALTER TABLE agent_conviction_shadow ADD COLUMN IF NOT EXISTS citations JSONB",
 ]
 
 

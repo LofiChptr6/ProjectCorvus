@@ -31,7 +31,7 @@ from typing import Any
 import numpy as np
 from hmmlearn.hmm import GaussianHMM
 
-MODEL_VERSION = "0.1.0"
+MODEL_VERSION = "0.2.0"
 BAR_FREQUENCY = "1d"
 LOOKBACK_DAYS = 200
 MIN_BARS = 60
@@ -127,6 +127,15 @@ def _fit_hmm(returns: np.ndarray) -> GaussianHMM | None:
         # collapse to a single state on quiet markets.
         init_params="stmc",
         params="stmc",
+        # hmmlearn's covars_prior defaults to ~1000 (high-dimensional-data
+        # convention). For daily log-returns σ² is O(1e-4), so the default
+        # prior dwarfs the data: when one state captures most observations,
+        # the other state's σ² gets pegged at the prior (√1000 ≈ 31.6 = 3160%
+        # per day), producing nonsense distributions. Setting covars_prior to
+        # 1e-3 (≈ σ ≤ 3.2%) gives the unused state a sensible floor and lets
+        # quiet-market symbols fit a real two-regime structure instead of
+        # silently collapsing. Bumped MODEL_VERSION to 0.2.0 for this change.
+        covars_prior=1e-3,
     )
     try:
         with warnings.catch_warnings():
@@ -153,6 +162,15 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     if len(log_returns) < MIN_BARS - 1:
         return _no_signal("insufficient log returns")
 
+    # Data sanity: a single |log_return| > 0.5 means a 65%+ one-bar move,
+    # almost always unadjusted-split data or a bar-feed glitch. Such an outlier
+    # drives the HMM into a degenerate fit (one state σ ≈ 0, the other σ huge),
+    # which then projects bins spanning ±9000% return. Drop the row instead of
+    # publishing a meaningless distribution.
+    max_abs_lr = float(np.max(np.abs(log_returns)))
+    if max_abs_lr > 0.5:
+        return _no_signal(f"data anomaly: max |log_return|={max_abs_lr:.3f} > 0.5 (likely unadjusted split / bad bar)")
+
     hmm = _fit_hmm(log_returns)
     if hmm is None:
         return _no_signal("HMM did not converge")
@@ -166,6 +184,13 @@ def compute(symbol: str, bars: list[dict], context: dict) -> dict[str, Any]:
     bull_idx = 1 - bear_idx
     mu_bear, sigma_bear = float(means[bear_idx]), float(sigmas[bear_idx])
     mu_bull, sigma_bull = float(means[bull_idx]), float(sigmas[bull_idx])
+
+    # Degenerate-fit guard: a healthy daily-bar HMM produces σ ≈ 0.005–0.05
+    # (0.5–5% per day). σ > 0.3 means the fit absorbed a structural anomaly the
+    # max_abs_lr check above missed (e.g. a sequence of small spikes). Skip
+    # rather than emit unstable bins.
+    if max(sigma_bull, sigma_bear) > 0.3:
+        return _no_signal(f"degenerate HMM fit: max σ={max(sigma_bull, sigma_bear):.3f} > 0.3")
 
     # Posterior regime probabilities at the most recent observation
     posterior = hmm.predict_proba(log_returns.reshape(-1, 1))[-1]

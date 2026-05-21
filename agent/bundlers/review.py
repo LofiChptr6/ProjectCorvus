@@ -40,6 +40,11 @@ class ReviewBundle:
     quiet_window: Optional[bool] = None
     kill_switch: Optional[dict[str, Any]] = None
     available_models: list[dict[str, Any]] = field(default_factory=list)
+    # Phase B of CITATION_ARCH (2026-05-21): registered agent-callable skills.
+    # Each entry: {name, version, description}. The LLM picks a `skill_name`
+    # and calls the `run_skill` MCP tool to get an answer with an evidence_id
+    # it can attach to a Citation.
+    available_skills: list[dict[str, Any]] = field(default_factory=list)
     bundle_warnings: list[str] = field(default_factory=list)
     # Queue-driven invocations (queue_worker subprocess) carry job context
     # so the agent knows what woke it — OCAP triggers, specific ticker focus,
@@ -172,6 +177,13 @@ async def get_review_bundle(
     except Exception as e:
         warnings.append(f"available_models: {type(e).__name__}: {e}")
 
+    available_skills: list[dict[str, Any]] = []
+    try:
+        from meta_agent.skill_loader import list_agent_skills
+        available_skills = list_agent_skills(agent_name)
+    except Exception as e:
+        warnings.append(f"available_skills: {type(e).__name__}: {e}")
+
     return ReviewBundle(
         agent_name=agent_name,
         now_iso=now_iso,
@@ -188,6 +200,7 @@ async def get_review_bundle(
         quiet_window=quiet_window,
         kill_switch=kill_switch,
         available_models=available_models,
+        available_skills=available_skills,
         bundle_warnings=warnings,
         job_context=job_context,
         pending_inbox=pending_inbox,

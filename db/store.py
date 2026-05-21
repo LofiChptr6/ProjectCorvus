@@ -828,6 +828,7 @@ async def insert_conviction_shadow(
     momentum_confirmed: Optional[bool] = None,
     stop_pct: Optional[float] = None,
     run_session_id: Optional[str] = None,
+    citations: Optional[list[dict]] = None,
 ) -> int:
     """Shadow-table sibling of upsert_conviction. expires_in_hours required
     (caller has already passed Pydantic validation in pipelines/schemas.py)."""
@@ -839,13 +840,14 @@ async def insert_conviction_shadow(
             """INSERT INTO agent_conviction_shadow
                (agent_name, symbol, direction, conviction, expected_return_pct,
                 time_to_target_days, likelihood, rationale, model_inputs,
-                momentum_confirmed, stop_pct, expires_at, run_session_id)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+                momentum_confirmed, stop_pct, expires_at, run_session_id, citations)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb)
                RETURNING id""",
             agent_name, symbol.upper(), direction, conviction, expected_return_pct,
             time_to_target_days, likelihood, rationale,
             json.dumps(model_inputs) if model_inputs else None,
             momentum_confirmed, stop_pct, expires_at, run_session_id,
+            json.dumps(citations) if citations else None,
         )
         return int(row["id"])
 
@@ -1256,6 +1258,7 @@ async def upsert_conviction(
     session_id: Optional[str] = None,
     forecast_run_id: Optional[str] = None,
     functional_name: Optional[str] = None,
+    citations: Optional[list[dict]] = None,
 ) -> int:
     """Upsert one conviction row keyed on (agent_name, symbol). Most recent wins.
     direction='flat' with conviction=0 is the canonical 'I have no view' submission.
@@ -1307,10 +1310,10 @@ async def upsert_conviction(
                   expected_return_pct, time_to_target_days, likelihood,
                   rationale, model_inputs, momentum_confirmed, expires_at,
                   stop_pct, first_held_since, session_id,
-                  forecast_run_id, functional_name)
+                  forecast_run_id, functional_name, citations)
                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::jsonb,$10,
                        NOW() + ($11 || ' hours')::interval,
-                       $12, $13, $14, $15::uuid, $16)
+                       $12, $13, $14, $15::uuid, $16, $17::jsonb)
                ON CONFLICT (agent_name, symbol) DO UPDATE SET
                  direction           = EXCLUDED.direction,
                  conviction          = EXCLUDED.conviction,
@@ -1327,6 +1330,7 @@ async def upsert_conviction(
                  session_id          = EXCLUDED.session_id,
                  forecast_run_id     = EXCLUDED.forecast_run_id,
                  functional_name     = EXCLUDED.functional_name,
+                 citations           = EXCLUDED.citations,
                  -- preserve original anchor when direction is unchanged across
                  -- re-publications; reset to the caller-supplied value when
                  -- direction flipped.
@@ -1343,6 +1347,7 @@ async def upsert_conviction(
             str(expires_in_hours),
             stop_pct, held_since, session_id,
             forecast_run_id, functional_name,
+            json.dumps(citations) if citations else None,
         )
         return int(row["id"])
 
@@ -3549,3 +3554,196 @@ async def drain_approved_watchlist_removals() -> int:
             _proposals.mark_placed(p["id"])
             applied += 1
     return applied
+
+
+# ── Evidence snapshot (Phase A of CITATION_ARCH) ─────────────────────────────
+
+
+def _evidence_valid_kinds() -> frozenset[str]:
+    """Lazy proxy to meta_agent.citation_pipeline.all_kinds() — keeps
+    db.store decoupled at import time (avoids a circular import: schemas
+    asserts against pipeline, pipeline imports store)."""
+    from meta_agent.citation_pipeline import all_kinds
+    return all_kinds()
+
+
+def _hash_evidence(kind: str, source_ref_id: str, outputs_json: dict) -> str:
+    """SHA-256 over the canonical evidence content. Same kind+ref+outputs ⇒
+    same hash, which lets the UNIQUE (kind, ref, hash) constraint dedupe
+    identical evidence across re-computations."""
+    import hashlib
+    payload = json.dumps(
+        {"kind": kind, "ref": source_ref_id, "out": outputs_json},
+        sort_keys=True, default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+async def stamp_evidence(
+    *,
+    kind: str,
+    source_ref_id: str,
+    outputs_json: dict,
+    inputs_json: Optional[dict] = None,
+    content_snippet: Optional[str] = None,
+    computed_by: str,
+    agent_name: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> int:
+    """Insert (or fetch existing) an evidence_snapshot row and return its id.
+
+    The append-only contract: identical (kind, source_ref_id, outputs)
+    deduplicate to the same row. Different outputs (model re-run with new bars,
+    news article edited) get a fresh id — the audit trail preserves both.
+
+    `computed_by` is a tool-name@version string for replay traceability.
+    `content_snippet` is the human-readable summary that ends up in Citation.quote.
+    """
+    valid = _evidence_valid_kinds()
+    if kind not in valid:
+        raise ValueError(f"kind must be one of {sorted(valid)}, got {kind!r}")
+    if not source_ref_id:
+        raise ValueError("source_ref_id is required")
+    if not computed_by:
+        raise ValueError("computed_by is required (tool name + version)")
+    content_hash = _hash_evidence(kind, source_ref_id, outputs_json)
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """INSERT INTO evidence_snapshot
+                 (kind, source_ref_id, content_hash, content_snippet,
+                  inputs_json, outputs_json, computed_by, agent_name, session_id)
+               VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9)
+               ON CONFLICT (kind, source_ref_id, content_hash) DO UPDATE
+                 SET computed_at = evidence_snapshot.computed_at  -- noop, returns existing row
+               RETURNING id""",
+            kind, source_ref_id, content_hash,
+            content_snippet,
+            json.dumps(inputs_json or {}, default=str),
+            json.dumps(outputs_json, default=str),
+            computed_by, agent_name, session_id,
+        )
+        return int(row["id"])
+
+
+async def get_evidence_snapshot(evidence_id: int) -> Optional[dict]:
+    """Fetch one evidence row by id. Returns dict or None.
+
+    Used by the verification worker (Phase C) and by callers that want to
+    surface the source of a citation in the dashboard."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, kind, source_ref_id, content_hash, content_snippet,
+                      inputs_json, outputs_json, computed_by, computed_at,
+                      agent_name, session_id
+               FROM evidence_snapshot WHERE id = $1""",
+            evidence_id,
+        )
+        if row is None:
+            return None
+        out = dict(row)
+        # asyncpg returns JSONB as str; normalize to dict for callers.
+        for k in ("inputs_json", "outputs_json"):
+            if isinstance(out.get(k), str):
+                try:
+                    out[k] = json.loads(out[k])
+                except json.JSONDecodeError:
+                    pass
+        return out
+
+
+# ── Conviction verification (Phase C of CITATION_ARCH) ──────────────────────
+
+
+async def fetch_unverified_convictions(
+    *,
+    since_hours: float = 24.0,
+    limit: int = 200,
+) -> list[dict]:
+    """Return non-flat agent_conviction rows from the last `since_hours` that
+    don't yet have a conviction_verification row. The verify_worker iterates
+    these. Includes the citations jsonb so the worker can walk them without a
+    second query.
+
+    Returns one dict per row: {id, agent_name, symbol, direction, conviction,
+    citations, submitted_at}. Citations is parsed (list[dict] or None).
+    """
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT c.id, c.agent_name, c.symbol, c.direction, c.conviction,
+                      c.citations, c.submitted_at
+               FROM agent_conviction c
+               LEFT JOIN LATERAL (
+                 SELECT 1 FROM conviction_verification v
+                 WHERE v.conviction_id = c.id
+                 ORDER BY v.verified_at DESC LIMIT 1
+               ) v ON TRUE
+               WHERE c.direction <> 'flat'
+                 AND c.submitted_at >= NOW() - ($1 || ' hours')::interval
+                 AND v IS NULL
+               ORDER BY c.submitted_at DESC
+               LIMIT $2""",
+            str(since_hours), limit,
+        )
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        if isinstance(d.get("citations"), str):
+            try:
+                d["citations"] = json.loads(d["citations"])
+            except json.JSONDecodeError:
+                d["citations"] = None
+        out.append(d)
+    return out
+
+
+async def write_conviction_verification(
+    *,
+    conviction_id: int,
+    citations_total: int,
+    citations_ok: int,
+    citations_flagged: Optional[list[dict]],
+    action: str,
+    verifier_notes: Optional[str] = None,
+) -> None:
+    """Append a conviction_verification row. PK is (conviction_id, verified_at)
+    so multiple verifications per conviction stack up — the allocator reads
+    the most recent one."""
+    if action not in {"pass", "downgrade", "reject"}:
+        raise ValueError(f"action must be pass|downgrade|reject, got {action!r}")
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO conviction_verification
+                 (conviction_id, citations_total, citations_ok,
+                  citations_flagged, action, verifier_notes)
+               VALUES ($1, $2, $3, $4::jsonb, $5, $6)""",
+            conviction_id, citations_total, citations_ok,
+            json.dumps(citations_flagged) if citations_flagged else None,
+            action, verifier_notes,
+        )
+
+
+async def latest_verification(conviction_id: int) -> Optional[dict]:
+    """The most recent conviction_verification row for a conviction, or None."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT conviction_id, verified_at, citations_total, citations_ok,
+                      citations_flagged, action, verifier_notes
+               FROM conviction_verification
+               WHERE conviction_id = $1
+               ORDER BY verified_at DESC LIMIT 1""",
+            conviction_id,
+        )
+        if row is None:
+            return None
+        d = dict(row)
+        if isinstance(d.get("citations_flagged"), str):
+            try:
+                d["citations_flagged"] = json.loads(d["citations_flagged"])
+            except json.JSONDecodeError:
+                d["citations_flagged"] = None
+        return d

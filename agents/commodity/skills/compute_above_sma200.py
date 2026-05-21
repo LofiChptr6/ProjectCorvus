@@ -1,0 +1,1 @@
+../../atlas/skills/compute_above_sma200.py
