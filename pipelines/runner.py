@@ -383,6 +383,7 @@ async def _apply_review_output(
     from pipelines import notify
     summary["telegram_sent"] = await notify.send_summary_safe(
         agent_name, parsed.telegram_summary, dry_run=dry_run,
+        subkind="hourly_review",
     )
 
     return summary

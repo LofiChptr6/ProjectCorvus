@@ -2948,22 +2948,30 @@ async def log_inbound(
     kind: str,
     content: str,
     meta: Optional[dict] = None,
+    *,
+    reply_to_telegram_message_id: Optional[int] = None,
 ) -> int:
     """Record an inbound Telegram event. Returns the row id.
 
     For 'user_text' rows, the concierge LLM later replays this row with role='user'.
     Slash/approval rows are stored too for audit but never enter the LLM context.
+
+    `reply_to_telegram_message_id` carries Telegram's `message.reply_to_message
+    .message_id` when the user long-pressed and replied to a specific past
+    bot message. The concierge uses it to join back to the originating
+    outbound row (and from there to source_ref).
     """
     role = "user" if kind == "user_text" else None
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO telegram_message
-                 (direction, kind, chat_id, telegram_message_id, role, content, meta)
-               VALUES ('inbound', $1, $2, $3, $4, $5, $6)
+                 (direction, kind, chat_id, telegram_message_id,
+                  reply_to_telegram_message_id, role, content, meta)
+               VALUES ('inbound', $1, $2, $3, $4, $5, $6, $7)
                RETURNING id""",
-            kind, chat_id, telegram_message_id, role, content,
-            json.dumps(meta or {}),
+            kind, chat_id, telegram_message_id, reply_to_telegram_message_id,
+            role, content, json.dumps(meta or {}),
         )
         return int(row["id"])
 
@@ -2977,23 +2985,34 @@ async def log_outbound(
     tool_calls: Optional[list] = None,
     tool_call_id: Optional[str] = None,
     meta: Optional[dict] = None,
+    source_ref: Optional[dict] = None,
+    telegram_message_id: Optional[int] = None,
 ) -> int:
     """Record an outbound Telegram event. Returns the row id.
 
     For 'concierge_reply' rows pass role='assistant' and optionally tool_calls.
     For 'concierge_tool' rows pass role='tool' and tool_call_id (these never go
     to Telegram but are stored so the LLM can replay the full tool-use loop).
+
+    `source_ref` is the structured origin pointer (kind + author_agent + ids)
+    consumed by the reply-resolver to look up agent context when the user
+    replies to a specific Telegram message. NULL for conversational rows.
+    `telegram_message_id` is the Telegram-assigned id of the message we just
+    sent — populated from the sendMessage response so reply lookups can
+    join on it.
     """
     pool = await get_pool()
     tc_json = json.dumps(tool_calls) if tool_calls is not None else None
+    src_json = json.dumps(source_ref) if source_ref is not None else None
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
             """INSERT INTO telegram_message
-                 (direction, kind, chat_id, role, content, tool_calls, tool_call_id, meta)
-               VALUES ('outbound', $1, $2, $3, $4, $5::jsonb, $6, $7)
+                 (direction, kind, chat_id, telegram_message_id,
+                  role, content, tool_calls, tool_call_id, meta, source_ref)
+               VALUES ('outbound', $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9::jsonb)
                RETURNING id""",
-            kind, chat_id, role, content, tc_json, tool_call_id,
-            json.dumps(meta or {}),
+            kind, chat_id, telegram_message_id, role, content, tc_json,
+            tool_call_id, json.dumps(meta or {}), src_json,
         )
         return int(row["id"])
 

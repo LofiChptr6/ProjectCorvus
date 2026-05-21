@@ -172,7 +172,23 @@ async def _poll_once(client: httpx.AsyncClient, offset: int) -> tuple[int, list[
         if allowed_chat and chat_id and chat_id != allowed_chat:
             log.warning("Dropped message from unauthorized chat_id=%s text=%r", chat_id, text[:80])
             continue
-        events.append({"type": "message", "text": text, "chat_id": chat_id, "message_id": msg.get("message_id")})
+        # Telegram Bot API 7.0+: when the user long-presses a past message and
+        # replies (optionally highlighting a fragment), the update carries
+        # `reply_to_message` (the full original Message) and optionally `quote`
+        # (the highlighted slice). The reply-aware concierge joins
+        # reply_to.message_id back to our outbound row → source_ref.
+        reply_to = msg.get("reply_to_message") or {}
+        reply_to_id = reply_to.get("message_id") if isinstance(reply_to, dict) else None
+        quote = msg.get("quote") or {}
+        quote_text = quote.get("text") if isinstance(quote, dict) else None
+        events.append({
+            "type": "message",
+            "text": text,
+            "chat_id": chat_id,
+            "message_id": msg.get("message_id"),
+            "reply_to_message_id": reply_to_id,
+            "quote_text": quote_text,
+        })
     return new_offset, events
 
 
@@ -225,6 +241,8 @@ async def _handle_callback(client: httpx.AsyncClient, ev: dict[str, Any]) -> Non
             f"⚠️ Button tap for `{short}` — no matching pending proposal.",
             kind="approval",
             meta={"event": "button_no_match", "short_id": short, "callback_data": data},
+            source_ref={"kind": "proposal", "event": "button_no_match",
+                        "short_id": short, "callback_data": data},
         )
         return
 
@@ -244,6 +262,10 @@ async def _handle_callback(client: httpx.AsyncClient, ev: dict[str, Any]) -> Non
         f"{icon} {verb}: `{p['id'][:8]}` — {p['title']}",
         kind="approval",
         meta={"event": "resolved_via_button", "short_id": p["id"][:8], "approved": approved},
+        source_ref={"kind": "proposal", "proposal_id": p["id"],
+                    "proposal_kind": p.get("kind", "strategic_change"),
+                    "title": p.get("title"),
+                    "event": "resolved_via_button", "approved": approved},
     )
 
 
@@ -274,6 +296,9 @@ async def _run() -> None:
             parse_mode=None,
             kind="push",
             meta={"author_agent": "system", "event": "concierge_startup_missing_env"},
+            source_ref={"kind": "system_alert", "alert_kind": "concierge_lifecycle",
+                        "author_agent": "system",
+                        "event": "startup_missing_env"},
         )
         return
     if not os.environ.get("TELEGRAM_BOT_TOKEN", "").strip():
@@ -294,6 +319,8 @@ async def _run() -> None:
         parse_mode=None,
         kind="push",
         meta={"author_agent": "system", "event": "concierge_online"},
+        source_ref={"kind": "system_alert", "alert_kind": "concierge_lifecycle",
+                    "author_agent": "system", "event": "online"},
     )
 
     nudge_interval = int(cfg.get("nudge_interval_s", 60))
@@ -325,6 +352,8 @@ async def _run() -> None:
                             ev["text"], cfg,
                             chat_id=ev.get("chat_id"),
                             telegram_message_id=ev.get("message_id"),
+                            reply_to_message_id=ev.get("reply_to_message_id"),
+                            quote_text=ev.get("quote_text"),
                         )
                 except Exception as exc:
                     log.exception("Router crashed on event: %r", ev)
@@ -334,6 +363,11 @@ async def _run() -> None:
                             parse_mode=None,
                             kind="push",
                             meta={"author_agent": "system", "event": "concierge_router_crash"},
+                            source_ref={"kind": "system_alert",
+                                        "alert_kind": "concierge_lifecycle",
+                                        "author_agent": "system",
+                                        "event": "router_crash",
+                                        "error": f"{type(exc).__name__}: {exc}"[:200]},
                         )
                     except Exception:
                         pass
@@ -358,6 +392,9 @@ async def _run() -> None:
             parse_mode=None,
             kind="push",
             meta={"author_agent": "system", "event": "concierge_offline"},
+            source_ref={"kind": "system_alert", "alert_kind": "concierge_lifecycle",
+                        "author_agent": "system", "event": "offline",
+                        "uptime_h": round(uptime_h, 1)},
         )
     except Exception:
         pass

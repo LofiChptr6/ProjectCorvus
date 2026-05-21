@@ -237,7 +237,13 @@ async def _main_locked() -> int:
         msg = f"🧭 *Allocator @ {_now_et_str()}* — no action. Insufficient views ({n_sym} sym / {n_agent} agents)."
         log.info("insufficient views: %d sym / %d agents", n_sym, n_agent)
         try:
-            await send_message(msg, kind="push", meta={"author_agent": "mike"})
+            await send_message(
+                msg, kind="push",
+                meta={"author_agent": "mike"},
+                source_ref={"kind": "agent_push", "author_agent": "mike",
+                            "subkind": "insufficient_conviction",
+                            "n_symbols": n_sym, "n_agents": n_agent},
+            )
         except Exception as exc:
             log.warning("telegram send failed: %s", exc)
         return 0
@@ -256,7 +262,12 @@ async def _main_locked() -> int:
         err = result["error"]
         log.error("rebalance_desk error: %s", err)
         try:
-            await send_message(f"⚠ allocator: {err}", kind="push", meta={"author_agent": "mike"})
+            await send_message(
+                f"⚠ allocator: {err}", kind="push",
+                meta={"author_agent": "mike"},
+                source_ref={"kind": "system_alert", "alert_kind": "allocator_error",
+                            "author_agent": "mike", "error": str(err)[:200]},
+            )
         except Exception:
             pass
         return 1
@@ -291,7 +302,14 @@ async def _main_locked() -> int:
 
     body = _format_telegram(result, n_sym, n_agent, why)
     try:
-        await send_message(body, kind="push", meta={"author_agent": "mike", "decision_id": decision_id})
+        await send_message(
+            body, kind="push",
+            meta={"author_agent": "mike", "decision_id": decision_id},
+            source_ref={"kind": "agent_push", "author_agent": "mike",
+                        "subkind": "rebalance_summary",
+                        "decision_id": decision_id,
+                        "orders_placed": len(placed)},
+        )
     except Exception as exc:
         log.error("telegram send failed: %s", exc)
 

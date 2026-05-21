@@ -641,6 +641,21 @@ END $$""",
     )""",
     "CREATE INDEX IF NOT EXISTS idx_telegram_message_kind_id ON telegram_message (kind, id DESC)",
     "CREATE INDEX IF NOT EXISTS idx_telegram_message_chat_id_id ON telegram_message (chat_id, id DESC)",
+    # Reply-aware concierge (added 2026-05-20):
+    #   source_ref: structured pointer back to whatever produced an outbound
+    #     message (agent push, proposal, trade approval, system alert). Lets
+    #     the concierge resolve "user replied to THIS Telegram message" → the
+    #     originating agent + thread post + thesis snapshot. Polymorphic JSONB
+    #     keyed on `kind`. NULL for conversational rows (concierge_reply etc.)
+    #     and for outbound rows sent before this feature shipped.
+    #   reply_to_telegram_message_id: on inbound rows, the Telegram message_id
+    #     of the message being replied to (from update.message.reply_to_message
+    #     in the Bot API). Joins back to telegram_message.telegram_message_id.
+    "ALTER TABLE telegram_message ADD COLUMN IF NOT EXISTS source_ref JSONB",
+    "ALTER TABLE telegram_message ADD COLUMN IF NOT EXISTS reply_to_telegram_message_id BIGINT",
+    "CREATE INDEX IF NOT EXISTS idx_telegram_message_tg_id ON telegram_message (telegram_message_id) WHERE telegram_message_id IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_telegram_message_source_kind ON telegram_message ((source_ref->>'kind')) WHERE source_ref IS NOT NULL",
+    "CREATE INDEX IF NOT EXISTS idx_telegram_message_source_author ON telegram_message ((source_ref->>'author_agent')) WHERE source_ref IS NOT NULL",
     # ─────────────────────────────────────────────────────────────────────
     # Watchlist — replaces agents/sector_map.yaml as the canonical universe.
     # Duplicates across agents are allowed: e.g. gold may live in both atlas

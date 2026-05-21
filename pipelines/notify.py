@@ -36,6 +36,7 @@ async def send_summary_safe(
     summary: str | None,
     *,
     dry_run: bool = False,
+    subkind: str | None = None,
 ) -> bool:
     """Send `summary` to Telegram prefixed with the agent's name.
 
@@ -43,6 +44,10 @@ async def send_summary_safe(
     pipeline-validation runs from live signal. The dry-run-fires-everything
     contract is the whole point — silent dry-runs hide regressions in the
     Telegram path itself.
+
+    `subkind` (optional) is recorded into source_ref so the reply-resolver
+    can tell apart e.g. an hourly review summary vs. a model-tune summary
+    vs. an evening digest. Defaults to None.
 
     Returns True on a successful send, False otherwise. Empty / None
     summary is a no-op (False). All exceptions are caught and logged.
@@ -56,8 +61,16 @@ async def send_summary_safe(
         return False
     prefix = DRY_RUN_PREFIX if dry_run else ""
     text = f"{prefix}*{agent_name}*: {summary.strip()}"
+    src: dict = {"kind": "agent_push", "author_agent": agent_name}
+    if subkind:
+        src["subkind"] = subkind
     try:
-        await send_message(text, parse_mode="Markdown")
+        await send_message(
+            text, parse_mode="Markdown",
+            meta={"author_agent": agent_name, "subkind": subkind} if subkind
+                 else {"author_agent": agent_name},
+            source_ref=src,
+        )
         return True
     except Exception as e:
         log.warning("send_summary_safe(%s) failed: %s", agent_name, e)
@@ -69,9 +82,15 @@ async def send_chart_safe(
     caption: str | None,
     *,
     dry_run: bool = False,
+    agent_name: str | None = None,
+    subkind: str | None = None,
 ) -> bool:
     """Send a chart image (PNG/JPG) via Telegram sendPhoto.
-    `dry_run=True` prepends `[DRY-RUN] ` to the caption."""
+    `dry_run=True` prepends `[DRY-RUN] ` to the caption.
+
+    `agent_name` and `subkind` get carried in source_ref so a reply to the
+    chart resolves to the right agent + flow (e.g. evening digest).
+    """
     if not image_path or not caption:
         return False
     try:
@@ -80,8 +99,18 @@ async def send_chart_safe(
         log.warning("approval.telegram.send_photo unavailable: %s", e)
         return False
     prefix = DRY_RUN_PREFIX if dry_run else ""
+    src: dict = {"kind": "agent_push", "chart_path": image_path}
+    if agent_name:
+        src["author_agent"] = agent_name
+    if subkind:
+        src["subkind"] = subkind
     try:
-        result = await send_photo(image_path=image_path, caption=f"{prefix}{caption}")
+        result = await send_photo(
+            image_path=image_path, caption=f"{prefix}{caption}",
+            meta={"author_agent": agent_name or "system", "subkind": subkind}
+                 if subkind else {"author_agent": agent_name or "system"},
+            source_ref=src,
+        )
         return result is not None
     except Exception as e:
         log.warning("send_chart_safe failed: %s", e)

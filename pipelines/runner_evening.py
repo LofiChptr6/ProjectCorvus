@@ -72,6 +72,7 @@ async def apply_evening_output(
     # Telegram with [DRY-RUN] prefix in dry-run.
     summary["telegram_sent"] = await notify.send_chart_safe(
         chart_path, parsed.telegram_caption, dry_run=dry_run,
+        agent_name=agent_name, subkind="evening_digest",
     )
 
     # Digest row — durable record of the grading regardless of mode.

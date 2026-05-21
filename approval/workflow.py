@@ -26,6 +26,13 @@ async def request_approval(
     from approval.telegram import send_message, poll_for_reply, escape_markdown
     from approval import bypass
 
+    trade_src_base = {
+        "kind": "trade_approval",
+        "symbol": str(order.symbol or ""),
+        "action": str(order.action or ""),
+        "quantity": float(order.quantity or 0),
+        "agent_name": str(order.agent_name or ""),
+    }
     if bypass.is_active():
         note = bypass.reason()
         log.info("Approval auto-granted: %s on %s %s x%s — %s",
@@ -35,6 +42,7 @@ async def request_approval(
                 f"⚡ Auto-approved ({note}): {order.action} {order.symbol} "
                 f"x{order.quantity:,.0f} (~${estimated_notional:,.0f})",
                 parse_mode=None,
+                source_ref={**trade_src_base, "stage": "auto_approved", "bypass_reason": note},
             )
         except Exception:
             pass
@@ -67,7 +75,11 @@ async def request_approval(
     )
 
     log.info("Sending Telegram approval request for %s %s %s", order.action, order.symbol, order.quantity)
-    response = await send_message(text)
+    response = await send_message(
+        text,
+        source_ref={**trade_src_base, "stage": "request",
+                    "notional": float(estimated_notional or 0), "mode": mode},
+    )
 
     if not response or not response.get("ok"):
         log.warning("Telegram send failed — auto-rejecting for safety")
@@ -78,15 +90,24 @@ async def request_approval(
 
     if reply in ("y", "yes"):
         log.info("Trade approved via Telegram")
-        await send_message(f"✅ Approved — submitting {order.action} {order.symbol} x{order.quantity:,.0f}")
+        await send_message(
+            f"✅ Approved — submitting {order.action} {order.symbol} x{order.quantity:,.0f}",
+            source_ref={**trade_src_base, "stage": "approved"},
+        )
         return ApprovalResult(approved=True, reason="Human approved via Telegram")
 
     if reply in ("n", "no"):
         log.info("Trade rejected via Telegram")
-        await send_message(f"❌ Rejected — order cancelled")
+        await send_message(
+            f"❌ Rejected — order cancelled",
+            source_ref={**trade_src_base, "stage": "rejected"},
+        )
         return ApprovalResult(approved=False, reason="Human rejected via Telegram")
 
     # Timeout
     log.warning("Approval timed out after %ds — rejecting", timeout_s)
-    await send_message(f"⏱ Timeout — trade auto-rejected after {timeout_s}s")
+    await send_message(
+        f"⏱ Timeout — trade auto-rejected after {timeout_s}s",
+        source_ref={**trade_src_base, "stage": "timeout"},
+    )
     return ApprovalResult(approved=False, reason=f"Approval timed out after {timeout_s}s")

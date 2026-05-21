@@ -188,7 +188,13 @@ def kill(
         console.print(f"[red bold]Kill switch ACTIVATED ({scope}): {reason}[/red bold]")
         try:
             from approval.telegram import send_message
-            await send_message(f"🛑 *Kill switch activated* ({scope})\nReason: {reason}")
+            await send_message(
+                f"🛑 *Kill switch activated* ({scope})\nReason: {reason}",
+                source_ref={"kind": "system_alert", "alert_kind": "kill_switch",
+                            "author_agent": "system",
+                            "scope": scope, "reason": reason,
+                            "activated_by": "cli"},
+            )
         except Exception:
             pass
 

@@ -298,7 +298,12 @@ async def main() -> int:
 
     from approval.telegram import send_message
     try:
-        await send_message(body, kind="push", meta={"author_agent": "hourly-review"})
+        await send_message(
+            body, kind="push",
+            meta={"author_agent": "hourly-review"},
+            source_ref={"kind": "agent_push", "author_agent": "hourly-review",
+                        "subkind": "heartbeat"},
+        )
     except Exception as exc:
         log.error("telegram send failed: %s", exc)
         return 1

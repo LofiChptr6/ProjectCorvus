@@ -47,10 +47,23 @@ async def route(
     *,
     chat_id: Optional[str] = None,
     telegram_message_id: Optional[int] = None,
+    reply_to_message_id: Optional[int] = None,
+    quote_text: Optional[str] = None,
 ) -> None:
-    """Main dispatcher. Sends responses via Telegram."""
+    """Main dispatcher. Sends responses via Telegram.
+
+    `reply_to_message_id` is the Telegram message_id this inbound text is
+    replying to (when the user long-pressed a past bot message). `quote_text`
+    is the optional highlighted fragment (Bot API 7.0+). Both are recorded
+    on the inbound row and, for free-text turns, passed into `chat.handle`
+    so the reply-resolver can pull the originating agent's context.
+    """
     stripped = text.strip()
     lowered = stripped.lower()
+
+    inbound_meta_extra: dict[str, Any] = {}
+    if quote_text:
+        inbound_meta_extra["quote_text"] = quote_text
 
     # 1. Pending write-action confirmation
     pending = state.load_pending_confirm()
@@ -58,7 +71,10 @@ async def route(
         try:
             await store.log_inbound(
                 chat_id, telegram_message_id, "approval", stripped,
-                meta={"event": "write_confirm_response", "pending_kind": pending.get("kind")},
+                meta={"event": "write_confirm_response",
+                      "pending_kind": pending.get("kind"),
+                      **inbound_meta_extra},
+                reply_to_telegram_message_id=reply_to_message_id,
             )
         except Exception:
             log.debug("log_inbound (confirm) skipped", exc_info=True)
@@ -67,7 +83,11 @@ async def route(
 
     kind = _classify(stripped)
     try:
-        await store.log_inbound(chat_id, telegram_message_id, kind, stripped)
+        await store.log_inbound(
+            chat_id, telegram_message_id, kind, stripped,
+            meta=inbound_meta_extra or None,
+            reply_to_telegram_message_id=reply_to_message_id,
+        )
     except Exception:
         log.debug("log_inbound skipped", exc_info=True)
 
@@ -82,7 +102,12 @@ async def route(
         return
 
     # 4. LLM chat
-    reply = await chat.handle(stripped, cfg, chat_id=chat_id)
+    reply = await chat.handle(
+        stripped, cfg,
+        chat_id=chat_id,
+        reply_to_message_id=reply_to_message_id,
+        quote_text=quote_text,
+    )
     # chat.handle has already logged the assistant reply (and any tool rows)
     # to telegram_message with kind='concierge_reply' / 'concierge_tool', and
     # has sent the reply to Telegram. Nothing more to do here.
@@ -109,6 +134,9 @@ async def _handle_confirmation(pending: dict[str, Any], text: str) -> None:
                     f"✅ Proposal {result['short_id']} {verb}.",
                     parse_mode=None, kind="approval",
                     meta={"event": "write_confirm_resolved", "short_id": result["short_id"]},
+                    source_ref={"kind": "proposal", "short_id": result["short_id"],
+                                "event": "write_confirm_resolved",
+                                "approved": bool(pending.get("approve"))},
                 )
             elif pending_kind == "propose_strategic_change":
                 await send_message(
@@ -116,6 +144,9 @@ async def _handle_confirmation(pending: dict[str, Any], text: str) -> None:
                     f"You'll get the approval ping momentarily.",
                     parse_mode=None, kind="approval",
                     meta={"event": "write_confirm_filed", "short_id": result["short_id"]},
+                    source_ref={"kind": "proposal", "short_id": result["short_id"],
+                                "title": pending.get("title"),
+                                "event": "write_confirm_filed"},
                 )
             elif pending_kind == "resolve_all_pending":
                 resolved = result.get("resolved") or []
@@ -126,6 +157,10 @@ async def _handle_confirmation(pending: dict[str, Any], text: str) -> None:
                         f"✅ {len(resolved)} proposal(s) {verb} in bulk:\n{body}",
                         parse_mode=None, kind="approval",
                         meta={"event": "write_confirm_bulk", "approved": bool(pending.get("approve")), "count": len(resolved)},
+                        source_ref={"kind": "proposal", "event": "write_confirm_bulk",
+                                    "approved": bool(pending.get("approve")),
+                                    "count": len(resolved),
+                                    "short_ids": [r["short_id"] for r in resolved]},
                     )
                 else:
                     await send_message(
@@ -167,6 +202,10 @@ async def _handle_yn(text: str) -> None:
             f"{icon} {verb}: `{p['id'][:8]}` — {p['title']}",
             kind="approval",
             meta={"event": "resolved_via_yn", "short_id": p["id"][:8], "approved": approved},
+            source_ref={"kind": "proposal", "proposal_id": p["id"],
+                        "proposal_kind": p.get("kind", "strategic_change"),
+                        "title": p.get("title"),
+                        "event": "resolved_via_yn", "approved": approved},
         )
     else:
         await send_message(

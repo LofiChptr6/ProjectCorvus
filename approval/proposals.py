@@ -116,6 +116,10 @@ async def create(
     _save(proposals)
 
     proposal_meta = {"proposal_id": proposal["id"], "short_id": proposal["id"][:8]}
+    proposal_src = {
+        "kind": "proposal", "proposal_id": proposal["id"],
+        "proposal_kind": kind, "title": title,
+    }
     if auto_approved:
         await send_message(
             f"⚡ *Strategic proposal auto-approved* ({bypass_reason})\n\n"
@@ -124,6 +128,7 @@ async def create(
             f"{details}",
             kind="approval",
             meta={**proposal_meta, "event": "auto_approved"},
+            source_ref={**proposal_src, "event": "auto_approved"},
         )
         log.info("Auto-approved proposal id=%s title=%s (%s)",
                  proposal["id"][:8], title, bypass_reason)
@@ -133,6 +138,7 @@ async def create(
             reply_markup=_proposal_buttons(proposal),
             kind="approval",
             meta={**proposal_meta, "event": "created"},
+            source_ref={**proposal_src, "event": "created"},
         )
         log.info("Created proposal id=%s title=%s", proposal["id"][:8], title)
     return proposal
@@ -241,6 +247,9 @@ async def nudge_stale() -> int:
             reply_markup=_proposal_buttons(p),
             kind="approval",
             meta={"proposal_id": p["id"], "short_id": p["id"][:8], "event": "nudge"},
+            source_ref={"kind": "proposal", "proposal_id": p["id"],
+                        "proposal_kind": p.get("kind", "strategic_change"),
+                        "title": p.get("title"), "event": "nudge"},
         )
         p["last_pinged_at"] = now
         p["ping_count"] += 1

@@ -162,6 +162,32 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "required": ["agent_name"],
         },
     },
+    {
+        "name": "get_recent_telegram_pushes",
+        "description": (
+            "Fetch recent Telegram messages sent BY agents/system to the user "
+            "(sector summaries, Mike rebalance pings, charts, proposals, alerts). "
+            "Use when the user asks about something an agent said earlier and "
+            "the user did NOT use Telegram's reply-to feature. Each row exposes "
+            "author_agent, content, source_ref, telegram_message_id, sent_at — "
+            "follow up with get_agent_overview / get_position_dossier / "
+            "list_recent_decisions to dig deeper. Filters are AND-combined."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "hours": {"type": "integer", "default": 6,
+                          "description": "Look-back window in hours (max 72)."},
+                "author_agent": {"type": "string",
+                                 "description": "Optional filter: 'mike', 'volt', 'atlas', 'cassidy', etc."},
+                "kind": {"type": "string",
+                         "enum": ["agent_push", "proposal", "trade_approval", "system_alert"],
+                         "description": "Optional filter on source_ref.kind."},
+                "limit": {"type": "integer", "default": 20,
+                          "description": "Max rows to return (max 50)."},
+            },
+        },
+    },
 ]
 
 
@@ -455,6 +481,53 @@ async def _tool_get_agent_journal(args: dict[str, Any]) -> str:
     )
 
 
+async def _tool_get_recent_telegram_pushes(args: dict[str, Any]) -> str:
+    """Read directly from telegram_message — gives the concierge access to
+    agent-pushed messages that are intentionally filtered out of its chat
+    history. Returns rows with source_ref so the model can chain to deeper
+    lookups (e.g. get_agent_overview on the author_agent).
+    """
+    import db.store as store
+
+    hours = max(1, min(int(args.get("hours") or 6), 72))
+    limit = max(1, min(int(args.get("limit") or 20), 50))
+    kind = args.get("kind")
+    author = (args.get("author_agent") or "").strip() or None
+
+    pool = await store.get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """SELECT id, telegram_message_id, created_at, kind AS telegram_kind,
+                      content, source_ref, meta
+               FROM telegram_message
+               WHERE direction='outbound'
+                 AND source_ref IS NOT NULL
+                 AND created_at >= NOW() - ($1::int * INTERVAL '1 hour')
+                 AND ($2::text IS NULL OR source_ref->>'kind' = $2)
+                 AND ($3::text IS NULL OR source_ref->>'author_agent' = $3)
+               ORDER BY id DESC
+               LIMIT $4""",
+            hours, kind, author, limit,
+        )
+
+    out = []
+    for r in rows:
+        d = dict(r)
+        for f in ("source_ref", "meta"):
+            v = d.get(f)
+            if isinstance(v, str):
+                try:
+                    d[f] = json.loads(v)
+                except json.JSONDecodeError:
+                    pass
+        out.append(d)
+    return json.dumps({
+        "window_hours": hours,
+        "filter": {"kind": kind, "author_agent": author},
+        "rows": out,
+    }, default=str)
+
+
 _DISPATCH = {
     "get_positions": _tool_get_positions,
     "get_balances": _tool_get_balances,
@@ -472,6 +545,7 @@ _DISPATCH = {
     "get_position_dossier": _tool_get_position_dossier,
     "get_agent_overview": _tool_get_agent_overview,
     "get_agent_journal": _tool_get_agent_journal,
+    "get_recent_telegram_pushes": _tool_get_recent_telegram_pushes,
 }
 
 

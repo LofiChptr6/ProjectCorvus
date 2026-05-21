@@ -99,6 +99,8 @@ async def _log_outbound_safe(
     tool_calls: Optional[list] = None,
     tool_call_id: Optional[str] = None,
     meta: Optional[dict] = None,
+    source_ref: Optional[dict] = None,
+    telegram_message_id: Optional[int] = None,
 ) -> None:
     """Best-effort write to telegram_message — never break the send path."""
     try:
@@ -106,6 +108,7 @@ async def _log_outbound_safe(
         await log_outbound(
             chat_id, kind, content,
             role=role, tool_calls=tool_calls, tool_call_id=tool_call_id, meta=meta,
+            source_ref=source_ref, telegram_message_id=telegram_message_id,
         )
     except Exception as exc:
         log.debug("telegram_message log_outbound skipped: %s", exc)
@@ -120,6 +123,7 @@ async def send_message(
     role: Optional[str] = None,
     tool_calls: Optional[list] = None,
     meta: Optional[dict] = None,
+    source_ref: Optional[dict] = None,
 ) -> Optional[dict]:
     """Send a message to the configured (or auto-detected) Telegram chat.
 
@@ -133,6 +137,10 @@ async def send_message(
     (agent-initiated desk notifications). Pass 'approval' for proposal pings
     and resolution confirmations, 'concierge_reply' for LLM replies, or
     'slash_cmd' for built-in slash-command output.
+
+    `source_ref` is the structured origin pointer for the reply-aware concierge.
+    Shape: {"kind": "agent_push" | "proposal" | "trade_approval" | "system_alert",
+    "author_agent": "...", ...kind-specific fields}. NULL for conversational rows.
     """
     url = _BASE.format(token=_token()) + "/sendMessage"
     chat_id: Optional[str] = None
@@ -161,6 +169,15 @@ async def send_message(
         except Exception as exc:
             log.error("Telegram send failed: %s", exc)
 
+    # Extract the Telegram-assigned message_id from the response (used by the
+    # concierge's reply-resolver to join inbound replies → origin row).
+    sent_message_id: Optional[int] = None
+    if sent is not None:
+        try:
+            sent_message_id = int(sent.get("result", {}).get("message_id"))
+        except (TypeError, ValueError):
+            sent_message_id = None
+
     # Log to telegram_message even on send-failure: the LLM's reply intent is
     # still part of its conversation history, and an audit trail of attempted
     # sends is useful. Only skip if we couldn't even resolve a chat_id.
@@ -168,6 +185,7 @@ async def send_message(
         await _log_outbound_safe(
             chat_id, kind, text,
             role=role, tool_calls=tool_calls, meta=meta,
+            source_ref=source_ref, telegram_message_id=sent_message_id,
         )
     return sent
 
@@ -178,12 +196,16 @@ async def send_photo(
     *,
     kind: str = "push",
     meta: Optional[dict] = None,
+    source_ref: Optional[dict] = None,
 ) -> Optional[dict]:
     """Send an image (PNG/JPG) via Telegram sendPhoto. Returns response dict or None on failure.
 
     Logs to telegram_message as kind='push' by default (charts/digests are
     typically pushes). The logged `content` is the caption plus a tag noting
     the image filename so an audit query can identify which chart was sent.
+
+    `source_ref` mirrors the `send_message` arg — the reply-resolver uses it
+    to join a user reply to the originating agent/chart.
     """
     from pathlib import Path as _Path
     url = _BASE.format(token=_token()) + "/sendPhoto"
@@ -210,11 +232,21 @@ async def send_photo(
         except Exception as exc:
             log.error("Telegram sendPhoto failed: %s", exc)
 
+    sent_message_id: Optional[int] = None
+    if sent is not None:
+        try:
+            sent_message_id = int(sent.get("result", {}).get("message_id"))
+        except (TypeError, ValueError):
+            sent_message_id = None
+
     photo_meta = dict(meta or {})
     photo_meta.setdefault("image_path", str(p))
     content = caption or f"[photo: {p.name}]"
     if chat_id is not None or sent is not None:
-        await _log_outbound_safe(chat_id, kind, content, meta=photo_meta)
+        await _log_outbound_safe(
+            chat_id, kind, content, meta=photo_meta,
+            source_ref=source_ref, telegram_message_id=sent_message_id,
+        )
     return sent
 
 

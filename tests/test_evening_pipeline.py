@@ -183,8 +183,8 @@ async def test_evening_dry_run_does_everything_live_does(test_agent, monkeypatch
     chart_calls: list[dict] = []
     from pipelines import notify, runner_evening
     async def _stub_slide(agent_name, output): slide_calls.append({"agent": agent_name}); return "/tmp/fake.png"
-    async def _stub_chart(image_path, caption, *, dry_run=False):
-        chart_calls.append({"caption": caption, "dry_run": dry_run})
+    async def _stub_chart(image_path, caption, *, dry_run=False, **kwargs):
+        chart_calls.append({"caption": caption, "dry_run": dry_run, **kwargs})
         return True
     monkeypatch.setattr(runner_evening, "_generate_slide_safe", _stub_slide)
     monkeypatch.setattr(notify, "send_chart_safe", _stub_chart)

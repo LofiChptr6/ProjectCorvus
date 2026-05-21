@@ -157,6 +157,10 @@ async def _ensure_init() -> None:
                 f"⚠️ *IBKR daemon unreachable*\n`{type(exc).__name__}: {exc}`\nTool call aborted. Check ibkr-daemon.service / IB Gateway.",
                 kind="push",
                 meta={"author_agent": "system", "event": "ibkr_daemon_unreachable"},
+                source_ref={"kind": "system_alert", "alert_kind": "daemon_health",
+                            "author_agent": "system",
+                            "subject": "ibkr_daemon_unreachable",
+                            "error": f"{type(exc).__name__}: {exc}"[:200]},
             )
         except Exception:
             pass
@@ -805,6 +809,10 @@ async def activate_kill_switch(reason: str, agent_name: Optional[str] = None) ->
             f"🛑 *Kill switch activated* ({scope})\nReason: {reason}",
             kind="push",
             meta={"author_agent": "system", "event": "kill_switch_activated", "scope": scope},
+            source_ref={"kind": "system_alert", "alert_kind": "kill_switch",
+                        "author_agent": "system",
+                        "scope": scope, "reason": reason,
+                        "activated_by": "claude_code"},
         )
     except Exception:
         pass
@@ -1083,10 +1091,12 @@ async def send_telegram_update(text: str, author_agent: Optional[str] = None) ->
     if not ok:
         return json.dumps({"sent": False, "error": reason})
     from approval.telegram import send_message
+    aa = author_agent or "system"
     result = await send_message(
         text,
         kind="push",
-        meta={"author_agent": author_agent or "system"},
+        meta={"author_agent": aa},
+        source_ref={"kind": "agent_push", "author_agent": aa},
     )
     return json.dumps({"sent": result is not None})
 
@@ -1716,10 +1726,12 @@ async def send_telegram_chart(
     """
     await _ensure_init_light()
     from approval.telegram import send_photo
+    aa = author_agent or "system"
     result = await send_photo(
         image_path, caption,
         kind="push",
-        meta={"author_agent": author_agent or "system"},
+        meta={"author_agent": aa},
+        source_ref={"kind": "agent_push", "author_agent": aa, "chart_path": image_path},
     )
     return json.dumps({"sent": result is not None})
 

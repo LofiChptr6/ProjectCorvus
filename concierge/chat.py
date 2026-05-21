@@ -71,10 +71,18 @@ Hard rules:
    `propose_strategic_change` capturing their intent so Mike sees it next run.
 6. Work efficiently: only call tools you actually need to answer the
    question. If one tool answers everything, stop there.
-7. You CANNOT see agent-pushed reports or approval traffic in this chat
-   history — those streams are intentionally separated. If the user references
-   a recent push or decision, use `list_recent_decisions` or another tool to
-   look it up; do not make up content.
+7. Agent-pushed reports and approval traffic are NOT in this chat history
+   by default, but they ARE queryable. Two access paths:
+   (a) If the user used Telegram's reply-to feature on a specific past
+       message, you'll receive a "Source context" block (system role) with
+       the resolved origin — author_agent, theses, convictions, the linked
+       thread post, or the full proposal. Treat that block as the primary
+       frame for your answer; the user is asking about THAT specific message.
+   (b) Otherwise, call `get_recent_telegram_pushes` (filter by author_agent,
+       kind, or hours) to look up recent pushes. Then chain to
+       `get_agent_overview` / `get_position_dossier` / `list_recent_decisions`
+       for the underlying reasoning.
+   Never tell the user "I can't see what an agent said earlier" — pull it.
 8. The agents' REASONING is available — every active forecast carries a
    rationale, and theses are persisted. When the user asks "why" about a
    position, an agent's stance, or a recent call, REACH FOR THESE TOOLS:
@@ -120,10 +128,19 @@ async def handle(
     cfg: dict[str, Any],
     *,
     chat_id: Optional[str] = None,
+    reply_to_message_id: Optional[int] = None,
+    quote_text: Optional[str] = None,
 ) -> Optional[str]:
     """Run a single user → assistant turn (with up to max_tool_iterations of
     interleaved tool calls) and SEND the final reply to Telegram. Returns the
-    final text for diagnostics; the router has no remaining work to do."""
+    final text for diagnostics; the router has no remaining work to do.
+
+    `reply_to_message_id` / `quote_text` come from the inbound Telegram update
+    when the user replied to a specific past bot message. When set, the
+    reply-resolver loads that message's origin context (agent push, proposal,
+    etc.) and we inject a "Source context" block right after the system prompt
+    so the LLM frames its answer around that specific message.
+    """
     from openai import AsyncOpenAI
 
     base_url = os.environ.get("LOCAL_LLM_BASE_URL", "").strip() or "http://localhost:8000/v1"
@@ -159,7 +176,39 @@ async def handle(
     if not history or history[-1].get("role") != "user" or history[-1].get("content") != user_text:
         history.append({"role": "user", "content": user_text})
 
-    messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT}, *history]
+    # Reply-aware context: if the user replied to a specific past bot message,
+    # resolve its origin (agent + theses / proposal / etc.) and splice a
+    # system-role "Source context" block right after the main system prompt.
+    # Recomputed per turn — never persisted, since agent state is live.
+    source_block: Optional[dict[str, Any]] = None
+    if reply_to_message_id:
+        try:
+            from concierge.reply_resolver import (
+                resolve_reply_context, format_bundle_for_prompt,
+            )
+            bundle = await resolve_reply_context(
+                int(reply_to_message_id), quote_text=quote_text,
+            )
+            if bundle:
+                source_block = {
+                    "role": "system",
+                    "content": (
+                        "The user's next message is a Telegram reply to a "
+                        "specific past bot message. Use the Source context "
+                        "block below as the primary frame for your answer — "
+                        "the user is asking about THAT specific message, "
+                        "not the general desk state.\n\n"
+                        "Source context (JSON):\n"
+                        + format_bundle_for_prompt(bundle)
+                    ),
+                }
+        except Exception:
+            log.exception("reply_resolver failed; continuing without source context")
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": _SYSTEM_PROMPT}]
+    if source_block is not None:
+        messages.append(source_block)
+    messages.extend(history)
     tool_schemas = _to_openai_tools(allowed_tools)
 
     final_text: str = ""

@@ -65,7 +65,12 @@ async def _post(client: httpx.AsyncClient, path: str, body: dict) -> dict:
 async def _send_telegram(text: str) -> None:
     try:
         from approval.telegram import send_message
-        await send_message(text, parse_mode="Markdown")
+        await send_message(
+            text, parse_mode="Markdown",
+            source_ref={"kind": "system_alert", "alert_kind": "flatten_all",
+                        "author_agent": "system",
+                        "subject": "manual_flatten"},
+        )
     except Exception as e:
         print(f"[warn] telegram failed: {e}", file=sys.stderr)
 
